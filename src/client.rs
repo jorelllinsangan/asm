@@ -30,11 +30,11 @@ const LEFT_WIDTH: u16 = 34;
 const OLD_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
 
 const NAV_HINT: &str =
-    "j/k move · Space fold · z fold-all · o old · Enter open · n shell · c cmd · w worktree · x kill · r rename · q quit";
-const TERM_HINT: &str = "TERMINAL · Ctrl+Q returns to the explorer";
+    "j/k move · Space fold · Enter open · c claude · o opencode · n shell · w worktree · x kill · r rename · a old · q quit";
+const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) returns to the explorer";
 
 /// Which pane keystrokes go to.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Nav,
     Term,
@@ -52,8 +52,6 @@ enum PromptKind {
     NewWorktree,
     /// A plain shell session; the input is its display name.
     NewSession { worktree: String },
-    /// A session that runs a command (e.g. `claude`); the input is the command.
-    RunCommand { worktree: String },
     RenameSession { id: SessionId },
 }
 
@@ -321,11 +319,16 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
     match ev {
         Event::Tree { root, worktrees } => {
             app.root = root;
-            // Newly-seen worktrees start collapsed; ones the user already
-            // expanded stay expanded across refreshes.
+            // Newly-seen worktrees start collapsed — except ones with an
+            // actively-running (green) session, which stay expanded so work in
+            // progress is visible. Worktrees the user already expanded are
+            // untouched.
             for w in &worktrees {
                 if app.seen_worktrees.insert(w.path.clone()) {
-                    app.collapsed.insert(w.path.clone());
+                    let has_active = w.sessions.iter().any(|s| s.status == Status::Running);
+                    if !has_active {
+                        app.collapsed.insert(w.path.clone());
+                    }
                 }
             }
             // Drop bookkeeping for worktrees that no longer exist.
@@ -385,27 +388,20 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
             app.selected = app.selected.saturating_sub(1);
         }
         KeyCode::Enter => {
-            if let Some((_, id)) = app.selected_session() {
-                let (cols, rows) = app.term_dims;
-                app.send(Request::Attach { id, cols, rows });
-                app.focus = Focus::Term;
-                app.footer = TERM_HINT.into();
-            } else if let Some((worktree, session_id, tool)) = app.selected_agent() {
-                // Resume the agent session; it auto-opens on SessionCreated.
-                app.send(Request::ResumeAgent {
-                    worktree,
-                    session_id,
-                    tool,
-                });
-                app.footer = "resuming session…".into();
-            } else {
-                // On a worktree header, Enter folds/unfolds it.
+            // On a session/agent this opens it; on a worktree header it folds.
+            if !open_selected(app) {
                 app.toggle_collapse_selected();
             }
         }
+        // Vim-style pane navigation: Ctrl+L moves into the terminal, Ctrl+H
+        // back to the explorer (a no-op here since we're already in it).
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            focus_terminal(app);
+        }
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         KeyCode::Char(' ') => app.toggle_collapse_selected(),
         KeyCode::Char('z') => app.toggle_collapse_all(),
-        KeyCode::Char('o') => {
+        KeyCode::Char('a') => {
             app.show_old = !app.show_old;
             app.rebuild_rows();
             app.footer = if app.show_old {
@@ -424,16 +420,8 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
                 });
             }
         }
-        KeyCode::Char('c') => {
-            if let Some(w) = app.selected_worktree() {
-                let worktree = w.path.clone();
-                app.prompt = Some(Prompt {
-                    kind: PromptKind::RunCommand { worktree },
-                    label: "Run command in new session (e.g. claude)".into(),
-                    input: String::new(),
-                });
-            }
-        }
+        KeyCode::Char('c') => start_agent(app, "claude"),
+        KeyCode::Char('o') => start_agent(app, "opencode"),
         KeyCode::Char('w') => {
             app.prompt = Some(Prompt {
                 kind: PromptKind::NewWorktree,
@@ -475,12 +463,60 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Open the selected session (attach) or agent (resume). Returns false when the
+/// selection is a worktree header (nothing to open).
+fn open_selected(app: &mut App) -> bool {
+    if let Some((_, id)) = app.selected_session() {
+        let (cols, rows) = app.term_dims;
+        app.send(Request::Attach { id, cols, rows });
+        app.focus = Focus::Term;
+        app.footer = TERM_HINT.into();
+        true
+    } else if let Some((worktree, session_id, tool)) = app.selected_agent() {
+        // Resume the agent session; it auto-opens (focus flips) on SessionCreated.
+        app.send(Request::ResumeAgent {
+            worktree,
+            session_id,
+            tool,
+        });
+        app.footer = "resuming session…".into();
+        true
+    } else {
+        false
+    }
+}
+
+/// Move focus into the terminal pane: re-focus the current session if attached,
+/// otherwise open the selected one.
+fn focus_terminal(app: &mut App) {
+    if app.attached.is_some() {
+        app.focus = Focus::Term;
+        app.footer = TERM_HINT.into();
+    } else {
+        open_selected(app);
+    }
+}
+
+/// Launch a fresh agent session (`claude` / `opencode`) in the selected
+/// worktree. It auto-opens when the daemon reports it created.
+fn start_agent(app: &mut App, cmd: &str) {
+    if let Some(w) = app.selected_worktree() {
+        let worktree = w.path.clone();
+        app.send(Request::CreateSession {
+            worktree,
+            name: cmd.to_string(),
+            command: cmd.to_string(),
+        });
+        app.footer = format!("starting {cmd}…");
+    }
+}
+
 fn handle_term_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // Ctrl+Q is the one key we intercept — it returns to the explorer. Every
-    // other key (including Ctrl+A, which agents use for start-of-line) is
+    // Ctrl+H (vim: move left) and Ctrl+Q return to the explorer. Everything
+    // else — including Ctrl+L (clear screen) and Ctrl+A (start of line) — is
     // forwarded untouched to the session.
-    if ctrl && matches!(key.code, KeyCode::Char('q')) {
+    if ctrl && matches!(key.code, KeyCode::Char('h') | KeyCode::Char('q')) {
         app.focus = Focus::Nav;
         app.footer = NAV_HINT.into();
         return;
@@ -692,22 +728,6 @@ fn submit_prompt(app: &mut App, prompt: Prompt) {
                 name,
                 command: String::new(),
             });
-        }
-        PromptKind::RunCommand { worktree } => {
-            if input.is_empty() {
-                app.footer = "command required".into();
-            } else {
-                let name = input
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("cmd")
-                    .to_string();
-                app.send(Request::CreateSession {
-                    worktree,
-                    name,
-                    command: input,
-                });
-            }
         }
         PromptKind::RenameSession { id } => {
             if !input.is_empty() {
@@ -1016,11 +1036,17 @@ mod tests {
     use crate::protocol::{AgentInfo, SessionInfo, Status, WorktreeInfo};
 
     fn sess(id: u64, name: &str) -> SessionInfo {
+        sess_status(id, name, Status::Idle)
+    }
+    fn running(id: u64, name: &str) -> SessionInfo {
+        sess_status(id, name, Status::Running)
+    }
+    fn sess_status(id: u64, name: &str, status: Status) -> SessionInfo {
         SessionInfo {
             id,
             name: name.into(),
             command: String::new(),
-            status: Status::Idle,
+            status,
             agent_id: None,
         }
     }
@@ -1046,7 +1072,11 @@ mod tests {
         }
     }
     fn app_with(tree: Vec<WorktreeInfo>) -> App {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        app_with_rx(tree).0
+    }
+
+    fn app_with_rx(tree: Vec<WorktreeInfo>) -> (App, mpsc::UnboundedReceiver<Request>) {
+        let (tx, rx) = mpsc::unbounded_channel();
         let mut app = App {
             root: "/r".into(),
             tree,
@@ -1065,7 +1095,7 @@ mod tests {
             should_quit: false,
         };
         app.rebuild_rows();
-        app
+        (app, rx)
     }
 
     #[test]
@@ -1146,6 +1176,21 @@ mod tests {
     }
 
     #[test]
+    fn active_worktree_stays_expanded_on_startup() {
+        let mut app = app_with(vec![]);
+        handle_daemon_event(
+            &mut app,
+            tree_ev(vec![
+                wt("/r/busy", vec![running(1, "agent")], vec![]),
+                wt("/r/idle", vec![sess(2, "sh")], vec![]),
+            ]),
+        );
+        assert!(!app.collapsed.contains("/r/busy")); // has a running session
+        assert!(app.collapsed.contains("/r/idle")); // quiet -> collapsed
+        assert_eq!(app.rows.len(), 3); // busy: header+session, idle: header
+    }
+
+    #[test]
     fn new_worktree_added_later_is_collapsed() {
         let mut app = app_with(vec![]);
         handle_daemon_event(&mut app, tree_ev(vec![wt("/r/a", vec![sess(1, "x")], vec![])]));
@@ -1203,6 +1248,46 @@ mod tests {
             column,
             row,
             modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_l_from_nav_opens_and_focuses_terminal() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
+        app.selected = 1; // the session row
+        handle_key(&mut app, ctrl('l'));
+        assert_eq!(app.focus, Focus::Term);
+        match rx.try_recv() {
+            Ok(Request::Attach { id, .. }) => assert_eq!(id, 7),
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_h_from_term_returns_to_explorer_without_forwarding() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
+        app.attached = Some(7);
+        app.focus = Focus::Term;
+        handle_key(&mut app, ctrl('h'));
+        assert_eq!(app.focus, Focus::Nav);
+        assert!(rx.try_recv().is_err()); // nothing forwarded to the PTY
+    }
+
+    #[test]
+    fn ctrl_l_in_term_is_forwarded_to_app() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
+        app.attached = Some(7);
+        app.focus = Focus::Term;
+        handle_key(&mut app, ctrl('l'));
+        assert_eq!(app.focus, Focus::Term); // stays in the terminal
+        match rx.try_recv() {
+            // Ctrl+L encodes to 0x0C (form feed / clear screen).
+            Ok(Request::Input { data, .. }) => assert_eq!(data, vec![0x0c]),
+            other => panic!("expected Input, got {other:?}"),
         }
     }
 

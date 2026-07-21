@@ -23,13 +23,15 @@ to the worktree/session core.
 │ ▾ feature-x              ││                                  │
 │   ◐ claude               ││                                  │
 └──────────────────────────┘└──────────────────────────────────┘
- j/k move · Enter open · n shell · c run cmd · w worktree · x kill · q quit
+ j/k move · Enter open · c claude · o opencode · n shell · w worktree · x kill · q quit
 ```
 
 Live sessions show a status dot (`●`/`◐`/`○`/`✕`); resumable agent sessions show
 a tool glyph (`✻` Claude, `◆` OpenCode) with their title and how long ago they
-were active. Worktrees start folded, and agent sessions inactive for more than 3
-days are hidden until you press `o`.
+were active. Worktrees start folded — except any with an actively-running
+(green) session, which stay expanded so work in progress is visible. Agent
+sessions inactive for more than 3 days are hidden until you press `a`. Press
+`c`/`o` to start a fresh Claude / OpenCode session in the selected worktree.
 
 ## Architecture
 
@@ -75,25 +77,30 @@ Run it from inside a git repository.
 | key | action |
 |-----|--------|
 | `j`/`k` or ↑/↓ | move selection |
-| `Enter` | open the selected live session, **or resume** the selected Claude session (auto-focuses the terminal) |
+| `Enter` | open the selected live session, **or resume** the selected agent session (auto-focuses the terminal) |
+| `c` | start a new **Claude** session (`claude`) in the selected worktree |
+| `o` | start a new **OpenCode** session (`opencode`) in the selected worktree |
 | `n` | new **shell** session in the selected worktree (prompts for a name; runs your login shell) |
-| `c` | new session that **runs a command** (e.g. `claude`); the command's first word becomes the name |
 | `Space` | fold/unfold the selected worktree (`z` folds/unfolds all) |
-| `o` | toggle showing Claude sessions older than 3 days (hidden by default) |
+| `a` | toggle showing agent sessions older than 3 days (hidden by default) |
 | `w` | new worktree (prompts for a branch name; created as a sibling dir) |
 | `x` | kill the selected session |
 | `d` | remove the selected worktree (not the root) |
 | `r` | rename the selected session |
 | `q` | quit the TUI (sessions keep running in the daemon) |
 
-### Keys — terminal focus
-
-Every keystroke is forwarded to the session **except** `Ctrl+Q`, so agent
-keybindings like `Ctrl+A` (start of line) work normally.
+### Moving between panes (vim-style)
 
 | key | action |
 |-----|--------|
-| `Ctrl+Q` | return to the explorer |
+| `Ctrl+L` | focus the terminal (from the explorer) |
+| `Ctrl+H` | focus the explorer (from the terminal); `Ctrl+Q` also works |
+
+### Keys — terminal focus
+
+Every keystroke is forwarded to the session **except** `Ctrl+H`/`Ctrl+Q` (which
+return to the explorer), so agent keybindings like `Ctrl+A` (start of line) and
+`Ctrl+L` (clear screen) work normally.
 
 ## Build
 
