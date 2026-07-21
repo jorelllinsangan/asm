@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::net::UnixListener;
@@ -29,13 +29,28 @@ const AGENT_REFRESH: Duration = Duration::from_secs(2);
 /// Most-recent Claude sessions to surface per worktree.
 const AGENT_LIMIT: usize = 12;
 
+/// vt100 callback that records a *real* audible bell (`^G`). Using the callback
+/// (rather than scanning bytes for 0x07) correctly ignores BELs that merely
+/// terminate OSC sequences like window-title changes.
+#[derive(Clone)]
+struct BellFlag(Arc<AtomicBool>);
+
+impl vt100::Callbacks for BellFlag {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// State the PTY reader thread and the status computation share. The daemon
 /// keeps an authoritative terminal emulator per session so a (re)attaching
 /// client gets the true current screen, not a replay of a truncated byte log.
 struct SessionShared {
-    parser: vt100::Parser,
+    parser: vt100::Parser<BellFlag>,
     last_output: Instant,
     exited: bool,
+    /// Set by the bell callback; means the app rang for attention (finished /
+    /// awaiting a response). Cleared when the session is attached.
+    bell: Arc<AtomicBool>,
 }
 
 struct Session {
@@ -137,10 +152,17 @@ impl Daemon {
         let writer = pair.master.take_writer().context("take writer failed")?;
 
         let (output_tx, _) = broadcast::channel(1024);
+        let bell = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Mutex::new(SessionShared {
-            parser: vt100::Parser::new(24, 80, SCROLLBACK_LINES),
+            parser: vt100::Parser::new_with_callbacks(
+                24,
+                80,
+                SCROLLBACK_LINES,
+                BellFlag(bell.clone()),
+            ),
             last_output: Instant::now(),
             exited: false,
+            bell,
         }));
 
         {
@@ -206,6 +228,8 @@ impl Daemon {
     fn attach(&self, id: SessionId) -> Option<(Vec<u8>, broadcast::Receiver<Vec<u8>>)> {
         let s = self.sessions.lock().unwrap().get(&id).cloned()?;
         let shared = s.shared.lock().unwrap();
+        // Attending to the session clears its "needs attention" bell.
+        shared.bell.store(false, Ordering::Relaxed);
         let rx = s.output_tx.subscribe();
         let screen = shared.parser.screen();
         let mut snapshot = mouse_mode_setup(screen);
@@ -605,17 +629,20 @@ fn compute_status(sh: &SessionShared) -> Status {
     if sh.exited {
         Status::Exited
     } else if sh.last_output.elapsed() < RUNNING_WINDOW {
+        // Still actively producing output.
         Status::Running
-    } else if tail_looks_waiting(&sh.parser.screen().contents()) {
+    } else if sh.bell.load(Ordering::Relaxed) || tail_looks_waiting(&sh.parser.screen().contents())
+    {
+        // Rang for attention, or a shell shows a confirmation prompt.
         Status::Waiting
     } else {
         Status::Idle
     }
 }
 
-/// Heuristic: does the last non-empty screen line look like a prompt awaiting
-/// input? `contents()` is already plain text (no escapes). Conservative — false
-/// negatives just show as Idle.
+/// Does the last non-empty screen line look like a shell confirmation prompt?
+/// Kept to unambiguous patterns — agent TUIs are covered by the bell instead,
+/// so we avoid noisy needles like "?" that fire on their footers.
 fn tail_looks_waiting(text: &str) -> bool {
     let last = text
         .lines()
@@ -624,10 +651,9 @@ fn tail_looks_waiting(text: &str) -> bool {
         .unwrap_or("")
         .trim_end();
     const NEEDLES: &[&str] = &[
-        "(y/n)", "[y/n]", "[Y/n]", "[y/N]", "(yes/no)", "❯", "›", "?", "password:",
-        "Password:", "Press enter", "Continue?", "overwrite?",
+        "(y/n)", "[y/n]", "[Y/n]", "[y/N]", "(yes/no)", "password:", "Password:", "passphrase:",
     ];
-    NEEDLES.iter().any(|n| last.ends_with(n) || last.contains(n))
+    NEEDLES.iter().any(|n| last.contains(n))
 }
 
 fn paths_eq(a: &Path, b: &Path) -> bool {
@@ -827,5 +853,60 @@ async fn forward_output(
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared_fed(bytes: &[u8]) -> SessionShared {
+        let bell = Arc::new(AtomicBool::new(false));
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 100, BellFlag(bell.clone()));
+        parser.process(bytes);
+        // Old enough that it's not counted as "recently producing output".
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now);
+        SessionShared {
+            parser,
+            last_output: old,
+            exited: false,
+            bell,
+        }
+    }
+
+    #[test]
+    fn audible_bell_marks_waiting() {
+        let sh = shared_fed(b"working done\x07");
+        assert_eq!(compute_status(&sh), Status::Waiting);
+    }
+
+    #[test]
+    fn osc_title_terminator_bell_is_not_waiting() {
+        // The BEL here only terminates an OSC window-title set; it must NOT be
+        // treated as an attention bell.
+        let sh = shared_fed(b"\x1b]2;my title\x07 done");
+        assert_eq!(compute_status(&sh), Status::Idle);
+    }
+
+    #[test]
+    fn quiet_without_bell_is_idle() {
+        let sh = shared_fed(b"some plain output\n");
+        assert_eq!(compute_status(&sh), Status::Idle);
+    }
+
+    #[test]
+    fn shell_confirm_prompt_is_waiting() {
+        let sh = shared_fed(b"Overwrite file? (y/n) ");
+        assert_eq!(compute_status(&sh), Status::Waiting);
+    }
+
+    #[test]
+    fn recent_output_is_running_even_with_bell() {
+        let mut sh = shared_fed(b"streaming\x07");
+        sh.last_output = Instant::now(); // just produced output
+        assert_eq!(compute_status(&sh), Status::Running);
     }
 }

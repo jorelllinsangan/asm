@@ -785,7 +785,15 @@ fn tree_items(app: &App) -> Vec<ListItem<'static>> {
             Row::Worktree { wt } => app.tree.get(wt).map(|w| {
                 let count =
                     w.sessions.len() + w.agents.iter().filter(|a| app.agent_visible(a)).count();
-                worktree_item(w, app.collapsed.contains(&w.path), count)
+                let collapsed = app.collapsed.contains(&w.path);
+                // When folded, surface the most important child status so a
+                // session awaiting a response is still visible.
+                let summary = if collapsed {
+                    summary_status(&w.sessions)
+                } else {
+                    None
+                };
+                worktree_item(w, collapsed, count, summary)
             }),
             Row::Session { wt, se } => app
                 .tree
@@ -820,7 +828,24 @@ fn draw_tree(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn worktree_item(w: &WorktreeInfo, collapsed: bool, count: usize) -> ListItem<'static> {
+/// Highest-priority status among a worktree's sessions (Waiting outranks
+/// Running); `None` if nothing is notable. Used for the folded-header summary.
+fn summary_status(sessions: &[SessionInfo]) -> Option<Status> {
+    if sessions.iter().any(|s| s.status == Status::Waiting) {
+        Some(Status::Waiting)
+    } else if sessions.iter().any(|s| s.status == Status::Running) {
+        Some(Status::Running)
+    } else {
+        None
+    }
+}
+
+fn worktree_item(
+    w: &WorktreeInfo,
+    collapsed: bool,
+    count: usize,
+    summary: Option<Status>,
+) -> ListItem<'static> {
     let icon = if collapsed { "▸" } else { "▾" };
     let marker = if w.is_root { " (root)" } else { "" };
     let badge = if collapsed && count > 0 {
@@ -828,14 +853,22 @@ fn worktree_item(w: &WorktreeInfo, collapsed: bool, count: usize) -> ListItem<'s
     } else {
         String::new()
     };
-    ListItem::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!("{icon} {}", w.branch),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(marker, Style::default().fg(Color::DarkGray)),
         Span::styled(badge, Style::default().fg(Color::DarkGray)),
-    ]))
+    ];
+    if let Some(status) = summary {
+        let (glyph, color) = status_glyph(status);
+        spans.push(Span::styled(
+            format!(" {glyph}"),
+            Style::default().fg(color),
+        ));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 fn session_item(s: &SessionInfo) -> ListItem<'static> {
@@ -1173,6 +1206,17 @@ mod tests {
         // A refresh with the same worktree must not re-collapse it.
         handle_daemon_event(&mut app, tree_ev(vec![wt("/r/a", vec![sess(1, "x")], vec![])]));
         assert_eq!(app.rows.len(), 2);
+    }
+
+    #[test]
+    fn folded_header_summary_prioritizes_waiting() {
+        let waiting = sess_status(2, "b", Status::Waiting);
+        assert_eq!(
+            summary_status(&[running(1, "a"), waiting]),
+            Some(Status::Waiting) // waiting outranks running
+        );
+        assert_eq!(summary_status(&[running(1, "a")]), Some(Status::Running));
+        assert_eq!(summary_status(&[sess(1, "a")]), None); // idle only -> no marker
     }
 
     #[test]

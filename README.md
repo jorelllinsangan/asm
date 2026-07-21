@@ -55,12 +55,17 @@ Each session shows a heuristic status in the tree, refreshed ~every 400ms:
 | glyph | meaning |
 |-------|---------|
 | ● green  | Running — produced output very recently |
-| ◐ yellow | Waiting — output tail looks like an input prompt |
+| ◐ yellow | Waiting — the app rang the terminal bell (finished / needs a response) |
 | ○ gray   | Idle — alive but quiet |
 | ✕ red    | Exited — child process ended |
 
-The Waiting detection is a conservative heuristic (prompt-shaped tails); false
-negatives just show as Idle.
+**Waiting** is driven by the terminal bell (`^G`): agents like Claude Code ring
+it when they finish and await input, so `◐` means "this session wants you". The
+bell clears once you open the session. (A quiet shell showing a `(y/n)` /
+`password:` prompt is also flagged.) For best results, leave terminal-bell
+notifications enabled in your agent. When a worktree is folded, its header shows
+the highest-priority child status, so a waiting session is visible without
+unfolding.
 
 ## Usage
 
