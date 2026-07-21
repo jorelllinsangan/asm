@@ -30,7 +30,7 @@ const LEFT_WIDTH: u16 = 34;
 const OLD_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
 
 const NAV_HINT: &str =
-    "j/k move · Space fold · Enter open · c claude · o opencode · n shell · w worktree · x kill · r rename · a old · q quit";
+    "j/k move · Space fold · Enter open · c claude · o opencode · n shell · w worktree · x kill · r refresh · R rename · a old · q quit";
 const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) returns to the explorer";
 
 /// Which pane keystrokes go to.
@@ -451,6 +451,10 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('r') => {
+            app.send(Request::Refresh);
+            app.footer = "refreshing…".into();
+        }
+        KeyCode::Char('R') => {
             if let Some((_, id)) = app.selected_session() {
                 app.prompt = Some(Prompt {
                     kind: PromptKind::RenameSession { id },

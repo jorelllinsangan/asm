@@ -308,6 +308,16 @@ impl Daemon {
         let _ = self.tree_tx.send(self.build_tree());
     }
 
+    /// Full reconciliation on demand: prune worktrees whose dirs are gone, drop
+    /// the transcript title cache (so renamed/deleted sessions are re-read),
+    /// rescan agent sessions, and rebroadcast.
+    fn refresh_all(&self) {
+        let _ = git::prune_worktrees(&self.root);
+        self.title_cache.lock().unwrap().clear();
+        self.refresh_agents();
+        self.broadcast_tree();
+    }
+
     /// Refresh the per-worktree agent-session cache from Claude transcripts and
     /// the OpenCode DB. Blocking I/O; runs on its own thread on a slow tick.
     fn refresh_agents(&self) {
@@ -759,6 +769,11 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
         match req {
             Request::Hello => {
                 let _ = out_tx.send(daemon.build_tree());
+            }
+            Request::Refresh => {
+                // Blocking git/fs work off the socket task.
+                let daemon = daemon.clone();
+                tokio::task::spawn_blocking(move || daemon.refresh_all());
             }
             Request::CreateWorktree { branch } => match daemon.create_worktree(&branch) {
                 Ok(()) => daemon.broadcast_tree(),

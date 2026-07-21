@@ -109,6 +109,13 @@ pub fn add_worktree(root: &Path, branch: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Prune worktree entries whose directories no longer exist (e.g. deleted
+/// without `git worktree remove`).
+pub fn prune_worktrees(root: &Path) -> Result<()> {
+    run(&["worktree", "prune"], root)?;
+    Ok(())
+}
+
 pub fn remove_worktree(root: &Path, path: &Path, force: bool) -> Result<()> {
     let path_str = path.to_string_lossy();
     let mut args = vec!["worktree", "remove"];

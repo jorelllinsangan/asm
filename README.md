@@ -91,8 +91,18 @@ Run it from inside a git repository.
 | `w` | new worktree (prompts for a branch name; created as a sibling dir) |
 | `x` | kill the selected session |
 | `d` | remove the selected worktree (not the root) |
-| `r` | rename the selected session |
+| `r` | force refresh (also runs `git worktree prune`) |
+| `R` | rename the selected session |
 | `q` | quit the TUI (sessions keep running in the daemon) |
+
+**The explorer tracks git's live state on its own** — the daemon re-lists
+worktrees ~every 0.4s and rescans agent sessions ~every 2s, so adding a
+worktree, a `git worktree remove`, or a session finishing all show up within a
+moment without any action. `r` is just a convenience: it forces an immediate
+reconciliation and additionally runs `git worktree prune`, which is the one
+thing the poll can't do on its own — a worktree whose directory you delete
+*without* `git worktree remove` keeps appearing in `git worktree list` until
+pruned.
 
 ### Moving between panes (vim-style)
 

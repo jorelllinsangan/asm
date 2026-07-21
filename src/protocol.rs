@@ -12,6 +12,9 @@ pub type SessionId = u64;
 pub enum Request {
     /// Sent once on connect; daemon replies with a fresh [`Event::Tree`].
     Hello,
+    /// Force full reconciliation: prune dropped worktrees, drop caches, rescan
+    /// agent sessions, and rebroadcast the tree.
+    Refresh,
     /// Create a new git worktree off the root repo on a new branch.
     CreateWorktree { branch: String },
     /// Remove a worktree (must not be the root).
