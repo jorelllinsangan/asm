@@ -34,8 +34,7 @@ const NAV_HINT: &str =
     "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · x kill · Ctrl+] editor · Ctrl+G diff · q quit";
 const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor · Ctrl+G diff";
 const EDITOR_HINT: &str = "EDITOR · Ctrl+] hides it (keeps running) · Ctrl+H explorer";
-const DIFF_HINT: &str =
-    "DIFF · j/k move · c comment · x delete · s submit · ]/[ file · n/p hunk · r refresh · Esc close";
+const DIFF_HINT: &str = "DIFF · j/k move · v select block · c comment · x delete · s submit · ]/[ file · n/p hunk · r refresh · Esc close";
 const COMMENT_HINT: &str = "COMMENT · Enter newline · Ctrl+S save · Esc cancel (blank = delete)";
 /// Fraction of the terminal pane width given to the editor in the split view.
 const EDITOR_SPLIT_PCT: u16 = 50;
@@ -112,9 +111,9 @@ struct Prompt {
 /// The footer [`Prompt`] is single-line by construction; a review comment that
 /// can't hold a paragraph isn't worth writing, so this gets its own overlay.
 struct CommentEditor {
+    /// The line — or block of lines — being annotated. Echoed in the popup so
+    /// you can see what you're commenting on while you type.
     anchor: CommentAnchor,
-    /// The source line being annotated, echoed in the popup for context.
-    quoted: String,
     body: String,
     /// Byte offset of the insertion point within `body`. Always kept on a
     /// `char` boundary by the movement/edit helpers.
@@ -748,7 +747,26 @@ fn handle_diff_key(app: &mut App, key: KeyEvent) {
         }
     }
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => close_diff(app),
+        // Esc backs out one layer at a time: an in-progress block selection
+        // first, the pane only once there's no selection to lose.
+        KeyCode::Esc => {
+            if app.diff.as_ref().is_some_and(|d| d.selecting()) {
+                diff_nav(app, DiffView::clear_selection);
+                app.footer = "selection cleared".into();
+            } else {
+                close_diff(app);
+            }
+        }
+        KeyCode::Char('q') => close_diff(app),
+        // Start/stop extending a block selection; j/k then grow it.
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            diff_nav(app, DiffView::toggle_selection);
+            app.footer = if app.diff.as_ref().is_some_and(|d| d.selecting()) {
+                "selecting a block — j/k to extend · c to comment on it · Esc to cancel".into()
+            } else {
+                DIFF_HINT.into()
+            };
+        }
         KeyCode::Char('j') | KeyCode::Down => move_diff_cursor(app, 1),
         KeyCode::Char('k') | KeyCode::Up => move_diff_cursor(app, -1),
         KeyCode::Char('g') | KeyCode::Home => {
@@ -797,25 +815,28 @@ fn diff_nav(app: &mut App, f: impl Fn(&mut DiffView)) {
     }
 }
 
-/// Open the comment popup on the cursor line, pre-filled when a comment is
-/// already there (so `c` edits rather than starting over).
+/// Open the comment popup on the selected block, or the cursor line when there
+/// is no selection. Pre-filled when a comment already covers the cursor, so `c`
+/// edits it rather than stacking a second one on top.
 fn open_comment_editor(app: &mut App) {
     let Some(d) = app.diff.as_ref() else {
         return;
     };
-    let Some((anchor, quoted)) = d.cursor_anchor() else {
-        app.footer = "move to a diff line to comment on it".into();
-        return;
+    // An existing comment under the cursor wins: editing it is almost always
+    // what `c` means there, and it keeps the original block's anchor intact.
+    let existing = d.comment_at_cursor().and_then(|ci| d.comments.get(ci));
+    let (anchor, body) = match existing {
+        Some(c) => (c.anchor.clone(), c.body.clone()),
+        None => match d.pending_anchor() {
+            Some(a) => (a, String::new()),
+            None => {
+                app.footer = "move to a diff line to comment on it".into();
+                return;
+            }
+        },
     };
-    let body = d
-        .comments
-        .iter()
-        .find(|c| c.anchor == anchor)
-        .map(|c| c.body.clone())
-        .unwrap_or_default();
     app.comment_editor = Some(CommentEditor {
         anchor,
-        quoted,
         cursor: body.len(),
         body,
     });
@@ -829,7 +850,10 @@ fn handle_comment_key(app: &mut App, key: KeyEvent) {
             return;
         };
         if let Some(d) = app.diff.as_mut() {
-            d.set_comment(ed.anchor, ed.quoted, ed.body);
+            d.set_comment(ed.anchor, ed.body);
+            // The block has been captured on the comment; drop the selection so
+            // the next movement isn't still dragging it.
+            d.clear_selection();
         }
         app.footer = DIFF_HINT.into();
         return;
@@ -968,7 +992,8 @@ fn submit_review(app: &mut App) {
         }
     };
     let n = d.comments.len();
-    let text = format_review(&d.comments);
+    // Top-to-bottom, not the order the notes happened to be written in.
+    let text = format_review(&d.ordered_comments());
     // The attached session's own emulator tells us whether the agent turned
     // bracketed paste on, the same way mouse forwarding is gated.
     let bracketed = app
@@ -1659,16 +1684,19 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .skip(d.scroll)
         .take(inner.height as usize)
-        .map(|(i, row)| diff_row_line(d, *row, i == d.cursor && focused))
+        .map(|(i, row)| diff_row_line(d, *row, i == d.cursor && focused, d.is_selected(i)))
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Render one row. Tabs are expanded because a raw `\t` in a ratatui `Line`
 /// collapses to a single cell and wrecks the diff's alignment.
-fn diff_row_line(d: &DiffView, row: DiffRow, selected: bool) -> Line<'static> {
+fn diff_row_line(d: &DiffView, row: DiffRow, at_cursor: bool, in_block: bool) -> Line<'static> {
+    // The cursor reverses; a row inside the pending block gets a band behind it,
+    // so the two read differently where they overlap.
     let sel = |s: Style| {
-        if selected {
+        let s = if in_block { s.bg(Color::Indexed(237)) } else { s };
+        if at_cursor {
             s.add_modifier(Modifier::REVERSED)
         } else {
             s
@@ -1771,17 +1799,36 @@ fn draw_comment_editor(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, popup);
 
     let dim = Style::default().fg(Color::DarkGray);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("{}:{}", ed.anchor.path, ed.anchor.line),
-            Style::default().fg(Color::Cyan),
-        )),
-        Line::from(Span::styled(
-            format!("> {}", ed.quoted.trim().replace('\t', "    ")),
+    let mut lines = vec![Line::from(Span::styled(
+        format!("{}:{}", ed.anchor.path, ed.anchor.label()),
+        Style::default().fg(Color::Cyan),
+    ))];
+    // Echo the block being annotated, capped so a large selection can't push
+    // the text area off the popup.
+    const PREVIEW: usize = 6;
+    for l in ed.anchor.lines.iter().take(PREVIEW) {
+        let marker = match l.kind {
+            LineKind::Add => '+',
+            LineKind::Del => '-',
+            LineKind::Context => ' ',
+        };
+        let tint = match l.kind {
+            LineKind::Add => Color::Green,
+            LineKind::Del => Color::Red,
+            LineKind::Context => Color::DarkGray,
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{}", l.text.replace('\t', "    ")),
+            Style::default().fg(tint),
+        )));
+    }
+    if ed.anchor.lines.len() > PREVIEW {
+        lines.push(Line::from(Span::styled(
+            format!("… and {} more line(s)", ed.anchor.lines.len() - PREVIEW),
             dim,
-        )),
-        Line::from(""),
-    ];
+        )));
+    }
+    lines.push(Line::from(""));
     // The caret is spliced into the text rather than positioned as a hardware
     // cursor, which would need the wrapped layout's geometry to place.
     for l in ed.with_caret().split('\n') {
@@ -2939,8 +2986,10 @@ diff --git a/src/a.rs b/src/a.rs
         assert_eq!(d.comments.len(), 1);
         assert_eq!(d.comments[0].body, "why?");
         assert_eq!(d.comments[0].anchor.path, "src/a.rs");
-        assert_eq!(d.comments[0].anchor.line, 11); // the added line's new number
-        assert_eq!(d.comments[0].quoted, "let added = 2;");
+        let pinned = &d.comments[0].anchor.lines;
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].line, 11); // the added line's new number
+        assert_eq!(pinned[0].text, "let added = 2;");
         assert!(app.comment_editor.is_none(), "editor closed on save");
     }
 
@@ -2973,12 +3022,7 @@ diff --git a/src/a.rs b/src/a.rs
     #[test]
     fn comment_editing_handles_backspace_and_multibyte_text() {
         let mut ed = CommentEditor {
-            anchor: CommentAnchor {
-                path: "a".into(),
-                side: crate::diff::Side::New,
-                line: 1,
-            },
-            quoted: String::new(),
+            anchor: CommentAnchor { path: "a".into(), lines: Vec::new() },
             body: String::new(),
             cursor: 0,
         };
@@ -3016,7 +3060,7 @@ diff --git a/src/a.rs b/src/a.rs
         );
         let d = app.diff.as_ref().unwrap();
         assert_eq!(d.comments.len(), 1);
-        assert_eq!(d.comments[0].anchor.line, 41);
+        assert_eq!(d.comments[0].anchor.lines[0].line, 41);
     }
 
     #[test]
@@ -3075,6 +3119,29 @@ diff --git a/src/a.rs b/src/a.rs
         assert!(text.contains("src/a.rs:11"));
         assert!(text.contains("> let added = 2;"));
         assert!(text.contains("hoist this"));
+    }
+
+    #[test]
+    fn a_submitted_review_reads_in_diff_order() {
+        let (mut app, mut rx) = app_reviewing_block();
+        cursor_on_line(&mut app, "let also = 3;"); // lower in the file, written first
+        write_comment(&mut app, "SECOND");
+        cursor_on_line(&mut app, "let keep = 1;");
+        write_comment(&mut app, "FIRST");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('s')));
+
+        let data = loop {
+            match rx.try_recv() {
+                Ok(Request::Input { data, .. }) => break data,
+                Ok(_) => continue,
+                Err(e) => panic!("expected Input, got {e:?}"),
+            }
+        };
+        let text = String::from_utf8(data).unwrap();
+        assert!(
+            text.find("FIRST") < text.find("SECOND"),
+            "comments must be ordered by position, not authoring:\n{text}"
+        );
     }
 
     #[test]
@@ -3217,6 +3284,128 @@ diff --git a/src/a.rs b/src/a.rs
         assert!(app.footer.contains("diff line"), "got: {}", app.footer);
     }
 
+    // ---- block selection ----
+
+    /// A two-line addition, so a block has something to span.
+    const BLOCK_DIFF: &str = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -10,1 +10,3 @@
+ let keep = 1;
++let added = 2;
++let also = 3;
+";
+
+    fn app_reviewing_block() -> (App, mpsc::UnboundedReceiver<Request>) {
+        let (mut app, rx) = app_with_rx(vec![wt("/r/a", vec![claude_sess(1, "claude")], vec![])]);
+        app.attached = Some(1);
+        handle_daemon_event(
+            &mut app,
+            Event::Diff {
+                worktree: "/r/a".into(),
+                text: BLOCK_DIFF.into(),
+                skipped_untracked: 0,
+            },
+        );
+        (app, rx)
+    }
+
+    #[test]
+    fn v_starts_a_selection_that_jk_extends() {
+        let (mut app, _rx) = app_reviewing_block();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        assert!(app.diff.as_ref().unwrap().selecting());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+
+        let a = app.diff.as_ref().unwrap().pending_anchor().unwrap();
+        assert_eq!(a.lines.len(), 2);
+        assert_eq!(a.label(), "11-12");
+    }
+
+    #[test]
+    fn commenting_on_a_selection_anchors_the_whole_block() {
+        let (mut app, _rx) = app_reviewing_block();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+        write_comment(&mut app, "hoist this block");
+
+        let d = app.diff.as_ref().unwrap();
+        assert_eq!(d.comments.len(), 1);
+        assert!(d.comments[0].anchor.is_range());
+        assert_eq!(d.comments[0].anchor.lines.len(), 2);
+        assert!(!d.selecting(), "selection released after commenting");
+    }
+
+    #[test]
+    fn esc_cancels_a_selection_before_it_closes_the_pane() {
+        let (mut app, _rx) = app_reviewing_block();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(!app.diff.as_ref().unwrap().selecting());
+        assert!(app.diff_showing(), "pane must survive the first Esc");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(!app.diff_showing(), "second Esc closes it");
+    }
+
+    #[test]
+    fn c_inside_an_existing_block_edits_it_rather_than_starting_a_new_one() {
+        let (mut app, _rx) = app_reviewing_block();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+        write_comment(&mut app, "first");
+
+        // Park on the block's *first* line, which is not where it renders.
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        let ed = app.comment_editor.as_ref().expect("editor opened");
+        assert_eq!(ed.body, "first", "pre-filled with the existing comment");
+        assert_eq!(ed.anchor.lines.len(), 2, "keeps the block anchor");
+    }
+
+    #[test]
+    fn submitting_a_block_sends_the_range_and_every_line() {
+        let (mut app, mut rx) = app_reviewing_block();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+        write_comment(&mut app, "hoist this block");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('s')));
+
+        let data = loop {
+            match rx.try_recv() {
+                Ok(Request::Input { data, .. }) => break data,
+                Ok(_) => continue,
+                Err(e) => panic!("expected Input, got {e:?}"),
+            }
+        };
+        let text = String::from_utf8(data).unwrap();
+        assert!(text.contains("src/a.rs:11-12"), "range header:\n{text}");
+        assert!(text.contains("> +let added = 2;"), "first line:\n{text}");
+        assert!(text.contains("> +let also = 3;"), "last line:\n{text}");
+    }
+
+    #[test]
+    fn a_block_renders_as_one_comment_with_the_whole_span_marked() {
+        let (mut app, _rx) = app_reviewing_block();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+        write_comment(&mut app, "one note for both");
+
+        let screen = render(&app, 120, 24).join("\n");
+        assert_eq!(
+            screen.matches("┃ one note for both").count(),
+            1,
+            "a block comment renders once, not per line:\n{screen}"
+        );
+    }
+
     // ---- rendering ----
 
     /// Draw the whole app and return the screen as text, one string per row.
@@ -3259,7 +3448,8 @@ diff --git a/src/a.rs b/src/a.rs
         let screen = render(&app, 120, 24).join("\n");
         assert!(screen.contains("comment"), "popup title missing");
         assert!(screen.contains("src/a.rs:11"), "anchor missing");
-        assert!(screen.contains("> let added = 2;"), "quoted line missing");
+        // The popup echoes the annotated line with its diff marker.
+        assert!(screen.contains("+let added = 2;"), "quoted line missing:\n{screen}");
         assert!(screen.contains("needs a test▏"), "body + caret missing:\n{screen}");
     }
 

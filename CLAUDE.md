@@ -171,14 +171,29 @@ Things that will bite if you change them:
   same invariant `App::rows` holds for the tree. A comment contributes one row
   *per line of its body* — collapse that to one row and scrolling desyncs from
   the cursor.
-- **Comments anchor to `(path, side, line)`**, where additions/context anchor to
-  the new side and deletions to the old. Old:11 and New:11 are different
-  anchors; treating them as one merges unrelated comments.
-- **Re-anchoring across a refresh requires the quoted text to still match**, not
-  just the line number. Position-only matching silently re-points a comment at
-  whatever line has since taken that slot — for text that gets pasted to an
-  agent, a dropped comment you report beats a confidently misplaced one. This is
-  pinned by `refresh_drops_a_comment_whose_line_is_gone`.
+- **A comment anchors to a `Vec<CommentLine>`, not a line number.** Each entry is
+  `(side, line, kind, text)`; a single-line comment just has one. This is what
+  lets a block span a changed hunk, where deletions pin to the old side and
+  additions to the new — a `start..end` range would have to pick one side and
+  misreport the other. Old:11 and New:11 remain distinct anchors.
+  - `covers()` drives the gutter marker and "is the cursor in this comment", so
+    the whole block is flagged and `c` from anywhere inside it *edits*.
+  - `renders_under()` is the *last* covered line, so a block comment appears
+    after the block rather than inside it. Rendering under the first line puts
+    the note in the middle of the code it describes.
+- **Re-anchoring across a refresh matches the whole block as a contiguous run**
+  of identical `(text, kind)` lines, preferring the run still at the original
+  position. Three ways to get this wrong, each pinned by a test:
+  - position-only matching silently re-points a comment at whatever line took
+    that slot (`refresh_does_not_repin_a_comment_onto_unrelated_code`);
+  - matching lines individually lets a block scatter across the file
+    (`refresh_drops_a_block_whose_lines_no_longer_sit_together`);
+  - ignoring `kind` moves a comment from a deletion onto an identical addition,
+    inverting its meaning
+    (`refresh_will_not_move_a_comment_across_sides_onto_matching_text`).
+
+  For text that gets pasted to an agent, a dropped comment you report beats a
+  confidently misplaced one.
 - **Submission wraps the text in bracketed paste** (`ESC[200~`/`ESC[201~`), gated
   on `screen.bracketed_paste()` the same way mouse forwarding is gated on
   `mouse_protocol_mode`. Without it every `\n` reads as Enter and the agent fires

@@ -7,7 +7,8 @@
 //!
 //! [`DiffView::rows`] is the single source of truth for both the cursor and the
 //! rendering — the same invariant the worktree tree holds for `App::rows`. A
-//! comment contributes exactly one row, directly beneath the line it annotates.
+//! comment contributes one row per line of its body, beneath the last line it
+//! covers — a comment may span a block of lines, not just one.
 
 /// Which side of the diff a line (and so a comment on it) belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,43 +273,118 @@ pub fn parse_unified(raw: &str) -> Vec<FileDiff> {
     files
 }
 
-/// Where a review comment is pinned. Line numbers are the file's own, so they
-/// stay meaningful to an agent that never sees the diff.
+/// One source line a comment is pinned to.
+///
+/// The text is carried along because it, not the line number, is what survives
+/// the agent editing the file underneath a review — see [`reanchor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentLine {
+    pub side: Side,
+    pub line: u32,
+    pub kind: LineKind,
+    pub text: String,
+}
+
+/// Where a review comment is pinned: one or more consecutive lines of one file.
+///
+/// Holding every covered line (rather than a `start..end` pair) is what lets a
+/// block comment span a changed hunk, where deletions pin to the old side and
+/// additions to the new. A `start`/`end` range would have to pick one side and
+/// silently misreport the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommentAnchor {
     pub path: String,
-    pub side: Side,
-    pub line: u32,
+    /// In diff order. A single-line comment has exactly one entry.
+    pub lines: Vec<CommentLine>,
+}
+
+impl CommentAnchor {
+    pub fn is_range(&self) -> bool {
+        self.lines.len() > 1
+    }
+
+    /// The line the comment renders under — the last one it covers, so a block
+    /// comment appears after the block rather than in the middle of it.
+    fn last(&self) -> Option<&CommentLine> {
+        self.lines.last()
+    }
+
+    fn renders_under(&self, l: &DiffLine) -> bool {
+        match (self.last(), l.anchor_line()) {
+            (Some(last), Some(n)) => last.side == l.anchor_side() && last.line == n,
+            _ => false,
+        }
+    }
+
+    /// Whether this anchor covers `l` — drives the gutter marker, so the whole
+    /// block is visibly flagged, not just its final line.
+    pub fn covers(&self, l: &DiffLine) -> bool {
+        let Some(n) = l.anchor_line() else {
+            return false;
+        };
+        let side = l.anchor_side();
+        self.lines.iter().any(|c| c.side == side && c.line == n)
+    }
+
+    /// `11` or `11-13`, spanning the side the comment renders on. A block that
+    /// crosses sides reports the span of its trailing side; every covered line
+    /// is quoted in the review regardless, so nothing is lost.
+    pub fn label(&self) -> String {
+        let Some(last) = self.last() else {
+            return String::new();
+        };
+        let mut lo = last.line;
+        let mut hi = last.line;
+        for c in self.lines.iter().filter(|c| c.side == last.side) {
+            lo = lo.min(c.line);
+            hi = hi.max(c.line);
+        }
+        if lo == hi {
+            format!("{lo}")
+        } else {
+            format!("{lo}-{hi}")
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comment {
     pub anchor: CommentAnchor,
-    /// The source line as it read when the comment was written. Included in the
-    /// submitted review so the agent can locate the spot even if the line has
-    /// since moved, and used to re-anchor the comment across a diff refresh.
-    pub quoted: String,
     pub body: String,
 }
 
 /// Render the review as the text pasted into an agent session.
 ///
-/// Line numbers can go stale the moment the agent edits a file, so every comment
-/// carries its quoted source line — that, not the number, is what makes the
-/// location recoverable.
+/// Line numbers go stale the moment the agent edits a file, so every comment
+/// quotes the source it refers to — that, not the number, is what makes the
+/// location recoverable. Block comments additionally carry each line's `+`/`-`
+/// marker, since "this block" is meaningless if you can't tell which half of a
+/// changed hunk is being talked about.
 pub fn format_review(comments: &[Comment]) -> String {
     let n = comments.len();
     let noun = if n == 1 { "comment" } else { "comments" };
-    let mut out = format!(
-        "Code review — {n} {noun} on the current diff. Please address each one.\n"
-    );
+    let mut out =
+        format!("Code review — {n} {noun} on the current diff. Please address each one.\n");
     for c in comments {
-        let side = match c.anchor.side {
-            Side::Old => " (removed line)",
-            Side::New => "",
+        let a = &c.anchor;
+        // A lone deletion needs saying out loud; in a block the markers show it.
+        let suffix = match a.lines.as_slice() {
+            [one] if one.side == Side::Old => " (removed line)",
+            _ => "",
         };
-        out.push_str(&format!("\n{}:{}{}\n", c.anchor.path, c.anchor.line, side));
-        out.push_str(&format!("> {}\n", c.quoted.trim_end()));
+        out.push_str(&format!("\n{}:{}{}\n", a.path, a.label(), suffix));
+        for l in &a.lines {
+            if a.is_range() {
+                let m = match l.kind {
+                    LineKind::Add => '+',
+                    LineKind::Del => '-',
+                    LineKind::Context => ' ',
+                };
+                out.push_str(&format!("> {m}{}\n", l.text.trim_end()));
+            } else {
+                out.push_str(&format!("> {}\n", l.text.trim_end()));
+            }
+        }
         for l in c.body.trim_end().lines() {
             out.push_str(l);
             out.push('\n');
@@ -324,9 +400,9 @@ pub enum DiffRow {
     FileHeader { fi: usize },
     HunkHeader { fi: usize, hi: usize },
     Line { fi: usize, hi: usize, li: usize },
-    /// One line of a comment body, rendered under the line it annotates. A
-    /// multi-line comment contributes one row per line so that a row stays
-    /// exactly one screen line and the scroll arithmetic holds.
+    /// One line of a comment body, rendered under the last line it annotates. A
+    /// multi-line body contributes one row per line so that a row stays exactly
+    /// one screen line and the scroll arithmetic holds.
     Comment { ci: usize, li: usize },
 }
 
@@ -340,6 +416,13 @@ pub struct DiffView {
     pub cursor: usize,
     /// Index of the first row drawn; kept in range by [`Self::ensure_visible`].
     pub scroll: usize,
+    /// Row where a block selection started, if one is in progress. The selection
+    /// is the span between it and the cursor, so extending it is just movement.
+    pub sel_start: Option<usize>,
+    /// Comment indices in the order they appear on screen, so a submitted review
+    /// reads top-to-bottom instead of in the order the notes happened to be
+    /// written. Rebuilt with `rows`.
+    pub comment_order: Vec<usize>,
 }
 
 impl DiffView {
@@ -351,6 +434,8 @@ impl DiffView {
             rows: Vec::new(),
             cursor: 0,
             scroll: 0,
+            sel_start: None,
+            comment_order: Vec::new(),
         };
         v.rebuild_rows();
         v
@@ -360,10 +445,12 @@ impl DiffView {
         self.files.is_empty()
     }
 
-    /// Flatten files → hunks → lines, splicing each comment in beneath its
-    /// anchor line. Must stay in lockstep with the renderer, which walks `rows`.
+    /// Flatten files → hunks → lines, splicing each comment in beneath the last
+    /// line it covers. Must stay in lockstep with the renderer, which walks
+    /// `rows` and nothing else.
     pub fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
+        let mut order = Vec::new();
         for (fi, f) in self.files.iter().enumerate() {
             rows.push(DiffRow::FileHeader { fi });
             for (hi, h) in f.hunks.iter().enumerate() {
@@ -371,7 +458,8 @@ impl DiffView {
                 for (li, l) in h.lines.iter().enumerate() {
                     rows.push(DiffRow::Line { fi, hi, li });
                     for (ci, c) in self.comments.iter().enumerate() {
-                        if anchors_to(c, &f.path, l) {
+                        if c.anchor.path == f.path && c.anchor.renders_under(l) {
+                            order.push(ci);
                             for cl in 0..c.body.lines().count().max(1) {
                                 rows.push(DiffRow::Comment { ci, li: cl });
                             }
@@ -381,9 +469,18 @@ impl DiffView {
             }
         }
         self.rows = rows;
+        self.comment_order = order;
         if self.cursor >= self.rows.len() {
             self.cursor = self.rows.len().saturating_sub(1);
         }
+    }
+
+    /// Comments in on-screen order, ready to hand to [`format_review`].
+    pub fn ordered_comments(&self) -> Vec<Comment> {
+        self.comment_order
+            .iter()
+            .filter_map(|&ci| self.comments.get(ci).cloned())
+            .collect()
     }
 
     pub fn line_at(&self, row: usize) -> Option<(&FileDiff, &DiffLine)> {
@@ -396,52 +493,115 @@ impl DiffView {
         }
     }
 
-    /// The anchor + quoted text for a comment on the cursor row, or `None` when
-    /// the cursor isn't on a commentable line.
-    pub fn cursor_anchor(&self) -> Option<(CommentAnchor, String)> {
-        let (f, l) = self.line_at(self.cursor)?;
-        Some((
-            CommentAnchor {
-                path: f.path.clone(),
-                side: l.anchor_side(),
-                line: l.anchor_line()?,
-            },
-            l.text.clone(),
-        ))
+    // ---- block selection ----
+
+    /// Begin a block selection at the cursor, or drop the one in progress.
+    pub fn toggle_selection(&mut self) {
+        self.sel_start = match self.sel_start {
+            Some(_) => None,
+            None => Some(self.cursor),
+        };
     }
 
-    /// Index of the comment attached to the cursor — whether the cursor sits on
-    /// the annotated line or on the comment row itself.
+    pub fn clear_selection(&mut self) {
+        self.sel_start = None;
+    }
+
+    pub fn selecting(&self) -> bool {
+        self.sel_start.is_some()
+    }
+
+    /// The inclusive row span currently selected, if any.
+    pub fn selection_span(&self) -> Option<(usize, usize)> {
+        let s = self.sel_start?;
+        Some((s.min(self.cursor), s.max(self.cursor)))
+    }
+
+    pub fn is_selected(&self, row: usize) -> bool {
+        self.selection_span()
+            .is_some_and(|(lo, hi)| row >= lo && row <= hi)
+    }
+
+    /// The anchor a new comment would take: the selected block if one is active,
+    /// otherwise the cursor line alone. `None` when nothing commentable is
+    /// covered (the cursor is parked on a file or hunk header).
+    ///
+    /// A selection dragged across a file boundary keeps only the trailing file's
+    /// lines — a comment has one path, and the cursor is where the user is
+    /// looking.
+    pub fn pending_anchor(&self) -> Option<CommentAnchor> {
+        let (lo, hi) = self.selection_span().unwrap_or((self.cursor, self.cursor));
+        let hi = hi.min(self.rows.len().saturating_sub(1));
+        let mut picked: Vec<(usize, CommentLine)> = Vec::new();
+        for row in lo..=hi {
+            let DiffRow::Line { fi, .. } = self.rows[row] else {
+                continue;
+            };
+            let Some((_, l)) = self.line_at(row) else {
+                continue;
+            };
+            let Some(n) = l.anchor_line() else {
+                continue;
+            };
+            picked.push((
+                fi,
+                CommentLine {
+                    side: l.anchor_side(),
+                    line: n,
+                    kind: l.kind,
+                    text: l.text.clone(),
+                },
+            ));
+        }
+        let last_fi = picked.last()?.0;
+        let lines: Vec<CommentLine> = picked
+            .into_iter()
+            .filter(|(fi, _)| *fi == last_fi)
+            .map(|(_, l)| l)
+            .collect();
+        Some(CommentAnchor {
+            path: self.files.get(last_fi)?.path.clone(),
+            lines,
+        })
+    }
+
+    // ---- comments ----
+
+    /// The comment at the cursor — whether the cursor sits anywhere inside the
+    /// block it covers, or on one of its rendered rows.
     pub fn comment_at_cursor(&self) -> Option<usize> {
         match self.rows.get(self.cursor)? {
             DiffRow::Comment { ci, .. } => Some(*ci),
             DiffRow::Line { .. } => {
-                let (anchor, _) = self.cursor_anchor()?;
-                self.comments.iter().position(|c| c.anchor == anchor)
+                let (f, l) = self.line_at(self.cursor)?;
+                self.comments
+                    .iter()
+                    .position(|c| c.anchor.path == f.path && c.anchor.covers(l))
             }
             _ => None,
         }
     }
 
     /// Add a comment, or replace the body of the one already on this anchor.
-    /// Saving a blank body removes the comment — that's how you delete one from
-    /// inside the editor.
-    pub fn set_comment(&mut self, anchor: CommentAnchor, quoted: String, body: String) {
+    /// Saving a blank body removes it — that's how you delete from the editor.
+    pub fn set_comment(&mut self, anchor: CommentAnchor, body: String) {
         let body = body.trim_end().to_string();
         if body.trim().is_empty() {
             self.comments.retain(|c| c.anchor != anchor);
         } else {
             match self.comments.iter_mut().find(|c| c.anchor == anchor) {
                 Some(existing) => existing.body = body,
-                None => self.comments.push(Comment { anchor, quoted, body }),
+                None => self.comments.push(Comment { anchor, body }),
             }
         }
         self.rebuild_rows();
     }
 
-    /// Whether a line carries a comment, for the gutter marker.
+    /// Whether a line falls inside any comment, for the gutter marker.
     pub fn is_commented(&self, path: &str, l: &DiffLine) -> bool {
-        self.comments.iter().any(|c| anchors_to(c, path, l))
+        self.comments
+            .iter()
+            .any(|c| c.anchor.path == path && c.anchor.covers(l))
     }
 
     /// The `li`th line of comment `ci`, for rendering one [`DiffRow::Comment`].
@@ -459,6 +619,8 @@ impl DiffView {
         true
     }
 
+    // ---- navigation ----
+
     pub fn move_cursor(&mut self, delta: isize) {
         if self.rows.is_empty() {
             return;
@@ -472,7 +634,7 @@ impl DiffView {
         self.cursor = row.min(self.rows.len().saturating_sub(1));
     }
 
-    /// Jump to the next/previous row matching `pred`, wrapping at neither end.
+    /// Jump to the next/previous row matching `pred`, stopping at either end.
     fn jump(&mut self, forward: bool, pred: impl Fn(&DiffRow) -> bool) {
         let found = if forward {
             self.rows
@@ -527,10 +689,8 @@ impl DiffView {
 
     /// Re-parse after the diff changed underneath us, carrying comments over.
     ///
-    /// A comment survives if its quoted source line can still be found in the
-    /// same file, re-pinned to wherever that line now sits. Comments whose line
-    /// is gone are dropped; the count is returned so the user can be told rather
-    /// than silently losing review notes.
+    /// Comments whose source can no longer be found are dropped; the count is
+    /// returned so the user can be told rather than silently losing notes.
     pub fn refresh(&mut self, raw: &str) -> usize {
         let files = parse_unified(raw);
         let before = self.comments.len();
@@ -541,34 +701,49 @@ impl DiffView {
             .collect();
         self.files = files;
         self.comments = kept;
+        self.sel_start = None;
         self.rebuild_rows();
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
         before - self.comments.len()
     }
 }
 
-fn anchors_to(c: &Comment, path: &str, l: &DiffLine) -> bool {
-    c.anchor.path == path
-        && c.anchor.side == l.anchor_side()
-        && Some(c.anchor.line) == l.anchor_line()
-}
-
-/// Find `c`'s quoted line in the freshly-parsed diff, updating its line number.
-/// Prefers the line still sitting on the original anchor, then the same text
-/// elsewhere on the same side.
+/// Re-pin a comment onto a freshly-parsed diff.
 ///
-/// Both paths require the text to still match. Anchoring on position alone would
-/// silently re-point a comment at whatever unrelated line has since taken that
-/// slot — for a review that gets pasted to an agent, a dropped comment we report
-/// is far better than a confidently misplaced one.
+/// The whole covered block is matched as a unit: we look for a run of
+/// consecutive lines with the same text and kinds, preferring the run still
+/// sitting where the comment was pinned. Matching lines individually would let a
+/// block scatter across the file, and matching on position alone would silently
+/// re-point a comment at whatever has since taken that slot — for text that gets
+/// pasted to an agent, a dropped comment we report beats a confidently
+/// misplaced one.
 fn reanchor(mut c: Comment, files: &[FileDiff]) -> Option<Comment> {
     let f = files.iter().find(|f| f.path == c.anchor.path)?;
-    let lines = || f.hunks.iter().flat_map(|h| &h.lines);
-    if lines().any(|l| anchors_to(&c, &f.path, l) && l.text == c.quoted) {
-        return Some(c);
+    let all: Vec<&DiffLine> = f.hunks.iter().flat_map(|h| &h.lines).collect();
+    let n = c.anchor.lines.len();
+    if n == 0 || all.len() < n {
+        return None;
     }
-    let moved = lines().find(|l| l.text == c.quoted && l.anchor_side() == c.anchor.side)?;
-    c.anchor.line = moved.anchor_line()?;
+    let matches_at = |i: usize| {
+        (0..n).all(|k| {
+            let want = &c.anchor.lines[k];
+            let got = all[i + k];
+            got.text == want.text && got.kind == want.kind
+        })
+    };
+    let first = c.anchor.lines.first()?;
+    let original = all
+        .iter()
+        .position(|l| l.anchor_side() == first.side && l.anchor_line() == Some(first.line));
+    let found = original
+        .filter(|&i| i + n <= all.len() && matches_at(i))
+        .or_else(|| (0..=all.len() - n).find(|&i| matches_at(i)))?;
+
+    for (k, slot) in c.anchor.lines.iter_mut().enumerate() {
+        let got = all[found + k];
+        slot.side = got.anchor_side();
+        slot.line = got.anchor_line()?;
+    }
     Some(c)
 }
 
@@ -746,10 +921,25 @@ diff --git a/a.rs b/a.rs
         DiffView::new("/w".into(), BASIC)
     }
 
-    /// Move the cursor onto the first row matching `pred`.
-    fn cursor_on(v: &mut DiffView, pred: impl Fn(&DiffView, usize) -> bool) {
-        let i = (0..v.rows.len()).find(|i| pred(v, *i)).expect("no such row");
+    /// Move the cursor onto the row for the diff line with `text`.
+    fn cursor_on(v: &mut DiffView, text: &str) {
+        let i = (0..v.rows.len())
+            .find(|i| v.line_at(*i).map(|(_, l)| l.text == text).unwrap_or(false))
+            .unwrap_or_else(|| panic!("no line {text:?}"));
         v.cursor = i;
+    }
+
+    /// Comment on the cursor line (or current selection) in one step.
+    fn comment_here(v: &mut DiffView, body: &str) {
+        let a = v.pending_anchor().expect("nothing commentable at cursor");
+        v.set_comment(a, body.into());
+    }
+
+    /// Select from the line `from` down to the line `to`, inclusive.
+    fn select_block(v: &mut DiffView, from: &str, to: &str) {
+        cursor_on(v, from);
+        v.toggle_selection();
+        cursor_on(v, to);
     }
 
     #[test]
@@ -766,8 +956,7 @@ diff --git a/a.rs b/a.rs
     fn comment_adds_exactly_one_row_under_its_line() {
         let mut v = view();
         v.cursor = 2; // first context line
-        let (anchor, quoted) = v.cursor_anchor().unwrap();
-        v.set_comment(anchor, quoted, "why".into());
+        comment_here(&mut v, "why");
 
         assert_eq!(v.rows.len(), 8);
         assert!(matches!(v.rows[2], DiffRow::Line { .. }));
@@ -778,8 +967,7 @@ diff --git a/a.rs b/a.rs
     fn multi_line_comment_gets_one_row_per_line() {
         let mut v = view();
         v.cursor = 2;
-        let (a, q) = v.cursor_anchor().unwrap();
-        v.set_comment(a, q, "first\nsecond\nthird".into());
+        comment_here(&mut v, "first\nsecond\nthird");
 
         assert_eq!(v.rows.len(), 10); // 7 diff rows + 3 comment rows
         assert!(matches!(v.rows[3], DiffRow::Comment { ci: 0, li: 0 }));
@@ -787,7 +975,6 @@ diff --git a/a.rs b/a.rs
         assert!(matches!(v.rows[5], DiffRow::Comment { ci: 0, li: 2 }));
         assert_eq!(v.comment_line(0, 1), Some("second"));
         assert_eq!(v.comment_line(0, 3), None);
-        // every comment row still resolves back to its comment
         v.cursor = 5;
         assert_eq!(v.comment_at_cursor(), Some(0));
     }
@@ -796,10 +983,10 @@ diff --git a/a.rs b/a.rs
     fn saving_a_blank_body_removes_the_comment() {
         let mut v = view();
         v.cursor = 2;
-        let (a, q) = v.cursor_anchor().unwrap();
-        v.set_comment(a.clone(), q.clone(), "note".into());
+        comment_here(&mut v, "note");
         assert_eq!(v.comments.len(), 1);
-        v.set_comment(a, q, "   \n  ".into());
+        let a = v.pending_anchor().unwrap();
+        v.set_comment(a, "   \n  ".into());
         assert!(v.comments.is_empty());
         assert_eq!(v.rows.len(), 7);
     }
@@ -807,40 +994,25 @@ diff --git a/a.rs b/a.rs
     #[test]
     fn addition_anchors_to_new_side_deletion_to_old() {
         let mut v = view();
-        cursor_on(&mut v, |v, i| {
-            v.line_at(i).map(|(_, l)| l.kind == LineKind::Del).unwrap_or(false)
-        });
-        let (del, _) = v.cursor_anchor().unwrap();
-        assert_eq!(del.side, Side::Old);
-        assert_eq!(del.line, 11);
+        cursor_on(&mut v, "let old = 2;");
+        let del = v.pending_anchor().unwrap();
+        assert_eq!(del.lines[0].side, Side::Old);
+        assert_eq!(del.lines[0].line, 11);
 
-        cursor_on(&mut v, |v, i| {
-            v.line_at(i).map(|(_, l)| l.kind == LineKind::Add).unwrap_or(false)
-        });
-        let (add, _) = v.cursor_anchor().unwrap();
-        assert_eq!(add.side, Side::New);
-        assert_eq!(add.line, 11);
+        cursor_on(&mut v, "let new = 2;");
+        let add = v.pending_anchor().unwrap();
+        assert_eq!(add.lines[0].side, Side::New);
+        assert_eq!(add.lines[0].line, 11);
     }
 
     #[test]
     fn same_line_number_on_opposite_sides_are_distinct_anchors() {
         // The deletion at old:11 and the addition at new:11 must not collide.
         let mut v = view();
-        let by_text = |t: &'static str| {
-            move |v: &DiffView, i: usize| {
-                v.line_at(i).map(|(_, l)| l.text == t).unwrap_or(false)
-            }
-        };
-        cursor_on(&mut v, by_text("let old = 2;"));
-        let (del, q) = v.cursor_anchor().unwrap();
-        assert_eq!((del.side, del.line), (Side::Old, 11));
-        v.set_comment(del, q, "on the deletion".into());
-
-        // Re-find the addition: the comment row just inserted shifted the rows.
-        cursor_on(&mut v, by_text("let new = 2;"));
-        let (add, q) = v.cursor_anchor().unwrap();
-        assert_eq!((add.side, add.line), (Side::New, 11));
-        v.set_comment(add, q, "on the addition".into());
+        cursor_on(&mut v, "let old = 2;");
+        comment_here(&mut v, "on the deletion");
+        cursor_on(&mut v, "let new = 2;");
+        comment_here(&mut v, "on the addition");
 
         assert_eq!(v.comments.len(), 2);
         assert_eq!(v.rows.len(), 9); // 7 diff rows + 2 comment rows
@@ -850,8 +1022,7 @@ diff --git a/a.rs b/a.rs
     fn cursor_on_comment_row_finds_that_comment() {
         let mut v = view();
         v.cursor = 2;
-        let (a, q) = v.cursor_anchor().unwrap();
-        v.set_comment(a, q, "note".into());
+        comment_here(&mut v, "note");
         v.cursor = 3; // the comment row itself
         assert_eq!(v.comment_at_cursor(), Some(0));
         assert!(v.delete_comment_at_cursor());
@@ -863,21 +1034,20 @@ diff --git a/a.rs b/a.rs
     fn commenting_twice_on_a_line_edits_rather_than_duplicates() {
         let mut v = view();
         v.cursor = 2;
-        let (a, q) = v.cursor_anchor().unwrap();
-        v.set_comment(a.clone(), q.clone(), "first".into());
-        v.set_comment(a, q, "second".into());
+        comment_here(&mut v, "first");
+        comment_here(&mut v, "second");
         assert_eq!(v.comments.len(), 1);
         assert_eq!(v.comments[0].body, "second");
-        assert_eq!(v.rows.len(), 8); // still exactly one comment row
+        assert_eq!(v.rows.len(), 8);
     }
 
     #[test]
-    fn cursor_anchor_is_none_on_headers() {
+    fn pending_anchor_is_none_on_headers() {
         let mut v = view();
         v.cursor = 0; // file header
-        assert!(v.cursor_anchor().is_none());
+        assert!(v.pending_anchor().is_none());
         v.cursor = 1; // hunk header
-        assert!(v.cursor_anchor().is_none());
+        assert!(v.pending_anchor().is_none());
         assert!(!v.delete_comment_at_cursor());
     }
 
@@ -901,7 +1071,6 @@ diff --git a/a.rs b/a.rs
         assert!(matches!(v.rows[v.cursor], DiffRow::FileHeader { fi: 1 }));
         v.prev_file();
         assert!(matches!(v.rows[v.cursor], DiffRow::FileHeader { fi: 0 }));
-        // No previous file from the top: the cursor stays put.
         v.prev_file();
         assert_eq!(v.cursor, 0);
     }
@@ -926,36 +1095,232 @@ diff --git a/a.rs b/a.rs
         assert_eq!(v.scroll, 0);
     }
 
+    // ---- block selection ----
+
+    #[test]
+    fn selection_spans_from_its_start_to_the_cursor_either_way() {
+        let mut v = view();
+        v.cursor = 4;
+        v.toggle_selection();
+        v.cursor = 2; // dragged upwards
+        assert_eq!(v.selection_span(), Some((2, 4)));
+        assert!(v.is_selected(3));
+        assert!(!v.is_selected(5));
+        v.cursor = 6; // and back down past the start
+        assert_eq!(v.selection_span(), Some((4, 6)));
+    }
+
+    #[test]
+    fn toggling_selection_off_leaves_a_single_line_anchor() {
+        let mut v = view();
+        cursor_on(&mut v, "let new = 2;");
+        v.toggle_selection();
+        assert!(v.selecting());
+        v.toggle_selection();
+        assert!(!v.selecting());
+        assert_eq!(v.pending_anchor().unwrap().lines.len(), 1);
+    }
+
+    #[test]
+    fn a_block_anchors_every_line_it_covers() {
+        let mut v = view();
+        select_block(&mut v, "let new = 2;", "let extra = 3;");
+        let a = v.pending_anchor().unwrap();
+        assert!(a.is_range());
+        assert_eq!(a.lines.len(), 2);
+        assert_eq!(a.lines[0].text, "let new = 2;");
+        assert_eq!(a.lines[1].text, "let extra = 3;");
+        assert_eq!(a.label(), "11-12");
+    }
+
+    #[test]
+    fn a_block_spanning_a_changed_hunk_keeps_both_sides() {
+        // Deletion (old:11) through additions (new:11,12) — a range of one side
+        // could not represent this without misreporting the other.
+        let mut v = view();
+        select_block(&mut v, "let old = 2;", "let extra = 3;");
+        let a = v.pending_anchor().unwrap();
+        assert_eq!(a.lines.len(), 3);
+        assert_eq!((a.lines[0].side, a.lines[0].line), (Side::Old, 11));
+        assert_eq!((a.lines[1].side, a.lines[1].line), (Side::New, 11));
+        assert_eq!((a.lines[2].side, a.lines[2].line), (Side::New, 12));
+        // The label spans the side it renders on; the old-side line is still
+        // quoted in the review.
+        assert_eq!(a.label(), "11-12");
+    }
+
+    #[test]
+    fn a_block_comment_renders_once_under_its_last_line() {
+        let mut v = view();
+        select_block(&mut v, "let new = 2;", "let extra = 3;");
+        comment_here(&mut v, "hoist this");
+
+        // 7 diff rows + exactly one comment row, after the last covered line.
+        assert_eq!(v.rows.len(), 8);
+        let ci = v
+            .rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::Comment { .. }))
+            .unwrap();
+        let before = v.line_at(ci - 1).unwrap().1;
+        assert_eq!(before.text, "let extra = 3;");
+    }
+
+    #[test]
+    fn the_gutter_marks_every_line_of_a_block_not_just_the_last() {
+        let mut v = view();
+        select_block(&mut v, "let new = 2;", "let extra = 3;");
+        comment_here(&mut v, "hoist this");
+
+        let marked = |v: &DiffView, text: &str| {
+            let i = (0..v.rows.len())
+                .find(|i| v.line_at(*i).map(|(_, l)| l.text == text).unwrap_or(false))
+                .unwrap();
+            let (f, l) = v.line_at(i).unwrap();
+            v.is_commented(&f.path, l)
+        };
+        assert!(marked(&v, "let new = 2;"), "first line of the block");
+        assert!(marked(&v, "let extra = 3;"), "last line of the block");
+        assert!(!marked(&v, "let keep = 1;"), "line outside the block");
+    }
+
+    #[test]
+    fn the_cursor_anywhere_inside_a_block_finds_its_comment() {
+        let mut v = view();
+        select_block(&mut v, "let old = 2;", "let extra = 3;");
+        comment_here(&mut v, "the whole hunk");
+
+        for text in ["let old = 2;", "let new = 2;", "let extra = 3;"] {
+            cursor_on(&mut v, text);
+            assert_eq!(v.comment_at_cursor(), Some(0), "at {text}");
+        }
+        cursor_on(&mut v, "let keep = 1;");
+        assert_eq!(v.comment_at_cursor(), None, "outside the block");
+    }
+
+    #[test]
+    fn deleting_from_inside_a_block_removes_the_whole_comment() {
+        let mut v = view();
+        select_block(&mut v, "let new = 2;", "let extra = 3;");
+        comment_here(&mut v, "gone");
+        cursor_on(&mut v, "let new = 2;"); // middle of the block, not the anchor
+        assert!(v.delete_comment_at_cursor());
+        assert!(v.comments.is_empty());
+    }
+
+    #[test]
+    fn a_selection_dragged_across_files_keeps_only_the_trailing_file() {
+        // A comment has one path; the cursor is where the user is looking.
+        let raw = format!("{BASIC}{}", BASIC.replace("a.rs", "b.rs"));
+        let mut v = DiffView::new("/w".into(), &raw);
+        v.cursor = 3; // inside src/a.rs
+        v.toggle_selection();
+        v.cursor = v.rows.len() - 1; // last line of src/b.rs
+        let a = v.pending_anchor().unwrap();
+        assert_eq!(a.path, "src/b.rs");
+        assert!(a.lines.iter().all(|l| l.text != "let old = 2;" || a.path == "src/b.rs"));
+        assert_eq!(a.lines.len(), 5, "only src/b.rs's five lines");
+    }
+
+    #[test]
+    fn headers_inside_a_selection_are_skipped() {
+        let raw = format!("{BASIC}{}", BASIC.replace("a.rs", "b.rs"));
+        let mut v = DiffView::new("/w".into(), &raw);
+        // Span the file/hunk headers of src/b.rs.
+        v.cursor = 7; // src/b.rs file header
+        v.toggle_selection();
+        v.cursor = 10;
+        let a = v.pending_anchor().unwrap();
+        assert!(a.lines.iter().all(|l| !l.text.starts_with("@@")));
+        assert_eq!(a.lines.len(), 2);
+    }
+
     // ---- refresh / re-anchoring ----
 
     #[test]
     fn refresh_repins_a_comment_whose_line_moved() {
         let mut v = view();
-        cursor_on(&mut v, |v, i| {
-            v.line_at(i).map(|(_, l)| l.text == "let extra = 3;").unwrap_or(false)
-        });
-        let (a, q) = v.cursor_anchor().unwrap();
-        assert_eq!(a.line, 12);
-        v.set_comment(a, q, "note".into());
+        cursor_on(&mut v, "let extra = 3;");
+        assert_eq!(v.pending_anchor().unwrap().lines[0].line, 12);
+        comment_here(&mut v, "note");
 
-        // Same content, shifted down 20 lines by an edit above.
         let moved = BASIC.replace("@@ -10,4 +10,5 @@", "@@ -30,4 +30,5 @@");
-        let dropped = v.refresh(&moved);
-        assert_eq!(dropped, 0);
-        assert_eq!(v.comments[0].anchor.line, 32);
+        assert_eq!(v.refresh(&moved), 0);
+        assert_eq!(v.comments[0].anchor.lines[0].line, 32);
         assert_eq!(v.comments[0].body, "note");
+    }
+
+    #[test]
+    fn refresh_repins_a_whole_block_as_a_unit() {
+        let mut v = view();
+        select_block(&mut v, "let new = 2;", "let extra = 3;");
+        comment_here(&mut v, "block note");
+
+        let moved = BASIC.replace("@@ -10,4 +10,5 @@", "@@ -30,4 +30,5 @@");
+        assert_eq!(v.refresh(&moved), 0);
+        let a = &v.comments[0].anchor;
+        assert_eq!(a.lines.len(), 2);
+        assert_eq!(a.lines[0].line, 31);
+        assert_eq!(a.lines[1].line, 32);
+        assert_eq!(a.label(), "31-32");
+    }
+
+    #[test]
+    fn refresh_drops_a_block_whose_lines_no_longer_sit_together() {
+        // Half the block survives, but not as a contiguous run — re-pinning it
+        // anywhere would be a guess, so it goes and the user is told.
+        let mut v = view();
+        select_block(&mut v, "let new = 2;", "let extra = 3;");
+        comment_here(&mut v, "block note");
+
+        let split = BASIC.replace("+let extra = 3;\n", "");
+        assert_eq!(v.refresh(&split), 1);
+        assert!(v.comments.is_empty());
     }
 
     #[test]
     fn refresh_drops_a_comment_whose_line_is_gone() {
         let mut v = view();
         v.cursor = 2;
-        let (a, q) = v.cursor_anchor().unwrap();
-        v.set_comment(a, q, "note".into());
+        comment_here(&mut v, "note");
 
         let gone = BASIC.replace(" let keep = 1;\n", "");
-        let dropped = v.refresh(&gone);
-        assert_eq!(dropped, 1);
+        assert_eq!(v.refresh(&gone), 1);
+        assert!(v.comments.is_empty());
+    }
+
+    #[test]
+    fn refresh_does_not_repin_a_comment_onto_unrelated_code() {
+        // The line that took the old slot has different text; matching on
+        // position alone would silently move the comment onto it.
+        let mut v = view();
+        cursor_on(&mut v, "let keep = 1;");
+        comment_here(&mut v, "note");
+        let replaced = BASIC.replace(" let keep = 1;\n", " something else entirely;\n");
+        assert_eq!(v.refresh(&replaced), 1);
+        assert!(v.comments.is_empty());
+    }
+
+    #[test]
+    fn refresh_will_not_move_a_comment_across_sides_onto_matching_text() {
+        // A moved line shows up as a deletion in one place and an identical
+        // addition in another. Matching on text alone would re-pin a "why did
+        // this go?" note onto the line that is being *added*, inverting it.
+        let mut v = view();
+        cursor_on(&mut v, "let old = 2;");
+        assert_eq!(v.pending_anchor().unwrap().lines[0].side, Side::Old);
+        comment_here(&mut v, "why remove this?");
+
+        let now_an_addition = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -10,4 +10,5 @@ fn thing() {
+ let keep = 1;
++let old = 2;
+ let tail = 4;
+";
+        assert_eq!(v.refresh(now_an_addition), 1);
         assert!(v.comments.is_empty());
     }
 
@@ -963,8 +1328,7 @@ diff --git a/a.rs b/a.rs
     fn refresh_drops_comments_when_the_file_leaves_the_diff() {
         let mut v = view();
         v.cursor = 2;
-        let (a, q) = v.cursor_anchor().unwrap();
-        v.set_comment(a, q, "note".into());
+        comment_here(&mut v, "note");
         assert_eq!(v.refresh(""), 1);
         assert!(v.comments.is_empty());
         assert!(v.rows.is_empty());
@@ -974,25 +1338,41 @@ diff --git a/a.rs b/a.rs
     fn refresh_keeps_an_untouched_comment_pinned() {
         let mut v = view();
         v.cursor = 2;
-        let (a, q) = v.cursor_anchor().unwrap();
-        v.set_comment(a.clone(), q, "note".into());
+        comment_here(&mut v, "note");
+        let before = v.comments[0].anchor.clone();
         assert_eq!(v.refresh(BASIC), 0);
-        assert_eq!(v.comments[0].anchor, a);
+        assert_eq!(v.comments[0].anchor, before);
+    }
+
+    #[test]
+    fn refresh_clears_a_selection_left_in_progress() {
+        let mut v = view();
+        v.cursor = 2;
+        v.toggle_selection();
+        v.refresh(BASIC);
+        assert!(!v.selecting());
     }
 
     // ---- review formatting ----
 
-    fn comment(path: &str, side: Side, line: u32, quoted: &str, body: &str) -> Comment {
+    fn single(path: &str, side: Side, line: u32, text: &str, body: &str) -> Comment {
         Comment {
-            anchor: CommentAnchor { path: path.into(), side, line },
-            quoted: quoted.into(),
+            anchor: CommentAnchor {
+                path: path.into(),
+                lines: vec![CommentLine {
+                    side,
+                    line,
+                    kind: if side == Side::Old { LineKind::Del } else { LineKind::Add },
+                    text: text.into(),
+                }],
+            },
             body: body.into(),
         }
     }
 
     #[test]
     fn review_includes_path_line_and_quoted_source() {
-        let out = format_review(&[comment(
+        let out = format_review(&[single(
             "src/a.rs",
             Side::New,
             11,
@@ -1007,15 +1387,15 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn review_marks_comments_on_removed_lines() {
-        let out = format_review(&[comment("a.rs", Side::Old, 4, "gone();", "why remove this?")]);
+        let out = format_review(&[single("a.rs", Side::Old, 4, "gone();", "why remove this?")]);
         assert!(out.contains("a.rs:4 (removed line)"));
     }
 
     #[test]
     fn review_pluralises_and_keeps_every_comment() {
         let out = format_review(&[
-            comment("a.rs", Side::New, 1, "x", "first"),
-            comment("b.rs", Side::New, 2, "y", "second"),
+            single("a.rs", Side::New, 1, "x", "first"),
+            single("b.rs", Side::New, 2, "y", "second"),
         ]);
         assert!(out.contains("2 comments"));
         assert!(out.contains("first"));
@@ -1024,7 +1404,47 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn review_preserves_multi_line_bodies() {
-        let out = format_review(&[comment("a.rs", Side::New, 1, "x", "line one\nline two")]);
+        let out = format_review(&[single("a.rs", Side::New, 1, "x", "line one\nline two")]);
         assert!(out.contains("line one\nline two\n"));
+    }
+
+    #[test]
+    fn review_of_a_block_spans_the_line_range_and_quotes_every_line() {
+        let mut v = view();
+        select_block(&mut v, "let new = 2;", "let extra = 3;");
+        comment_here(&mut v, "hoist this block");
+        let out = format_review(&v.ordered_comments());
+
+        assert!(out.contains("src/a.rs:11-12\n"), "range header:\n{out}");
+        assert!(out.contains("> +let new = 2;\n"), "first line:\n{out}");
+        assert!(out.contains("> +let extra = 3;\n"), "last line:\n{out}");
+        assert!(out.contains("hoist this block"));
+    }
+
+    #[test]
+    fn review_of_a_block_marks_removed_and_added_lines_apart() {
+        let mut v = view();
+        select_block(&mut v, "let old = 2;", "let new = 2;");
+        comment_here(&mut v, "why the rename?");
+        let out = format_review(&v.ordered_comments());
+        assert!(out.contains("> -let old = 2;\n"), "deletion marker:\n{out}");
+        assert!(out.contains("> +let new = 2;\n"), "addition marker:\n{out}");
+        // The per-line markers replace the single-line suffix.
+        assert!(!out.contains("(removed line)"));
+    }
+
+    #[test]
+    fn review_lists_comments_in_diff_order_not_authoring_order() {
+        let mut v = view();
+        cursor_on(&mut v, "let extra = 3;"); // lower in the file, written first
+        comment_here(&mut v, "SECOND");
+        cursor_on(&mut v, "let keep = 1;");
+        comment_here(&mut v, "FIRST");
+
+        let out = format_review(&v.ordered_comments());
+        assert!(
+            out.find("FIRST") < out.find("SECOND"),
+            "expected file order:\n{out}"
+        );
     }
 }

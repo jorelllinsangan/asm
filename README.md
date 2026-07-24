@@ -134,28 +134,49 @@ current diff, with GitHub-style line comments you can hand straight back to the
 agent that wrote the code.
 
 Put the cursor on a line, press `c`, type a comment (multi-line is fine), and
-`Ctrl+S`. When you're done, `s` formats every comment into a prompt and pastes
-it into the agent session you're attached to.
+`Ctrl+S`. To comment on a **block of code**, press `v`, extend the selection with
+`j`/`k`, then `c` — the comment covers every line you selected. When you're done,
+`s` formats every comment into a prompt and pastes it into the agent session
+you're attached to.
+
+```
+  10   10  fn draw(f: &mut Frame) {
+       11 +    let x = compute();
+       12 +    let y = x * 2;
+           ┃ these two recompute every frame
+           ┃ hoist them out of the draw loop
+```
 
 | key | action |
 |-----|--------|
 | `j`/`k`, `Ctrl+D`/`Ctrl+U`, `g`/`G` | move · half-page · top/bottom |
 | `]`/`[` | next / previous file |
 | `n`/`p` | next / previous hunk |
-| `c` or `Enter` | comment on the cursor line (or edit the one that's there) |
+| `v` | start / cancel a block selection (`j`/`k` extends it) |
+| `c` or `Enter` | comment on the selection, or the cursor line (edits the one that's there) |
 | `x` | delete the comment under the cursor |
 | `s` | submit the review to the attached agent |
 | `r` | reload the diff (comments are re-pinned to their lines) |
-| `Esc` or `q` | close (the review is kept — `Ctrl+G` returns to it) |
+| `Esc` | cancel the selection, or close the pane when there isn't one |
+| `q` | close (the review is kept — `Ctrl+G` returns to it) |
+
+A block comment renders once, under the last line it covers, and every line in
+it is marked in the gutter. Putting the cursor anywhere inside the block and
+pressing `c` edits that comment rather than starting a new one. A selection can
+span a changed hunk — the removed and added lines are both kept, and both are
+quoted in what gets submitted.
 
 **What's in the diff.** Everything the worktree has done since it branched off
 the root worktree's branch: commits, staged, unstaged, *and* untracked files.
 Diffing only the working tree would show nothing for an agent that commits as it
 goes, which reads as "did nothing".
 
-**What gets pasted.** Each comment goes over with its file, line number, and the
-quoted source line — the quote is what keeps the location findable after the
-agent starts editing and the line numbers move. The text lands in the agent's
+**What gets pasted.** Each comment goes over with its file, line number (or
+`11-13` span), and the quoted source — the quote is what keeps the location
+findable after the agent starts editing and the line numbers move. Block
+comments quote every covered line with its `+`/`-` marker, so "this block" still
+means something on the other end. Comments are ordered by position in the diff,
+not by the order you wrote them. The text lands in the agent's
 input box but is **not** submitted; press Enter yourself once you've looked at
 it. Submitting is refused if the session you're attached to isn't an agent in
 that worktree, rather than pasting a review into the wrong place.
