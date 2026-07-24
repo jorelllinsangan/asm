@@ -2,7 +2,7 @@
 //! what makes sessions survive until explicitly killed.
 
 use crate::git;
-use crate::ipc::{read_frame, write_frame};
+use crate::ipc::{Frame, read_frame, write_frame};
 use crate::paths;
 use crate::protocol::{
     AgentInfo, AgentTool, Event, Request, SessionId, SessionInfo, Status, WorktreeInfo,
@@ -1119,7 +1119,20 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
 
     loop {
         let req: Request = match read_frame(&mut rd).await {
-            Ok(r) => r,
+            Ok(Frame::Msg(r)) => r,
+            // A request this build doesn't know: the client is newer than the
+            // daemon. Say so and keep serving rather than dropping the socket —
+            // a dropped socket is indistinguishable from a crash at the client,
+            // which used to take the whole TUI down with it.
+            Ok(Frame::Undecodable(e)) => {
+                let _ = out_tx.send(Event::Error {
+                    message: format!(
+                        "daemon is running an older build and does not understand this request \
+                         ({e}) — restart it with: pkill -f 'asm daemon'"
+                    ),
+                });
+                continue;
+            }
             Err(_) => break, // client disconnected
         };
         match req {

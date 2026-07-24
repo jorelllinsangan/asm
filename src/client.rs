@@ -2,7 +2,7 @@
 //! is a live embedded terminal for the focused session.
 
 use crate::diff::{CommentAnchor, DiffRow, DiffView, FileStatus, LineKind, format_review};
-use crate::ipc::{read_frame, write_frame};
+use crate::ipc::{Frame as IpcFrame, read_frame, write_frame};
 use crate::paths;
 use crate::protocol::{
     AgentInfo, AgentTool, Event, Request, SessionId, SessionInfo, Status, WorktreeInfo,
@@ -164,6 +164,8 @@ enum Msg {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Resize,
+    /// A frame arrived that this build can't decode (daemon newer than client).
+    UnknownEvent(String),
     DaemonGone,
 }
 
@@ -200,6 +202,9 @@ struct App {
     footer: String,
     net_tx: mpsc::UnboundedSender<Request>,
     should_quit: bool,
+    /// Printed to stderr after the terminal is restored. For failures the user
+    /// would otherwise never see, because the TUI exits before drawing again.
+    exit_message: Option<String>,
 }
 
 impl App {
@@ -432,8 +437,16 @@ pub async fn run(root: PathBuf) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 match read_frame::<_, Event>(&mut rd).await {
-                    Ok(ev) => {
+                    Ok(IpcFrame::Msg(ev)) => {
                         if msg_tx.send(Msg::Daemon(ev)).is_err() {
+                            break;
+                        }
+                    }
+                    // An event this build doesn't know: the daemon is newer.
+                    // Skip it — the frame was consumed whole, so the stream is
+                    // still in sync — rather than killing the session.
+                    Ok(IpcFrame::Undecodable(e)) => {
+                        if msg_tx.send(Msg::UnknownEvent(e)).is_err() {
                             break;
                         }
                     }
@@ -495,6 +508,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
         footer: NAV_HINT.into(),
         net_tx,
         should_quit: false,
+        exit_message: None,
     };
     app.send(Request::Hello);
 
@@ -503,6 +517,9 @@ pub async fn run(root: PathBuf) -> Result<()> {
     let result = event_loop(&mut terminal, &mut app, &mut msg_rx).await;
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    if let Some(msg) = app.exit_message.as_deref() {
+        eprintln!("\nasm: {msg}");
+    }
     result
 }
 
@@ -520,8 +537,20 @@ async fn event_loop(
             Msg::Key(k) => handle_key(app, k),
             Msg::Mouse(m) => handle_mouse(app, m),
             Msg::Resize => sync_term_size(app),
+            Msg::UnknownEvent(e) => {
+                app.footer = format!("ignored an unrecognised event from a newer daemon ({e})");
+            }
             Msg::DaemonGone => {
-                app.footer = "daemon connection lost".into();
+                // The footer is never seen — we're about to tear the TUI down —
+                // so the reason has to survive past `ratatui::restore()`.
+                app.exit_message = Some(
+                    "daemon connection lost.\n\n\
+                     If this happened right after a rebuild, the daemon is probably still \
+                     running an older build that doesn't understand this client. Restart it:\n\n  \
+                     pkill -f 'asm daemon'\n\n\
+                     (that ends live sessions; agent transcripts are on disk and resumable)"
+                        .into(),
+                );
                 app.should_quit = true;
             }
         }
@@ -2182,6 +2211,7 @@ mod tests {
             footer: String::new(),
             net_tx: tx,
             should_quit: false,
+            exit_message: None,
         };
         app.rebuild_rows();
         (app, rx)
