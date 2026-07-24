@@ -7,6 +7,7 @@
 
 mod client;
 mod daemon;
+mod diff;
 mod git;
 mod ipc;
 mod paths;
@@ -63,7 +64,7 @@ fn print_help() {
          asm daemon     run the background server in the foreground\n  \
          asm --help     show this help\n\n\
          KEYS (nav):    j/k move · Space fold · Enter open · c new claude · o new opencode · n shell · w new worktree · x kill · d rm worktree · r refresh · R rename · a show old · q quit\n  \
-         PANES:         Ctrl+L  focus terminal · Ctrl+H (or Ctrl+Q)  focus explorer\n  \
+         PANES:         Ctrl+L  focus terminal · Ctrl+H (or Ctrl+Q)  focus explorer · Ctrl+]  split editor · Ctrl+G  diff review\n  \
          KEYS (term):   all other keys go to the session (Ctrl+L clears the screen there)"
     );
 }

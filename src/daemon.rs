@@ -1229,6 +1229,24 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
                     t.abort();
                 }
             }
+            Request::Diff { worktree } => {
+                // Shelling out to git (once per untracked file) blocks; keep it
+                // off the socket task so streaming output doesn't stall.
+                let daemon = daemon.clone();
+                let out_tx = out_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let wt = PathBuf::from(&worktree);
+                    let ev = match git::review_diff(&daemon.root, &wt) {
+                        Ok((text, skipped_untracked)) => Event::Diff {
+                            worktree,
+                            text,
+                            skipped_untracked,
+                        },
+                        Err(e) => Event::Error { message: format!("{e:#}") },
+                    };
+                    let _ = out_tx.send(ev);
+                });
+            }
             Request::Input { id, data } => daemon.write_input(id, &data),
             Request::Resize { id, cols, rows } => daemon.resize(id, cols, rows),
         }

@@ -139,6 +139,59 @@ becomes an exited ghost (no session reaper) — `open_editor` detects and respaw
 it. Split geometry lives in one helper (`split_widths`) used by both
 `draw_terminal` and `sync_term_size` so the two PTYs' dims never drift.
 
+### Diff review (`diff.rs`) — the one feature that is *not* a PTY
+
+`Ctrl+G` opens a reviewable diff over the right pane, with line comments that
+get pasted into a live agent session. Unlike the editor, none of this is a
+terminal: it's a client-side widget, which is forced by the feature itself — you
+can't anchor a comment to a line inside a `less` buffer, so asm has to own the
+rendering. (An early sketch ran `git diff` through the user's pager in the
+editor rail; line comments killed it.)
+
+Split of responsibility:
+
+- **`git::review_diff`** (daemon side) shells out and returns raw unified-diff
+  text plus a skipped-untracked count. The range is
+  `git diff $(git merge-base <root branch> HEAD)` — **not** `git diff` or `git
+  diff HEAD`. An agent that commits as it works has an empty working-tree diff,
+  which reads as "did nothing"; the merge-base range shows commits, staged and
+  unstaged in one view. Untracked files are appended via `git diff --no-index --
+  /dev/null <path>`, one process each (capped at `MAX_UNTRACKED`), deliberately
+  in preference to `git add -N .` — that would write to the index of a repo the
+  agent is concurrently using.
+- **`diff.rs`** is pure: parser → `FileDiff`/`Hunk`/`DiffLine`, the `DiffView`
+  model, and `format_review`. No I/O, no ratatui. All the real logic lives here
+  and is unit-tested directly.
+- **`client.rs`** renders `DiffView::rows` and owns the keymap, the comment
+  popup, and submission.
+
+Things that will bite if you change them:
+
+- **`DiffView::rows` is the source of truth for cursor *and* rendering**, the
+  same invariant `App::rows` holds for the tree. A comment contributes one row
+  *per line of its body* — collapse that to one row and scrolling desyncs from
+  the cursor.
+- **Comments anchor to `(path, side, line)`**, where additions/context anchor to
+  the new side and deletions to the old. Old:11 and New:11 are different
+  anchors; treating them as one merges unrelated comments.
+- **Re-anchoring across a refresh requires the quoted text to still match**, not
+  just the line number. Position-only matching silently re-points a comment at
+  whatever line has since taken that slot — for text that gets pasted to an
+  agent, a dropped comment you report beats a confidently misplaced one. This is
+  pinned by `refresh_drops_a_comment_whose_line_is_gone`.
+- **Submission wraps the text in bracketed paste** (`ESC[200~`/`ESC[201~`), gated
+  on `screen.bracketed_paste()` the same way mouse forwarding is gated on
+  `mouse_protocol_mode`. Without it every `\n` reads as Enter and the agent fires
+  on line one, treating the rest as follow-up prompts. No trailing newline is
+  sent — the review lands in the input box and the *user* presses Enter.
+- **`review_target` is deliberately strict**: the attached session, and only if
+  it's an agent in the diff's worktree. Pasting a review into a plain shell would
+  execute it as commands.
+- The diff and the editor split both own the right pane and are mutually
+  exclusive; opening either hides the other. `split_active()` encodes this.
+  Hiding the diff retains it (`diff` stays `Some`, `diff_visible` goes false) so
+  a stray `Ctrl+G` doesn't destroy a review in progress.
+
 ### Session spawning
 
 Every session runs through the user's own `$SHELL` as a **login + interactive**

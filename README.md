@@ -97,6 +97,7 @@ Run it from inside a git repository.
 | `r` | force refresh (also runs `git worktree prune`) |
 | `R` | rename the selected session |
 | `Ctrl+]` | toggle the **split-view editor** for the current worktree |
+| `Ctrl+G` | toggle the **diff review** pane for the current worktree |
 | `q` | quit the TUI (sessions keep running in the daemon) |
 
 **The explorer tracks git's live state on its own** — the daemon re-lists
@@ -125,6 +126,43 @@ worktree, spawned on first use; it never shows up as a session in the tree.
 ```
 ASM_EDITOR=nvim asm
 ```
+
+### Reviewing a diff
+
+`Ctrl+G` opens a **code review** pane over the right-hand side: the worktree's
+current diff, with GitHub-style line comments you can hand straight back to the
+agent that wrote the code.
+
+Put the cursor on a line, press `c`, type a comment (multi-line is fine), and
+`Ctrl+S`. When you're done, `s` formats every comment into a prompt and pastes
+it into the agent session you're attached to.
+
+| key | action |
+|-----|--------|
+| `j`/`k`, `Ctrl+D`/`Ctrl+U`, `g`/`G` | move · half-page · top/bottom |
+| `]`/`[` | next / previous file |
+| `n`/`p` | next / previous hunk |
+| `c` or `Enter` | comment on the cursor line (or edit the one that's there) |
+| `x` | delete the comment under the cursor |
+| `s` | submit the review to the attached agent |
+| `r` | reload the diff (comments are re-pinned to their lines) |
+| `Esc` or `q` | close (the review is kept — `Ctrl+G` returns to it) |
+
+**What's in the diff.** Everything the worktree has done since it branched off
+the root worktree's branch: commits, staged, unstaged, *and* untracked files.
+Diffing only the working tree would show nothing for an agent that commits as it
+goes, which reads as "did nothing".
+
+**What gets pasted.** Each comment goes over with its file, line number, and the
+quoted source line — the quote is what keeps the location findable after the
+agent starts editing and the line numbers move. The text lands in the agent's
+input box but is **not** submitted; press Enter yourself once you've looked at
+it. Submitting is refused if the session you're attached to isn't an agent in
+that worktree, rather than pasting a review into the wrong place.
+
+Comments survive `r` and `Ctrl+G` — they're re-pinned by matching the quoted
+line. A comment whose line has genuinely vanished is dropped, and you're told
+how many.
 
 ### Moving between panes (vim-style)
 
@@ -191,7 +229,8 @@ Working: worktree tree (foldable, collapsed by default), create/remove
 worktrees, create/kill/rename sessions, embedded live terminal, input roundtrip,
 resize, scrollback persistence, session survival across client restarts, status
 detection, agent-session discovery + resume for **Claude Code, OpenCode, and
-Codex**, age filtering (hide >3d), auto-open on create/resume.
+Codex**, age filtering (hide >3d), auto-open on create/resume, split-view
+editor, diff review with line comments submitted back to the agent.
 
 Discovery reads `~/.claude/projects` (Claude), the OpenCode SQLite DB via the
 `sqlite3` CLI (respects `ASM_OPENCODE_DB`), and `~/.codex/sessions` rollout

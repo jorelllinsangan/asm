@@ -1,6 +1,7 @@
 //! The ratatui TUI client. Left pane is the worktree/session tree; right pane
 //! is a live embedded terminal for the focused session.
 
+use crate::diff::{CommentAnchor, DiffRow, DiffView, FileStatus, LineKind, format_review};
 use crate::ipc::{read_frame, write_frame};
 use crate::paths;
 use crate::protocol::{
@@ -16,7 +17,7 @@ use crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -30,11 +31,16 @@ const LEFT_WIDTH: u16 = 34;
 const OLD_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
 
 const NAV_HINT: &str =
-    "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · x kill · Ctrl+] editor · q quit";
-const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor";
+    "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · x kill · Ctrl+] editor · Ctrl+G diff · q quit";
+const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor · Ctrl+G diff";
 const EDITOR_HINT: &str = "EDITOR · Ctrl+] hides it (keeps running) · Ctrl+H explorer";
+const DIFF_HINT: &str =
+    "DIFF · j/k move · c comment · x delete · s submit · ]/[ file · n/p hunk · r refresh · Esc close";
+const COMMENT_HINT: &str = "COMMENT · Enter newline · Ctrl+S save · Esc cancel (blank = delete)";
 /// Fraction of the terminal pane width given to the editor in the split view.
 const EDITOR_SPLIT_PCT: u16 = 50;
+/// Gutter width for the `old new` line-number columns in the diff view.
+const GUTTER: usize = 11;
 
 /// The reserved chord that toggles the split-view editor. Intercepted before any
 /// PTY forwarding, so the editor never receives it.
@@ -49,11 +55,21 @@ fn is_editor_toggle(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
 }
 
+/// The reserved chord that toggles the diff review pane. Reserved for the same
+/// reason as [`is_editor_toggle`]: it has to work while a full-screen app owns
+/// the keyboard. `Ctrl+G` is `0x07`, which crossterm decodes plainly as
+/// `Ctrl+'g'` — none of the `Ctrl+]` legacy remapping applies.
+fn is_diff_toggle(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g'))
+}
+
 /// Which pane keystrokes go to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Nav,
     Term,
+    /// The diff review pane, which takes over the whole right-hand side.
+    Diff,
 }
 
 /// A pane identity for click-to-focus. `Term` is the single terminal pane;
@@ -64,6 +80,7 @@ enum ClickPane {
     Term,
     TermAi,
     TermEditor,
+    Diff,
 }
 
 /// A flattened, selectable tree row.
@@ -88,6 +105,57 @@ struct Prompt {
     kind: PromptKind,
     label: String,
     input: String,
+}
+
+/// The multi-line editor for one review comment, shown as a modal over the diff.
+///
+/// The footer [`Prompt`] is single-line by construction; a review comment that
+/// can't hold a paragraph isn't worth writing, so this gets its own overlay.
+struct CommentEditor {
+    anchor: CommentAnchor,
+    /// The source line being annotated, echoed in the popup for context.
+    quoted: String,
+    body: String,
+    /// Byte offset of the insertion point within `body`. Always kept on a
+    /// `char` boundary by the movement/edit helpers.
+    cursor: usize,
+}
+
+impl CommentEditor {
+    fn insert(&mut self, c: char) {
+        self.body.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        if let Some(prev) = self.body[..self.cursor].chars().next_back() {
+            self.cursor -= prev.len_utf8();
+            self.body.remove(self.cursor);
+        }
+    }
+
+    fn left(&mut self) {
+        if let Some(prev) = self.body[..self.cursor].chars().next_back() {
+            self.cursor -= prev.len_utf8();
+        }
+    }
+
+    fn right(&mut self) {
+        if let Some(next) = self.body[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+
+    /// The body with a visible caret spliced in at the cursor. Mirrors how the
+    /// footer prompt draws its own caret, sidestepping cursor-position maths
+    /// through a wrapped `Paragraph`.
+    fn with_caret(&self) -> String {
+        let mut s = String::with_capacity(self.body.len() + 1);
+        s.push_str(&self.body[..self.cursor]);
+        s.push('▏');
+        s.push_str(&self.body[self.cursor..]);
+        s
+    }
 }
 
 /// Events feeding the main loop.
@@ -122,6 +190,12 @@ struct App {
     /// the AI session. Only meaningful while the split is open.
     editor_focused: bool,
     term_dims: (u16, u16), // (cols, rows) of the terminal pane's inner area
+    /// The parsed diff and its review comments. Retained while hidden so that
+    /// an accidental `Ctrl+G` doesn't throw away a review in progress.
+    diff: Option<DiffView>,
+    /// Whether the retained diff is currently showing.
+    diff_visible: bool,
+    comment_editor: Option<CommentEditor>,
     prompt: Option<Prompt>,
     footer: String,
     net_tx: mpsc::UnboundedSender<Request>,
@@ -197,9 +271,16 @@ impl App {
         self.tree.iter().flat_map(|w| &w.sessions).find(|s| s.id == id)
     }
 
+    /// Whether the diff review pane is on screen. It owns the entire right-hand
+    /// side, so it and the editor split are mutually exclusive — opening either
+    /// closes the other (see [`toggle_diff`] / [`toggle_editor`]).
+    fn diff_showing(&self) -> bool {
+        self.diff_visible && self.diff.is_some()
+    }
+
     /// Whether the AI session and editor are shown side-by-side (both present).
     fn split_active(&self) -> bool {
-        self.editor.is_some() && self.attached.is_some()
+        !self.diff_showing() && self.editor.is_some() && self.attached.is_some()
     }
 
     /// The session that receives keystrokes: in the split, the active side; else
@@ -246,6 +327,9 @@ impl App {
         if col < LEFT_WIDTH {
             return ClickPane::Tree;
         }
+        if self.diff_showing() {
+            return ClickPane::Diff;
+        }
         if self.split_active() {
             let right_w = self.term_dims.0.saturating_add(2);
             let (ai_w, _) = split_widths(right_w);
@@ -263,6 +347,7 @@ impl App {
     fn active_pane(&self) -> ClickPane {
         match self.focus {
             Focus::Nav => ClickPane::Tree,
+            Focus::Diff => ClickPane::Diff,
             Focus::Term if self.split_active() => {
                 if self.editor_focused {
                     ClickPane::TermEditor
@@ -403,6 +488,9 @@ pub async fn run(root: PathBuf) -> Result<()> {
         editor_parser: None,
         editor_focused: false,
         term_dims: (80, 24),
+        diff: None,
+        diff_visible: false,
+        comment_editor: None,
         prompt: None,
         footer: NAV_HINT.into(),
         net_tx,
@@ -508,11 +596,25 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             app.focus = Focus::Term;
             app.footer = EDITOR_HINT.into();
         }
+        Event::Diff { worktree, text, skipped_untracked } => {
+            // Re-request of the same worktree = refresh: keep the comments,
+            // re-pinning them onto the new text (see `DiffView::refresh`).
+            let dropped = match app.diff.as_mut() {
+                Some(d) if d.worktree == worktree => d.refresh(&text),
+                _ => {
+                    app.diff = Some(DiffView::new(worktree, &text));
+                    0
+                }
+            };
+            app.diff_visible = true;
+            app.focus = Focus::Diff;
+            app.footer = diff_status(app, dropped, skipped_untracked);
+        }
         Event::Error { message } => {
             app.footer = format!("error: {message}");
             // If a re-attach failed and we have nothing to show, drop to the
             // explorer rather than leaving the user in an empty terminal.
-            if app.parser.is_none() && app.editor.is_none() {
+            if app.parser.is_none() && app.editor.is_none() && !app.diff_showing() {
                 app.focus = Focus::Nav;
             }
         }
@@ -524,9 +626,20 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // dispatch so it works from every mode and is never forwarded to a PTY. When
     // a prompt is open it's swallowed (so it neither toggles nor types a `]`).
     if is_editor_toggle(&key) {
-        if app.prompt.is_none() {
+        if app.prompt.is_none() && app.comment_editor.is_none() {
             toggle_editor(app);
         }
+        return;
+    }
+    if is_diff_toggle(&key) {
+        if app.prompt.is_none() && app.comment_editor.is_none() {
+            toggle_diff(app);
+        }
+        return;
+    }
+    // The comment editor is modal over everything but the reserved chords.
+    if app.comment_editor.is_some() {
+        handle_comment_key(app, key);
         return;
     }
     if app.prompt.is_some() {
@@ -536,13 +649,206 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match app.focus {
         Focus::Nav => handle_nav_key(app, key),
         Focus::Term => handle_term_key(app, key),
+        Focus::Diff => handle_diff_key(app, key),
+    }
+}
+
+/// Toggle the diff review pane for the current worktree.
+///
+/// Hiding keeps the parsed diff and any comments in memory, so toggling back
+/// resumes the review where it left off; showing re-requests the diff from the
+/// daemon so what you review is never stale.
+fn toggle_diff(app: &mut App) {
+    if app.diff_showing() {
+        close_diff(app);
+        return;
+    }
+    // Anchor to the worktree of the session you're viewing, else the selection —
+    // same rule the editor uses.
+    let worktree = if app.focus == Focus::Term && app.attached.is_some() {
+        app.worktree_of_attached().map(|w| w.path.clone())
+    } else {
+        app.selected_worktree().map(|w| w.path.clone())
+    };
+    let Some(worktree) = worktree else {
+        app.footer = "select a worktree first".into();
+        return;
+    };
+    // A retained review for a different worktree can't be carried over.
+    if app.diff.as_ref().is_some_and(|d| d.worktree != worktree) {
+        app.diff = None;
+    }
+    // The diff owns the full right pane; drop the editor's stream (its process
+    // keeps running, so Ctrl+] later returns to it intact).
+    if app.editor.is_some() {
+        app.send(Request::DetachEditor);
+        app.editor = None;
+        app.editor_parser = None;
+    }
+    app.send(Request::Diff { worktree });
+    app.footer = "loading diff…".into();
+}
+
+fn close_diff(app: &mut App) {
+    app.diff_visible = false;
+    app.comment_editor = None;
+    if app.attached.is_some() {
+        app.focus = Focus::Term;
+        app.footer = TERM_HINT.into();
+    } else {
+        app.focus = Focus::Nav;
+        app.footer = NAV_HINT.into();
+    }
+}
+
+fn handle_diff_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Half-page jumps and the explorer chord are checked before the plain-letter
+    // bindings so Ctrl+D isn't read as "delete comment".
+    if ctrl {
+        let page = (app.term_dims.1 / 2).max(1) as isize;
+        match key.code {
+            KeyCode::Char('d') => return move_diff_cursor(app, page),
+            KeyCode::Char('u') => return move_diff_cursor(app, -page),
+            KeyCode::Char('h') | KeyCode::Char('q') => {
+                app.focus = Focus::Nav;
+                app.footer = NAV_HINT.into();
+                return;
+            }
+            _ => return,
+        }
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => close_diff(app),
+        KeyCode::Char('j') | KeyCode::Down => move_diff_cursor(app, 1),
+        KeyCode::Char('k') | KeyCode::Up => move_diff_cursor(app, -1),
+        KeyCode::Char('g') | KeyCode::Home => {
+            if let Some(d) = app.diff.as_mut() {
+                d.cursor_to(0);
+            }
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            if let Some(d) = app.diff.as_mut() {
+                d.cursor_to(usize::MAX);
+            }
+        }
+        KeyCode::Char(']') => diff_nav(app, DiffView::next_file),
+        KeyCode::Char('[') => diff_nav(app, DiffView::prev_file),
+        KeyCode::Char('n') => diff_nav(app, DiffView::next_hunk),
+        KeyCode::Char('p') => diff_nav(app, DiffView::prev_hunk),
+        KeyCode::Char('c') | KeyCode::Enter => open_comment_editor(app),
+        KeyCode::Char('x') => {
+            let removed = app.diff.as_mut().is_some_and(|d| d.delete_comment_at_cursor());
+            app.footer = if removed {
+                "comment deleted".into()
+            } else {
+                "no comment here".into()
+            };
+        }
+        KeyCode::Char('s') => submit_review(app),
+        KeyCode::Char('r') => {
+            if let Some(d) = app.diff.as_ref() {
+                app.send(Request::Diff { worktree: d.worktree.clone() });
+                app.footer = "refreshing diff…".into();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn move_diff_cursor(app: &mut App, delta: isize) {
+    if let Some(d) = app.diff.as_mut() {
+        d.move_cursor(delta);
+    }
+}
+
+fn diff_nav(app: &mut App, f: impl Fn(&mut DiffView)) {
+    if let Some(d) = app.diff.as_mut() {
+        f(d);
+    }
+}
+
+/// Open the comment popup on the cursor line, pre-filled when a comment is
+/// already there (so `c` edits rather than starting over).
+fn open_comment_editor(app: &mut App) {
+    let Some(d) = app.diff.as_ref() else {
+        return;
+    };
+    let Some((anchor, quoted)) = d.cursor_anchor() else {
+        app.footer = "move to a diff line to comment on it".into();
+        return;
+    };
+    let body = d
+        .comments
+        .iter()
+        .find(|c| c.anchor == anchor)
+        .map(|c| c.body.clone())
+        .unwrap_or_default();
+    app.comment_editor = Some(CommentEditor {
+        anchor,
+        quoted,
+        cursor: body.len(),
+        body,
+    });
+    app.footer = COMMENT_HINT.into();
+}
+
+fn handle_comment_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl && key.code == KeyCode::Char('s') {
+        let Some(ed) = app.comment_editor.take() else {
+            return;
+        };
+        if let Some(d) = app.diff.as_mut() {
+            d.set_comment(ed.anchor, ed.quoted, ed.body);
+        }
+        app.footer = DIFF_HINT.into();
+        return;
+    }
+    let Some(ed) = app.comment_editor.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.comment_editor = None;
+            app.footer = DIFF_HINT.into();
+        }
+        // Enter is a newline here, not submit — Ctrl+S saves. A review comment
+        // that can't span lines isn't worth much.
+        KeyCode::Enter => ed.insert('\n'),
+        KeyCode::Backspace => ed.backspace(),
+        KeyCode::Left => ed.left(),
+        KeyCode::Right => ed.right(),
+        KeyCode::Char(c) if !ctrl => ed.insert(c),
+        _ => {}
     }
 }
 
 /// Toggle the split-view editor. Opening asks the daemon for the per-worktree
 /// editor (streamed on the secondary slot when it replies [`Event::EditorOpened`]);
 /// hiding drops that stream but leaves the process — and the AI session — running.
+/// Footer line after a diff loads: lead with anything the user needs to know
+/// (dropped comments, skipped untracked files) rather than the generic hint,
+/// since both mean the review isn't showing everything it could.
+fn diff_status(app: &App, dropped: usize, skipped_untracked: usize) -> String {
+    if dropped > 0 {
+        return format!("{dropped} comment(s) dropped — their lines are gone from the diff");
+    }
+    if skipped_untracked > 0 {
+        return format!("{skipped_untracked} untracked file(s) not shown (over the display cap)");
+    }
+    if app.diff.as_ref().is_some_and(|d| d.is_empty()) {
+        return "no changes in this worktree".into();
+    }
+    DIFF_HINT.into()
+}
+
 fn toggle_editor(app: &mut App) {
+    // The editor split and the diff both own the right pane; showing one hides
+    // the other. The diff is retained, so Ctrl+G returns to the review intact.
+    if app.diff_showing() {
+        app.diff_visible = false;
+    }
     if app.editor.is_some() {
         // Hide: drop the editor stream; the AI session was never detached.
         app.send(Request::DetachEditor);
@@ -573,6 +879,85 @@ fn toggle_editor(app: &mut App) {
         command: resolve_editor_command(),
     });
     app.footer = "opening editor…".into();
+}
+
+/// The session a review may be pasted into: the one you're attached to, so long
+/// as it's an agent living in the worktree the diff came from.
+///
+/// Deliberately strict. Pasting a review into the wrong agent — or into a plain
+/// shell, where it would execute as commands — is far worse than refusing and
+/// saying why, so every mismatch returns a reason instead of guessing.
+fn review_target(app: &App, worktree: &str) -> Result<SessionId, &'static str> {
+    let Some(id) = app.attached else {
+        return Err("open the agent session you want to review into first");
+    };
+    let Some(w) = app.worktree_of_attached() else {
+        return Err("the attached session is gone");
+    };
+    if w.path != worktree {
+        return Err("the attached session is in a different worktree");
+    }
+    match app.attached_session() {
+        Some(s) if s.agent.is_some() => Ok(id),
+        Some(_) => Err("the attached session is a shell, not an agent"),
+        None => Err("the attached session is gone"),
+    }
+}
+
+/// Wrap a multi-line paste so the receiving app takes it as one block.
+///
+/// Without bracketed paste every `\n` reads as Enter: the agent would fire on
+/// the first line and treat the rest as separate follow-up prompts. All three
+/// agent CLIs turn the mode on, so the unwrapped branch is a last resort.
+///
+/// No trailing newline is sent either way — the review lands in the agent's
+/// input box and the user presses Enter themselves. Auto-submitting into an
+/// agent that happens to be mid-turn is how a review gets swallowed.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.trim_end();
+    if bracketed {
+        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
+/// Format the review, paste it into the target agent, and end the review.
+fn submit_review(app: &mut App) {
+    let Some(d) = app.diff.as_ref() else {
+        return;
+    };
+    if d.comments.is_empty() {
+        app.footer = "no comments to submit — press c on a line to add one".into();
+        return;
+    }
+    let id = match review_target(app, &d.worktree) {
+        Ok(id) => id,
+        Err(reason) => {
+            app.footer = format!("can't submit: {reason}");
+            return;
+        }
+    };
+    let n = d.comments.len();
+    let text = format_review(&d.comments);
+    // The attached session's own emulator tells us whether the agent turned
+    // bracketed paste on, the same way mouse forwarding is gated.
+    let bracketed = app
+        .parser
+        .as_ref()
+        .is_some_and(|p| p.screen().bracketed_paste());
+    app.send(Request::Input {
+        id,
+        data: paste_bytes(&text, bracketed),
+    });
+
+    app.diff = None;
+    close_diff(app);
+    app.footer = if bracketed {
+        format!("pasted {n} comment(s) — press Enter in the session to send")
+    } else {
+        format!("pasted {n} comment(s) — session has bracketed paste off, check it before sending")
+    };
 }
 
 /// Which editor binary to launch: `$ASM_EDITOR` → `$EDITOR` → `vi`.
@@ -830,6 +1215,10 @@ fn focus_pane(app: &mut App, pane: ClickPane) {
                 TERM_HINT.into()
             };
         }
+        ClickPane::Diff => {
+            app.focus = Focus::Diff;
+            app.footer = DIFF_HINT.into();
+        }
     }
 }
 
@@ -858,6 +1247,21 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
             }
             MouseEventKind::ScrollUp => {
                 app.selected = app.selected.saturating_sub(1);
+            }
+            _ => {}
+        },
+        Focus::Diff => match ev.kind {
+            MouseEventKind::ScrollDown => move_diff_cursor(app, 3),
+            MouseEventKind::ScrollUp => move_diff_cursor(app, -3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Row 0 is the pane's top border, so content starts at row 1.
+                if ev.row >= 1
+                    && ev.row <= app.term_dims.1
+                    && let Some(d) = app.diff.as_mut()
+                {
+                    let target = d.scroll + (ev.row - 1) as usize;
+                    d.cursor_to(target);
+                }
             }
             _ => {}
         },
@@ -1156,6 +1560,18 @@ fn sync_term_size(app: &mut App) {
     };
     resize_view(app, ViewKind::Primary, ai_target);
     resize_view(app, ViewKind::Editor, ed_target);
+
+    sync_diff_viewport(app);
+}
+
+/// Keep the diff's viewport showing its cursor. The diff pane occupies the same
+/// inner area as the terminal pane, so `term_dims` is its height too. Split out
+/// from [`sync_term_size`] so it can be exercised without a real terminal.
+fn sync_diff_viewport(app: &mut App) {
+    let view_h = app.term_dims.1 as usize;
+    if let Some(d) = app.diff.as_mut() {
+        d.ensure_visible(view_h);
+    }
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -1166,8 +1582,195 @@ fn draw(f: &mut Frame, app: &App) {
     let cols =
         Layout::horizontal([Constraint::Length(LEFT_WIDTH), Constraint::Min(0)]).split(main);
     draw_tree(f, app, cols[0]);
-    draw_terminal(f, app, cols[1]);
+    if app.diff_showing() {
+        draw_diff(f, app, cols[1]);
+    } else {
+        draw_terminal(f, app, cols[1]);
+    }
     draw_footer(f, app, footer_area);
+    // Modal, so it goes last — over whatever the right pane drew.
+    draw_comment_editor(f, app, cols[1]);
+}
+
+/// The reviewable diff: files → hunks → lines, with comments inline. Renders
+/// straight from `DiffView::rows`, so what's drawn and what the cursor indexes
+/// can't drift apart.
+fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
+    let Some(d) = app.diff.as_ref() else {
+        return;
+    };
+    let focused = app.focus == Focus::Diff;
+    let n = d.comments.len();
+    let title = match n {
+        0 => format!(" diff — {} ", short_path(&d.worktree)),
+        1 => format!(" diff — {} · 1 comment ", short_path(&d.worktree)),
+        n => format!(" diff — {} · {n} comments ", short_path(&d.worktree)),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style(focused));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if d.rows.is_empty() {
+        let hint = Paragraph::new(
+            "No changes in this worktree.\n\nThe review diff covers everything since this \
+             branch left the root branch — commits, staged, unstaged, and untracked files.",
+        )
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true });
+        f.render_widget(hint, inner);
+        return;
+    }
+
+    let lines: Vec<Line> = d
+        .rows
+        .iter()
+        .enumerate()
+        .skip(d.scroll)
+        .take(inner.height as usize)
+        .map(|(i, row)| diff_row_line(d, *row, i == d.cursor && focused))
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render one row. Tabs are expanded because a raw `\t` in a ratatui `Line`
+/// collapses to a single cell and wrecks the diff's alignment.
+fn diff_row_line(d: &DiffView, row: DiffRow, selected: bool) -> Line<'static> {
+    let sel = |s: Style| {
+        if selected {
+            s.add_modifier(Modifier::REVERSED)
+        } else {
+            s
+        }
+    };
+    let expand = |t: &str| t.replace('\t', "    ");
+
+    match row {
+        DiffRow::FileHeader { fi } => {
+            let Some(file) = d.files.get(fi) else {
+                return Line::from("");
+            };
+            let tint = match file.status {
+                FileStatus::Added => Color::Green,
+                FileStatus::Deleted => Color::Red,
+                _ => Color::Cyan,
+            };
+            let mut spans = vec![Span::styled(
+                file.label(),
+                sel(Style::default().fg(tint).add_modifier(Modifier::BOLD)),
+            )];
+            if file.binary {
+                spans.push(Span::styled(
+                    "  (binary)",
+                    sel(Style::default().fg(Color::DarkGray)),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!("  +{} -{}", file.added(), file.removed()),
+                    sel(Style::default().fg(Color::DarkGray)),
+                ));
+            }
+            Line::from(spans)
+        }
+        DiffRow::HunkHeader { fi, hi } => {
+            let text = d
+                .files
+                .get(fi)
+                .and_then(|f| f.hunks.get(hi))
+                .map(|h| h.header.clone())
+                .unwrap_or_default();
+            Line::from(Span::styled(
+                expand(&text),
+                sel(Style::default().fg(Color::DarkGray)),
+            ))
+        }
+        DiffRow::Line { fi, hi, li } => {
+            let Some((file, l)) = d
+                .files
+                .get(fi)
+                .and_then(|f| f.hunks.get(hi).map(|h| (f, h)))
+                .and_then(|(f, h)| h.lines.get(li).map(|l| (f, l)))
+            else {
+                return Line::from("");
+            };
+            let (marker, tint) = match l.kind {
+                LineKind::Add => ('+', Color::Green),
+                LineKind::Del => ('-', Color::Red),
+                LineKind::Context => (' ', Color::Gray),
+            };
+            let num = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
+            let gutter = format!("{:>4} {:>4} {marker}", num(l.old_ln), num(l.new_ln));
+            // A commented line keeps its marker visible once its comment rows
+            // have scrolled out of view.
+            let gutter_color = if d.is_commented(&file.path, l) {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            Line::from(vec![
+                Span::styled(gutter, sel(Style::default().fg(gutter_color))),
+                Span::styled(expand(&l.text), sel(Style::default().fg(tint))),
+            ])
+        }
+        DiffRow::Comment { ci, li } => {
+            let text = d.comment_line(ci, li).unwrap_or_default().to_string();
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>width$}┃ ", "", width = GUTTER),
+                    sel(Style::default().fg(Color::Yellow)),
+                ),
+                Span::styled(expand(&text), sel(Style::default().fg(Color::Yellow))),
+            ])
+        }
+    }
+}
+
+/// The modal comment editor, centred over the diff pane.
+fn draw_comment_editor(f: &mut Frame, app: &App, area: Rect) {
+    let Some(ed) = app.comment_editor.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(area, 80, 50);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" comment ")
+        .border_style(border_style(true));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{}:{}", ed.anchor.path, ed.anchor.line),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(Span::styled(
+            format!("> {}", ed.quoted.trim().replace('\t', "    ")),
+            dim,
+        )),
+        Line::from(""),
+    ];
+    // The caret is spliced into the text rather than positioned as a hardware
+    // cursor, which would need the wrapped layout's geometry to place.
+    for l in ed.with_caret().split('\n') {
+        lines.push(Line::from(Span::raw(l.replace('\t', "    ").to_string())));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// A rect `pct_x`/`pct_y` percent of `area`, centred within it.
+fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let w = (area.width * pct_x / 100).max(1).min(area.width);
+    let h = (area.height * pct_y / 100).max(3).min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 /// Build the tree's list items straight from `app.rows`, so the drawn list and
@@ -1572,6 +2175,9 @@ mod tests {
             editor_parser: None,
             editor_focused: false,
             term_dims: (80, 24),
+            diff: None,
+            diff_visible: false,
+            comment_editor: None,
             prompt: None,
             footer: String::new(),
             net_tx: tx,
@@ -2162,4 +2768,517 @@ mod tests {
         handle_mouse(&mut app, click(LEFT_WIDTH + 5, 3));
         assert_eq!(app.focus, Focus::Term); // no-op focus-wise, click falls through
     }
+
+    // ---- diff review pane ----
+
+    const DIFF: &str = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -10,2 +10,3 @@
+ let keep = 1;
++let added = 2;
+";
+
+    fn claude_sess(id: u64, name: &str) -> SessionInfo {
+        agent_sess(id, name, AgentTool::Claude)
+    }
+
+    /// An app attached to an agent session in `/r/a`, with the diff loaded.
+    fn app_reviewing() -> (App, mpsc::UnboundedReceiver<Request>) {
+        let (mut app, rx) = app_with_rx(vec![wt("/r/a", vec![claude_sess(1, "claude")], vec![])]);
+        app.attached = Some(1);
+        handle_daemon_event(
+            &mut app,
+            Event::Diff {
+                worktree: "/r/a".into(),
+                text: DIFF.into(),
+                skipped_untracked: 0,
+            },
+        );
+        (app, rx)
+    }
+
+    /// Move the diff cursor onto the row for the line with `text`.
+    fn cursor_on_line(app: &mut App, text: &str) {
+        let d = app.diff.as_mut().expect("diff loaded");
+        let i = (0..d.rows.len())
+            .find(|i| d.line_at(*i).map(|(_, l)| l.text == text).unwrap_or(false))
+            .expect("no such line");
+        d.cursor = i;
+    }
+
+    /// Add a comment through the real key path: `c`, type, `Ctrl+S`.
+    fn write_comment(app: &mut App, body: &str) {
+        handle_key(app, KeyEvent::from(KeyCode::Char('c')));
+        for ch in body.chars() {
+            handle_key(app, KeyEvent::from(KeyCode::Char(ch)));
+        }
+        handle_key(app, ctrl('s'));
+    }
+
+    #[test]
+    fn ctrl_g_is_the_diff_toggle_and_plain_g_is_not() {
+        assert!(is_diff_toggle(&ctrl('g')));
+        assert!(!is_diff_toggle(&KeyEvent::from(KeyCode::Char('g'))));
+        assert!(!is_diff_toggle(&ctrl('h')));
+    }
+
+    #[test]
+    fn ctrl_g_requests_the_diff_for_the_selected_worktree() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![], vec![])]);
+        handle_key(&mut app, ctrl('g'));
+        match rx.try_recv() {
+            Ok(Request::Diff { worktree }) => assert_eq!(worktree, "/r/a"),
+            other => panic!("expected Diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_the_diff_detaches_the_editor_split() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.attached = Some(1);
+        app.editor = Some(99);
+        app.editor_parser = Some(vt100::Parser::new(24, 80, 0));
+        handle_key(&mut app, ctrl('g'));
+        assert!(app.editor.is_none(), "editor stream dropped");
+        assert!(matches!(rx.try_recv(), Ok(Request::DetachEditor)));
+        assert!(matches!(rx.try_recv(), Ok(Request::Diff { .. })));
+    }
+
+    #[test]
+    fn loading_a_diff_focuses_the_pane_and_parses_it() {
+        let (app, _rx) = app_reviewing();
+        assert_eq!(app.focus, Focus::Diff);
+        assert!(app.diff_showing());
+        let d = app.diff.as_ref().unwrap();
+        assert_eq!(d.files.len(), 1);
+        assert_eq!(d.files[0].path, "src/a.rs");
+    }
+
+    #[test]
+    fn the_diff_and_the_editor_split_are_mutually_exclusive() {
+        let (mut app, _rx) = app_reviewing();
+        app.editor = Some(99);
+        // Both "present" — the diff wins, so the split never renders under it.
+        assert!(app.diff_showing());
+        assert!(!app.split_active());
+        assert_eq!(app.pane_at(LEFT_WIDTH + 5), ClickPane::Diff);
+    }
+
+    #[test]
+    fn hiding_the_diff_keeps_the_review_for_later() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "hoist this");
+        assert_eq!(app.diff.as_ref().unwrap().comments.len(), 1);
+
+        handle_key(&mut app, ctrl('g')); // hide
+        assert!(!app.diff_showing());
+        assert!(app.diff.is_some(), "review retained while hidden");
+        assert_eq!(app.diff.as_ref().unwrap().comments.len(), 1);
+    }
+
+    #[test]
+    fn switching_worktree_discards_a_review_that_cannot_carry_over() {
+        let (mut app, _rx) = app_with_rx(vec![
+            wt("/r/a", vec![], vec![]),
+            wt("/r/b", vec![], vec![]),
+        ]);
+        handle_daemon_event(
+            &mut app,
+            Event::Diff { worktree: "/r/a".into(), text: DIFF.into(), skipped_untracked: 0 },
+        );
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "note");
+        handle_key(&mut app, ctrl('g')); // hide
+
+        app.selected = 1; // the /r/b worktree row
+        app.focus = Focus::Nav;
+        handle_key(&mut app, ctrl('g')); // open for a different worktree
+        assert!(app.diff.is_none(), "stale review for /r/a dropped");
+    }
+
+    #[test]
+    fn writing_a_comment_anchors_it_to_the_cursor_line() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "why?");
+
+        let d = app.diff.as_ref().unwrap();
+        assert_eq!(d.comments.len(), 1);
+        assert_eq!(d.comments[0].body, "why?");
+        assert_eq!(d.comments[0].anchor.path, "src/a.rs");
+        assert_eq!(d.comments[0].anchor.line, 11); // the added line's new number
+        assert_eq!(d.comments[0].quoted, "let added = 2;");
+        assert!(app.comment_editor.is_none(), "editor closed on save");
+    }
+
+    #[test]
+    fn escaping_the_comment_editor_discards_the_draft() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        for ch in "typed".chars() {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(ch)));
+        }
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.comment_editor.is_none());
+        assert!(app.diff.as_ref().unwrap().comments.is_empty());
+    }
+
+    #[test]
+    fn enter_inserts_a_newline_in_a_comment_rather_than_saving() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('b')));
+        assert!(app.comment_editor.is_some(), "Enter must not save");
+        handle_key(&mut app, ctrl('s'));
+        assert_eq!(app.diff.as_ref().unwrap().comments[0].body, "a\nb");
+    }
+
+    #[test]
+    fn comment_editing_handles_backspace_and_multibyte_text() {
+        let mut ed = CommentEditor {
+            anchor: CommentAnchor {
+                path: "a".into(),
+                side: crate::diff::Side::New,
+                line: 1,
+            },
+            quoted: String::new(),
+            body: String::new(),
+            cursor: 0,
+        };
+        for c in "né→".chars() {
+            ed.insert(c);
+        }
+        assert_eq!(ed.cursor, ed.body.len());
+        ed.backspace(); // drops the 3-byte arrow whole
+        assert_eq!(ed.body, "né");
+        ed.left();
+        ed.insert('X'); // lands between n and é
+        assert_eq!(ed.body, "nXé");
+        assert!(ed.with_caret().contains('▏'));
+    }
+
+    #[test]
+    fn x_deletes_the_comment_under_the_cursor() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "gone soon");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('x')));
+        assert!(app.diff.as_ref().unwrap().comments.is_empty());
+    }
+
+    #[test]
+    fn refreshing_the_diff_keeps_comments_pinned_to_moved_lines() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "still relevant");
+
+        let moved = DIFF.replace("@@ -10,2 +10,3 @@", "@@ -40,2 +40,3 @@");
+        handle_daemon_event(
+            &mut app,
+            Event::Diff { worktree: "/r/a".into(), text: moved, skipped_untracked: 0 },
+        );
+        let d = app.diff.as_ref().unwrap();
+        assert_eq!(d.comments.len(), 1);
+        assert_eq!(d.comments[0].anchor.line, 41);
+    }
+
+    #[test]
+    fn refresh_reports_comments_it_had_to_drop() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "doomed");
+        handle_daemon_event(
+            &mut app,
+            Event::Diff { worktree: "/r/a".into(), text: String::new(), skipped_untracked: 0 },
+        );
+        assert!(app.diff.as_ref().unwrap().comments.is_empty());
+        assert!(app.footer.contains("1 comment(s) dropped"), "got: {}", app.footer);
+    }
+
+    #[test]
+    fn skipped_untracked_files_are_reported() {
+        let (mut app, _rx) = app_with_rx(vec![wt("/r/a", vec![], vec![])]);
+        handle_daemon_event(
+            &mut app,
+            Event::Diff { worktree: "/r/a".into(), text: DIFF.into(), skipped_untracked: 7 },
+        );
+        assert!(app.footer.contains("7 untracked"), "got: {}", app.footer);
+    }
+
+    #[test]
+    fn an_empty_diff_says_so() {
+        let (mut app, _rx) = app_with_rx(vec![wt("/r/a", vec![], vec![])]);
+        handle_daemon_event(
+            &mut app,
+            Event::Diff { worktree: "/r/a".into(), text: String::new(), skipped_untracked: 0 },
+        );
+        assert!(app.footer.contains("no changes"), "got: {}", app.footer);
+    }
+
+    // ---- submission ----
+
+    #[test]
+    fn submitting_pastes_the_review_into_the_attached_agent() {
+        let (mut app, mut rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "hoist this");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('s')));
+
+        let data = loop {
+            match rx.try_recv() {
+                Ok(Request::Input { id, data }) => {
+                    assert_eq!(id, 1);
+                    break data;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("expected Input, got {e:?}"),
+            }
+        };
+        let text = String::from_utf8(data).unwrap();
+        assert!(text.contains("src/a.rs:11"));
+        assert!(text.contains("> let added = 2;"));
+        assert!(text.contains("hoist this"));
+    }
+
+    #[test]
+    fn submitting_ends_the_review_and_returns_to_the_session() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "note");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('s')));
+        assert!(app.diff.is_none(), "review consumed");
+        assert!(!app.diff_showing());
+        assert_eq!(app.focus, Focus::Term);
+    }
+
+    #[test]
+    fn submitting_with_no_comments_sends_nothing() {
+        let (mut app, mut rx) = app_reviewing();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('s')));
+        assert!(rx.try_recv().is_err(), "nothing forwarded");
+        assert!(app.diff_showing(), "review stays open");
+        assert!(app.footer.contains("no comments"));
+    }
+
+    #[test]
+    fn a_review_refuses_to_go_to_a_plain_shell() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, "bash")], vec![])]);
+        app.attached = Some(1);
+        assert_eq!(
+            review_target(&app, "/r/a"),
+            Err("the attached session is a shell, not an agent")
+        );
+    }
+
+    #[test]
+    fn a_review_refuses_to_cross_worktrees() {
+        let mut app = app_with(vec![
+            wt("/r/a", vec![], vec![]),
+            wt("/r/b", vec![claude_sess(2, "claude")], vec![]),
+        ]);
+        app.attached = Some(2); // agent lives in /r/b, diff is for /r/a
+        assert_eq!(
+            review_target(&app, "/r/a"),
+            Err("the attached session is in a different worktree")
+        );
+    }
+
+    #[test]
+    fn a_review_refuses_when_nothing_is_attached() {
+        let app = app_with(vec![wt("/r/a", vec![claude_sess(1, "claude")], vec![])]);
+        assert!(review_target(&app, "/r/a").is_err());
+    }
+
+    #[test]
+    fn a_review_goes_to_an_attached_agent_in_the_same_worktree() {
+        let mut app = app_with(vec![wt("/r/a", vec![claude_sess(1, "claude")], vec![])]);
+        app.attached = Some(1);
+        assert_eq!(review_target(&app, "/r/a"), Ok(1));
+    }
+
+    #[test]
+    fn a_refused_review_is_not_discarded() {
+        // The comments must survive so the user can attach and retry.
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "bash")], vec![])]);
+        app.attached = Some(1); // a shell, not an agent
+        handle_daemon_event(
+            &mut app,
+            Event::Diff { worktree: "/r/a".into(), text: DIFF.into(), skipped_untracked: 0 },
+        );
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "keep me");
+        while rx.try_recv().is_ok() {} // drain
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('s')));
+        assert!(rx.try_recv().is_err(), "nothing pasted");
+        assert_eq!(app.diff.as_ref().unwrap().comments.len(), 1);
+        assert!(app.footer.contains("shell, not an agent"), "got: {}", app.footer);
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_the_review_so_newlines_do_not_submit_it() {
+        let out = paste_bytes("line one\nline two", true);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("\x1b[200~"));
+        assert!(s.ends_with("\x1b[201~"));
+        assert!(s.contains("line one\nline two"));
+    }
+
+    #[test]
+    fn paste_without_bracketed_support_sends_the_bare_text() {
+        let out = paste_bytes("hello", false);
+        assert_eq!(String::from_utf8(out).unwrap(), "hello");
+    }
+
+    #[test]
+    fn paste_never_carries_a_trailing_newline() {
+        // A trailing newline would submit the review the moment it lands.
+        for bracketed in [true, false] {
+            let s = String::from_utf8(paste_bytes("body\n\n", bracketed)).unwrap();
+            let payload = s.trim_start_matches("\x1b[200~").trim_end_matches("\x1b[201~");
+            assert_eq!(payload, "body");
+        }
+    }
+
+    // ---- navigation ----
+
+    #[test]
+    fn ctrl_d_pages_the_diff_instead_of_deleting_a_comment() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "stays");
+        app.diff.as_mut().unwrap().cursor = 0;
+        handle_key(&mut app, ctrl('d'));
+        assert_eq!(app.diff.as_ref().unwrap().comments.len(), 1, "not deleted");
+        assert!(app.diff.as_ref().unwrap().cursor > 0, "cursor advanced");
+    }
+
+    #[test]
+    fn g_and_shift_g_jump_to_the_ends() {
+        let (mut app, _rx) = app_reviewing();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')));
+        let d = app.diff.as_ref().unwrap();
+        assert_eq!(d.cursor, d.rows.len() - 1);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(app.diff.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn esc_closes_the_diff_and_returns_to_the_session() {
+        let (mut app, _rx) = app_reviewing();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(!app.diff_showing());
+        assert_eq!(app.focus, Focus::Term);
+    }
+
+    #[test]
+    fn commenting_on_a_header_row_is_refused_without_opening_the_editor() {
+        let (mut app, _rx) = app_reviewing();
+        app.diff.as_mut().unwrap().cursor = 0; // the file header
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        assert!(app.comment_editor.is_none());
+        assert!(app.footer.contains("diff line"), "got: {}", app.footer);
+    }
+
+    // ---- rendering ----
+
+    /// Draw the whole app and return the screen as text, one string per row.
+    fn render(app: &App, w: u16, h: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_diff_pane_renders_gutter_numbers_and_inline_comments() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "hoist this");
+
+        let screen = render(&app, 120, 24).join("\n");
+        assert!(screen.contains("src/a.rs"), "file header missing:\n{screen}");
+        assert!(screen.contains("@@ -10,2 +10,3 @@"), "hunk header missing");
+        assert!(screen.contains("+let added = 2;"), "added line missing");
+        assert!(screen.contains("11 +"), "new-side line number missing");
+        assert!(screen.contains("┃ hoist this"), "inline comment missing");
+        assert!(screen.contains("1 comment"), "title count missing");
+    }
+
+    #[test]
+    fn the_comment_editor_draws_over_the_diff() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        for ch in "needs a test".chars() {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(ch)));
+        }
+        let screen = render(&app, 120, 24).join("\n");
+        assert!(screen.contains("comment"), "popup title missing");
+        assert!(screen.contains("src/a.rs:11"), "anchor missing");
+        assert!(screen.contains("> let added = 2;"), "quoted line missing");
+        assert!(screen.contains("needs a test▏"), "body + caret missing:\n{screen}");
+    }
+
+    #[test]
+    fn an_empty_diff_renders_an_explanation_rather_than_a_blank_pane() {
+        let (mut app, _rx) = app_with_rx(vec![wt("/r/a", vec![], vec![])]);
+        handle_daemon_event(
+            &mut app,
+            Event::Diff { worktree: "/r/a".into(), text: String::new(), skipped_untracked: 0 },
+        );
+        let screen = render(&app, 120, 24).join("\n");
+        assert!(screen.contains("No changes"), "got:\n{screen}");
+    }
+
+    #[test]
+    fn rendering_survives_a_pane_far_too_small_for_the_content() {
+        // Guards the slicing in the row renderer and the popup geometry against
+        // panicking when the terminal is tiny.
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "a comment much wider than the pane it renders into");
+        for (w, h) in [(40, 6), (36, 4), (80, 3)] {
+            render(&app, w, h);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+            render(&app, w, h); // with the popup open
+            handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        }
+    }
+
+    #[test]
+    fn scrolling_keeps_the_cursor_on_screen() {
+        let (mut app, _rx) = app_reviewing();
+        app.term_dims = (100, 4); // 4 visible rows
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')));
+        sync_diff_viewport(&mut app);
+        let d = app.diff.as_ref().unwrap();
+        assert!(d.cursor >= d.scroll && d.cursor < d.scroll + 4, "cursor off screen");
+    }
+
+    #[test]
+    fn diff_keys_do_not_leak_to_the_pty() {
+        // `c`/`s`/`x` are tree and terminal bindings elsewhere; in the diff they
+        // must neither start a session nor reach the attached PTY.
+        let (mut app, mut rx) = app_reviewing();
+        for c in ['c', 's', 'x', 'j', 'k'] {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(c)));
+        }
+        // The only request a comment-less review can produce here is none at all.
+        assert!(rx.try_recv().is_err(), "diff keys must not reach the daemon");
+    }
 }
+

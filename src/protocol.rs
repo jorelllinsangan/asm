@@ -50,6 +50,9 @@ pub enum Request {
     AttachEditor { id: SessionId, cols: u16, rows: u16 },
     /// Drop the secondary (editor) stream; leaves the primary attachment intact.
     DetachEditor,
+    /// Ask for the reviewable diff of `worktree` (see [`crate::git::review_diff`]).
+    /// Daemon replies [`Event::Diff`].
+    Diff { worktree: String },
     /// Forward bytes to the session's PTY.
     Input { id: SessionId, data: Vec<u8> },
     Resize { id: SessionId, cols: u16, rows: u16 },
@@ -75,6 +78,14 @@ pub enum Event {
     /// Reply to [`Request::OpenEditor`]: the editor session's id, ready to be
     /// streamed via [`Request::AttachEditor`].
     EditorOpened { id: SessionId },
+    /// Reply to [`Request::Diff`]: raw unified diff text, parsed client-side.
+    /// `skipped_untracked` is non-zero when the untracked-file cap was hit.
+    Diff {
+        worktree: String,
+        text: String,
+        #[serde(default)]
+        skipped_untracked: usize,
+    },
     Error { message: String },
 }
 
