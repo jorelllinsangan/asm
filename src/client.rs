@@ -30,14 +30,40 @@ const LEFT_WIDTH: u16 = 34;
 const OLD_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
 
 const NAV_HINT: &str =
-    "j/k move · Space fold · Enter open · c claude · o opencode · n shell · w worktree · x kill · r refresh · R rename · a old · q quit";
-const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) returns to the explorer";
+    "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · x kill · Ctrl+] editor · q quit";
+const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor";
+const EDITOR_HINT: &str = "EDITOR · Ctrl+] hides it (keeps running) · Ctrl+H explorer";
+/// Fraction of the terminal pane width given to the editor in the split view.
+const EDITOR_SPLIT_PCT: u16 = 50;
+
+/// The reserved chord that toggles the split-view editor. Intercepted before any
+/// PTY forwarding, so the editor never receives it.
+///
+/// `Ctrl+]` is the byte `0x1D`. crossterm's legacy (non-kitty) input decodes the
+/// `0x1C..=0x1F` range as `Ctrl+'4'..'7'`, so it reports `Ctrl+]` as `Ctrl+'5'`;
+/// a terminal running the kitty keyboard protocol would instead send `Ctrl+']'`.
+/// asm doesn't enable kitty flags, so in practice it's always `Ctrl+'5'` — accept
+/// both so the chord works regardless.
+fn is_editor_toggle(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
+}
 
 /// Which pane keystrokes go to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Nav,
     Term,
+}
+
+/// A pane identity for click-to-focus. `Term` is the single terminal pane;
+/// `TermAi`/`TermEditor` are the two sides when the editor split is open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClickPane {
+    Tree,
+    Term,
+    TermAi,
+    TermEditor,
 }
 
 /// A flattened, selectable tree row.
@@ -52,6 +78,9 @@ enum PromptKind {
     NewWorktree,
     /// A plain shell session; the input is its display name.
     NewSession { worktree: String },
+    /// A new agent session; the input is its display name (blank => a cute
+    /// auto-generated one).
+    NewAgent { worktree: String, tool: AgentTool },
     RenameSession { id: SessionId },
 }
 
@@ -85,6 +114,13 @@ struct App {
     focus: Focus,
     attached: Option<SessionId>,
     parser: Option<vt100::Parser>,
+    /// The split-view editor session, when open. `Some` = the editor is shown;
+    /// keystrokes route to it and it renders beside the AI session.
+    editor: Option<SessionId>,
+    editor_parser: Option<vt100::Parser>,
+    /// In the split, which side has keyboard focus: `true` = editor, `false` =
+    /// the AI session. Only meaningful while the split is open.
+    editor_focused: bool,
     term_dims: (u16, u16), // (cols, rows) of the terminal pane's inner area
     prompt: Option<Prompt>,
     footer: String,
@@ -144,6 +180,98 @@ impl App {
             return Some((w, s.id));
         }
         None
+    }
+
+    /// The worktree containing the currently-attached (primary) session, so the
+    /// editor opens where you're actually working, not just where the cursor is.
+    fn worktree_of_attached(&self) -> Option<&WorktreeInfo> {
+        let id = self.attached?;
+        self.tree
+            .iter()
+            .find(|w| w.sessions.iter().any(|s| s.id == id))
+    }
+
+    /// The currently-attached (primary) session, if any.
+    fn attached_session(&self) -> Option<&SessionInfo> {
+        let id = self.attached?;
+        self.tree.iter().flat_map(|w| &w.sessions).find(|s| s.id == id)
+    }
+
+    /// Whether the AI session and editor are shown side-by-side (both present).
+    fn split_active(&self) -> bool {
+        self.editor.is_some() && self.attached.is_some()
+    }
+
+    /// The session that receives keystrokes: in the split, the active side; else
+    /// the editor when open, else the primary attachment.
+    fn focused_session_id(&self) -> Option<SessionId> {
+        if self.split_active() {
+            return if self.editor_focused {
+                self.editor
+            } else {
+                self.attached
+            };
+        }
+        self.editor.or(self.attached)
+    }
+
+    /// The focused terminal sub-pane for mouse routing:
+    /// `(parser, origin_x, origin_y, cols, rows)`, accounting for the split.
+    fn focused_terminal(&self) -> Option<(&vt100::Parser, u16, u16, u16, u16)> {
+        let right_w = self.term_dims.0.saturating_add(2);
+        let main_h = self.term_dims.1.saturating_add(2);
+        if self.split_active() {
+            let (ai_w, ed_w) = split_widths(right_w);
+            if self.editor_focused {
+                let (c, r) = inner_dims(ed_w, main_h);
+                // Editor inner origin: tree width + ai block width + editor's border.
+                let ox = LEFT_WIDTH + ai_w + 1;
+                return self.editor_parser.as_ref().map(|p| (p, ox, 1, c, r));
+            }
+            let (c, r) = inner_dims(ai_w, main_h);
+            return self.parser.as_ref().map(|p| (p, LEFT_WIDTH + 1, 1, c, r));
+        }
+        let (c, r) = self.term_dims;
+        let p = if self.editor.is_some() {
+            self.editor_parser.as_ref()
+        } else {
+            self.parser.as_ref()
+        };
+        p.map(|p| (p, LEFT_WIDTH + 1, 1, c, r))
+    }
+
+    /// Which pane the column `col` falls in (for click-to-focus). Mirrors the
+    /// draw layout: tree, then the terminal pane (split into ai|editor or single).
+    fn pane_at(&self, col: u16) -> ClickPane {
+        if col < LEFT_WIDTH {
+            return ClickPane::Tree;
+        }
+        if self.split_active() {
+            let right_w = self.term_dims.0.saturating_add(2);
+            let (ai_w, _) = split_widths(right_w);
+            if col < LEFT_WIDTH + ai_w {
+                ClickPane::TermAi
+            } else {
+                ClickPane::TermEditor
+            }
+        } else {
+            ClickPane::Term
+        }
+    }
+
+    /// The pane that currently has focus, in the same terms as [`Self::pane_at`].
+    fn active_pane(&self) -> ClickPane {
+        match self.focus {
+            Focus::Nav => ClickPane::Tree,
+            Focus::Term if self.split_active() => {
+                if self.editor_focused {
+                    ClickPane::TermEditor
+                } else {
+                    ClickPane::TermAi
+                }
+            }
+            Focus::Term => ClickPane::Term,
+        }
     }
 
     /// Returns (worktree path, session id, tool) for a selected agent row.
@@ -271,6 +399,9 @@ pub async fn run(root: PathBuf) -> Result<()> {
         focus: Focus::Nav,
         attached: None,
         parser: None,
+        editor: None,
+        editor_parser: None,
+        editor_focused: false,
         term_dims: (80, 24),
         prompt: None,
         footer: NAV_HINT.into(),
@@ -339,14 +470,23 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             app.rebuild_rows();
         }
         Event::Attached { id, scrollback } => {
-            let (cols, rows) = app.term_dims;
+            // Route by id: the editor's secondary stream feeds its own parser.
+            let (cols, rows) = editor_view_dims(app, id);
             let mut parser = vt100::Parser::new(rows.max(1), cols.max(1), 1000);
             parser.process(&scrollback);
-            app.parser = Some(parser);
-            app.attached = Some(id);
+            if app.editor == Some(id) {
+                app.editor_parser = Some(parser);
+            } else {
+                app.parser = Some(parser);
+                app.attached = Some(id);
+            }
         }
         Event::Output { id, data } => {
-            if app.attached == Some(id)
+            if app.editor == Some(id) {
+                if let Some(p) = app.editor_parser.as_mut() {
+                    p.process(&data);
+                }
+            } else if app.attached == Some(id)
                 && let Some(p) = app.parser.as_mut()
             {
                 p.process(&data);
@@ -359,13 +499,36 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             app.focus = Focus::Term;
             app.footer = TERM_HINT.into();
         }
+        Event::EditorOpened { id } => {
+            // The daemon opened/reused the editor; stream it on the secondary slot.
+            app.editor = Some(id);
+            app.editor_focused = true; // new editor grabs focus within the split
+            let (cols, rows) = editor_view_dims(app, id);
+            app.send(Request::AttachEditor { id, cols, rows });
+            app.focus = Focus::Term;
+            app.footer = EDITOR_HINT.into();
+        }
         Event::Error { message } => {
             app.footer = format!("error: {message}");
+            // If a re-attach failed and we have nothing to show, drop to the
+            // explorer rather than leaving the user in an empty terminal.
+            if app.parser.is_none() && app.editor.is_none() {
+                app.focus = Focus::Nav;
+            }
         }
     }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    // The editor toggle is reserved globally: intercept it before any focus
+    // dispatch so it works from every mode and is never forwarded to a PTY. When
+    // a prompt is open it's swallowed (so it neither toggles nor types a `]`).
+    if is_editor_toggle(&key) {
+        if app.prompt.is_none() {
+            toggle_editor(app);
+        }
+        return;
+    }
     if app.prompt.is_some() {
         handle_prompt_key(app, key);
         return;
@@ -374,6 +537,61 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Focus::Nav => handle_nav_key(app, key),
         Focus::Term => handle_term_key(app, key),
     }
+}
+
+/// Toggle the split-view editor. Opening asks the daemon for the per-worktree
+/// editor (streamed on the secondary slot when it replies [`Event::EditorOpened`]);
+/// hiding drops that stream but leaves the process — and the AI session — running.
+fn toggle_editor(app: &mut App) {
+    if app.editor.is_some() {
+        // Hide: drop the editor stream; the AI session was never detached.
+        app.send(Request::DetachEditor);
+        app.editor = None;
+        app.editor_parser = None;
+        if app.attached.is_some() {
+            app.focus = Focus::Term;
+            app.footer = TERM_HINT.into();
+        } else {
+            app.focus = Focus::Nav;
+            app.footer = NAV_HINT.into();
+        }
+        return;
+    }
+    // Open: anchor to the worktree of the AI session you're viewing, else the
+    // tree selection.
+    let worktree = if app.focus == Focus::Term && app.attached.is_some() {
+        app.worktree_of_attached().map(|w| w.path.clone())
+    } else {
+        app.selected_worktree().map(|w| w.path.clone())
+    };
+    let Some(worktree) = worktree else {
+        app.footer = "select a worktree first".into();
+        return;
+    };
+    app.send(Request::OpenEditor {
+        worktree,
+        command: resolve_editor_command(),
+    });
+    app.footer = "opening editor…".into();
+}
+
+/// Which editor binary to launch: `$ASM_EDITOR` → `$EDITOR` → `vi`.
+fn resolve_editor_command() -> String {
+    pick_editor(
+        std::env::var("ASM_EDITOR").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    )
+}
+
+/// Editor precedence, factored out for testing: `ASM_EDITOR` → `EDITOR` → `vi`,
+/// treating an unset or blank/whitespace value as absent.
+fn pick_editor(asm_editor: Option<&str>, editor: Option<&str>) -> String {
+    [asm_editor, editor]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.trim().is_empty())
+        .unwrap_or("vi")
+        .to_string()
 }
 
 fn handle_nav_key(app: &mut App, key: KeyEvent) {
@@ -420,8 +638,9 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
                 });
             }
         }
-        KeyCode::Char('c') => start_agent(app, "claude"),
-        KeyCode::Char('o') => start_agent(app, "opencode"),
+        KeyCode::Char('c') => start_agent(app, AgentTool::Claude),
+        KeyCode::Char('o') => start_agent(app, AgentTool::Opencode),
+        KeyCode::Char('C') => start_agent(app, AgentTool::Codex),
         KeyCode::Char('w') => {
             app.prompt = Some(Prompt {
                 kind: PromptKind::NewWorktree,
@@ -501,18 +720,74 @@ fn focus_terminal(app: &mut App) {
     }
 }
 
-/// Launch a fresh agent session (`claude` / `opencode`) in the selected
-/// worktree. It auto-opens when the daemon reports it created.
-fn start_agent(app: &mut App, cmd: &str) {
+/// Prompt for a name, then launch a fresh agent session (`claude` / `opencode`)
+/// in the selected worktree. A blank name gets a cute auto-generated one. It
+/// auto-opens when the daemon reports it created (see [`submit_prompt`]).
+fn start_agent(app: &mut App, tool: AgentTool) {
     if let Some(w) = app.selected_worktree() {
         let worktree = w.path.clone();
-        app.send(Request::CreateSession {
-            worktree,
-            name: cmd.to_string(),
-            command: cmd.to_string(),
+        app.prompt = Some(Prompt {
+            kind: PromptKind::NewAgent { worktree, tool },
+            label: format!("New {} session name (blank = random)", agent_label(tool)),
+            input: String::new(),
         });
-        app.footer = format!("starting {cmd}…");
     }
+}
+
+fn agent_label(tool: AgentTool) -> &'static str {
+    match tool {
+        AgentTool::Claude => "Claude",
+        AgentTool::Opencode => "OpenCode",
+        AgentTool::Codex => "Codex",
+    }
+}
+
+/// The CLI a fresh agent session runs.
+fn agent_command(tool: AgentTool) -> &'static str {
+    match tool {
+        AgentTool::Claude => "claude",
+        AgentTool::Opencode => "opencode",
+        AgentTool::Codex => "codex",
+    }
+}
+
+/// A whimsical default label for an unnamed session: `adjective-pokemon`, drawn
+/// from the original 151. Seeded from the clock so successive sessions differ.
+fn cute_name() -> String {
+    const ADJ: &[&str] = &[
+        "swift", "brave", "cosmic", "gentle", "fuzzy", "clever", "mellow", "snappy", "witty",
+        "sunny", "dapper", "zesty", "lucky", "nimble", "quiet", "plucky", "bold", "cheeky",
+    ];
+    // The original 151, lowercased and stripped to alphanumerics.
+    const POKEMON: &[&str] = &[
+        "bulbasaur", "ivysaur", "venusaur", "charmander", "charmeleon", "charizard", "squirtle",
+        "wartortle", "blastoise", "caterpie", "metapod", "butterfree", "weedle", "kakuna",
+        "beedrill", "pidgey", "pidgeotto", "pidgeot", "rattata", "raticate", "spearow", "fearow",
+        "ekans", "arbok", "pikachu", "raichu", "sandshrew", "sandslash", "nidoran", "nidorina",
+        "nidoqueen", "nidorino", "nidoking", "clefairy", "clefable", "vulpix", "ninetales",
+        "jigglypuff", "wigglytuff", "zubat", "golbat", "oddish", "gloom", "vileplume", "paras",
+        "parasect", "venonat", "venomoth", "diglett", "dugtrio", "meowth", "persian", "psyduck",
+        "golduck", "mankey", "primeape", "growlithe", "arcanine", "poliwag", "poliwhirl",
+        "poliwrath", "abra", "kadabra", "alakazam", "machop", "machoke", "machamp", "bellsprout",
+        "weepinbell", "victreebel", "tentacool", "tentacruel", "geodude", "graveler", "golem",
+        "ponyta", "rapidash", "slowpoke", "slowbro", "magnemite", "magneton", "farfetchd", "doduo",
+        "dodrio", "seel", "dewgong", "grimer", "muk", "shellder", "cloyster", "gastly", "haunter",
+        "gengar", "onix", "drowzee", "hypno", "krabby", "kingler", "voltorb", "electrode",
+        "exeggcute", "exeggutor", "cubone", "marowak", "hitmonlee", "hitmonchan", "lickitung",
+        "koffing", "weezing", "rhyhorn", "rhydon", "chansey", "tangela", "kangaskhan", "horsea",
+        "seadra", "goldeen", "seaking", "staryu", "starmie", "mrmime", "scyther", "jynx",
+        "electabuzz", "magmar", "pinsir", "tauros", "magikarp", "gyarados", "lapras", "ditto",
+        "eevee", "vaporeon", "jolteon", "flareon", "porygon", "omanyte", "omastar", "kabuto",
+        "kabutops", "aerodactyl", "snorlax", "articuno", "zapdos", "moltres", "dratini",
+        "dragonair", "dragonite", "mewtwo", "mew",
+    ];
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let adj = ADJ[(n as usize) % ADJ.len()];
+    let mon = POKEMON[((n >> 10) as usize) % POKEMON.len()];
+    format!("{adj}-{mon}")
 }
 
 fn handle_term_key(app: &mut App, key: KeyEvent) {
@@ -530,10 +805,50 @@ fn handle_term_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Mouse handling. In the tree, the wheel moves the selection. In a session,
-/// events are forwarded to the app when it has enabled mouse reporting;
-/// otherwise the wheel scrolls the local emulator's scrollback.
+/// Switch focus to the clicked pane.
+fn focus_pane(app: &mut App, pane: ClickPane) {
+    match pane {
+        ClickPane::Tree => {
+            app.focus = Focus::Nav;
+            app.footer = NAV_HINT.into();
+        }
+        ClickPane::TermAi => {
+            app.focus = Focus::Term;
+            app.editor_focused = false;
+            app.footer = TERM_HINT.into();
+        }
+        ClickPane::TermEditor => {
+            app.focus = Focus::Term;
+            app.editor_focused = true;
+            app.footer = EDITOR_HINT.into();
+        }
+        ClickPane::Term => {
+            app.focus = Focus::Term;
+            app.footer = if app.editor.is_some() {
+                EDITOR_HINT.into()
+            } else {
+                TERM_HINT.into()
+            };
+        }
+    }
+}
+
+/// Mouse handling. A left click focuses the clicked pane (see [`focus_pane`]). In
+/// the tree, the wheel moves the selection. In a session, events are forwarded to
+/// the app when it has enabled mouse reporting; otherwise the wheel scrolls the
+/// local emulator's scrollback.
 fn handle_mouse(app: &mut App, ev: MouseEvent) {
+    // Click-to-focus: a left press in a pane other than the active one switches
+    // focus to it and is consumed (not forwarded), so the first click just moves
+    // focus. Clicks within the already-focused pane fall through to normal
+    // handling (forward to the app / scroll / etc.).
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        let target = app.pane_at(ev.column);
+        if target != app.active_pane() {
+            focus_pane(app, target);
+            return;
+        }
+    }
     match app.focus {
         Focus::Nav => match ev.kind {
             MouseEventKind::ScrollDown => {
@@ -547,21 +862,28 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
             _ => {}
         },
         Focus::Term => {
-            let Some((mode, enc)) = app.parser.as_ref().map(|p| {
+            // Route to the focused pane (the editor when the split is open).
+            let Some((mode, enc, ox, w, h)) = app.focused_terminal().map(|(p, ox, _oy, c, r)| {
                 let s = p.screen();
-                (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
+                (s.mouse_protocol_mode(), s.mouse_protocol_encoding(), ox, c, r)
             }) else {
                 return;
             };
             if mode != vt100::MouseProtocolMode::None {
-                let (w, h) = app.term_dims;
-                if let Some(bytes) = encode_mouse(&ev, mode, enc, LEFT_WIDTH + 1, 1, w, h) {
+                if let Some(bytes) = encode_mouse(&ev, mode, enc, ox, 1, w, h) {
                     send_input(app, &bytes);
                 }
             } else {
-                // No app-level mouse support: scroll the local scrollback view.
+                // No app-level mouse support: scroll the focused pane's scrollback.
                 const STEP: usize = 3;
-                if let Some(p) = app.parser.as_mut() {
+                let parser = if app.split_active() && !app.editor_focused {
+                    app.parser.as_mut()
+                } else if app.editor.is_some() {
+                    app.editor_parser.as_mut()
+                } else {
+                    app.parser.as_mut()
+                };
+                if let Some(p) = parser {
                     let cur = p.screen().scrollback();
                     match ev.kind {
                         MouseEventKind::ScrollUp => p.screen_mut().set_scrollback(cur + STEP),
@@ -680,7 +1002,7 @@ fn encode_mouse(
 }
 
 fn send_input(app: &App, data: &[u8]) {
-    if let Some(id) = app.attached {
+    if let Some(id) = app.focused_session_id() {
         app.send(Request::Input {
             id,
             data: data.to_vec(),
@@ -731,7 +1053,18 @@ fn submit_prompt(app: &mut App, prompt: Prompt) {
                 worktree,
                 name,
                 command: String::new(),
+                agent: None,
             });
+        }
+        PromptKind::NewAgent { worktree, tool } => {
+            let name = if input.is_empty() { cute_name() } else { input };
+            app.send(Request::CreateSession {
+                worktree,
+                name,
+                command: agent_command(tool).to_string(),
+                agent: Some(tool),
+            });
+            app.footer = format!("starting {}…", agent_label(tool));
         }
         PromptKind::RenameSession { id } => {
             if !input.is_empty() {
@@ -741,31 +1074,88 @@ fn submit_prompt(app: &mut App, prompt: Prompt) {
     }
 }
 
-/// Recompute the terminal pane's inner dimensions from the real terminal size,
-/// updating the local parser and telling the daemon to resize the PTY.
+/// Split the terminal pane's outer width into `(ai_block, editor_block)` widths
+/// (each a bordered sub-block). Kept in one place so `draw` and `sync_term_size`
+/// divide the pane identically. Both panes stay wide enough for a border + text.
+fn split_widths(right_w: u16) -> (u16, u16) {
+    let editor = ((right_w as u32 * EDITOR_SPLIT_PCT as u32) / 100) as u16;
+    let editor = editor.clamp(3, right_w.saturating_sub(3).max(3));
+    (right_w.saturating_sub(editor), editor)
+}
+
+/// Inner (content) dims for a bordered block of outer size `(w, h)`.
+fn inner_dims(w: u16, h: u16) -> (u16, u16) {
+    (w.saturating_sub(2).max(1), h.saturating_sub(2).max(1))
+}
+
+/// Inner dims the session `id` renders at, given the current (possibly split)
+/// layout. Used when (re)building a parser on attach.
+fn editor_view_dims(app: &App, id: SessionId) -> (u16, u16) {
+    if !app.split_active() {
+        return app.term_dims;
+    }
+    let right_w = app.term_dims.0.saturating_add(2);
+    let main_h = app.term_dims.1.saturating_add(2);
+    let (ai_w, ed_w) = split_widths(right_w);
+    if app.editor == Some(id) {
+        inner_dims(ed_w, main_h)
+    } else {
+        inner_dims(ai_w, main_h)
+    }
+}
+
+enum ViewKind {
+    Primary,
+    Editor,
+}
+
+/// Resize one view's PTY + local parser to `target` if it differs from what the
+/// parser currently holds. No-op when that view isn't present.
+fn resize_view(app: &mut App, kind: ViewKind, target: (u16, u16)) {
+    let (id, parser) = match kind {
+        ViewKind::Primary => (app.attached, &mut app.parser),
+        ViewKind::Editor => (app.editor, &mut app.editor_parser),
+    };
+    let Some(id) = id else {
+        return;
+    };
+    let (cols, rows) = target;
+    let needs = match parser.as_ref() {
+        Some(p) => {
+            let (r, c) = p.screen().size();
+            (c, r) != (cols, rows)
+        }
+        None => false,
+    };
+    if !needs {
+        return;
+    }
+    if let Some(p) = parser.as_mut() {
+        p.screen_mut().set_size(rows, cols);
+    }
+    app.send(Request::Resize { id, cols, rows });
+}
+
+/// Recompute the terminal pane's inner dimensions from the real terminal size and
+/// resize every visible session's PTY (both panes when the editor split is open).
 fn sync_term_size(app: &mut App) {
     let Ok((cols, rows)) = crossterm::terminal::size() else {
         return;
     };
-    // Mirror the draw layout: 1-line footer, left column, bordered right pane.
+    // Mirror the draw layout: 1-line footer, left column, bordered right pane(s).
     let main_h = rows.saturating_sub(1);
     let right_w = cols.saturating_sub(LEFT_WIDTH);
-    let inner_cols = right_w.saturating_sub(2).max(1);
-    let inner_rows = main_h.saturating_sub(2).max(1);
-    let dims = (inner_cols, inner_rows);
-    if dims != app.term_dims {
-        app.term_dims = dims;
-        if let Some(p) = app.parser.as_mut() {
-            p.screen_mut().set_size(inner_rows, inner_cols);
-        }
-        if let Some(id) = app.attached {
-            app.send(Request::Resize {
-                id,
-                cols: inner_cols,
-                rows: inner_rows,
-            });
-        }
-    }
+    let full = inner_dims(right_w, main_h);
+    app.term_dims = full;
+
+    let (ai_target, ed_target) = if app.split_active() {
+        let (ai_w, ed_w) = split_widths(right_w);
+        (inner_dims(ai_w, main_h), inner_dims(ed_w, main_h))
+    } else {
+        (full, full)
+    };
+    resize_view(app, ViewKind::Primary, ai_target);
+    resize_view(app, ViewKind::Editor, ed_target);
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -877,23 +1267,40 @@ fn worktree_item(
 
 fn session_item(s: &SessionInfo) -> ListItem<'static> {
     let (glyph, color) = status_glyph(s.status);
-    let name = if s.agent_id.is_some() {
-        format!("✻ {}", s.name)
-    } else {
-        s.name.clone()
-    };
-    ListItem::new(Line::from(vec![
+    let mut spans = vec![
         Span::raw("  "),
         Span::styled(glyph, Style::default().fg(color)),
         Span::raw(" "),
-        Span::raw(truncate(&name, 26)),
-    ]))
+    ];
+    // Live agent sessions carry their tool glyph (✻ Claude / ◆ OpenCode) so the
+    // tree shows which agent is running; a plain shell shows none.
+    if let Some(tool) = s.agent {
+        let (tglyph, tcolor) = agent_glyph(tool);
+        spans.push(Span::styled(tglyph, Style::default().fg(tcolor)));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::raw(truncate(&s.name, 24)));
+    ListItem::new(Line::from(spans))
 }
 
 fn agent_glyph(tool: AgentTool) -> (&'static str, Color) {
     match tool {
         AgentTool::Claude => ("✻", Color::Magenta),
         AgentTool::Opencode => ("◆", Color::Blue),
+        AgentTool::Codex => ("◈", Color::Green),
+    }
+}
+
+/// Title for the primary (left/only) terminal pane, derived from the attached
+/// session: `Claude - <name>` for an agent, the bare name for a plain shell,
+/// and ` terminal ` when nothing is attached.
+fn primary_pane_title(app: &App) -> String {
+    match app.attached_session() {
+        Some(s) => match s.agent {
+            Some(tool) => format!(" {} - {} ", agent_label(tool), truncate(&s.name, 30)),
+            None => format!(" {} ", truncate(&s.name, 30)),
+        },
+        None => " terminal ".to_string(),
     }
 }
 
@@ -912,18 +1319,54 @@ fn agent_item(a: &AgentInfo) -> ListItem<'static> {
 }
 
 fn draw_terminal(f: &mut Frame, app: &App, area: Rect) {
+    let term_focused = app.focus == Focus::Term;
+    if app.split_active() {
+        // Highlight + place the cursor in whichever side has focus.
+        let (ai_w, _) = split_widths(area.width);
+        let cols =
+            Layout::horizontal([Constraint::Length(ai_w), Constraint::Min(0)]).split(area);
+        let ai_focused = term_focused && !app.editor_focused;
+        let ed_focused = term_focused && app.editor_focused;
+        let ai_title = primary_pane_title(app);
+        draw_pty(f, cols[0], &ai_title, app.parser.as_ref(), ai_focused, ai_focused);
+        draw_pty(
+            f,
+            cols[1],
+            " editor ",
+            app.editor_parser.as_ref(),
+            ed_focused,
+            ed_focused,
+        );
+    } else if app.editor.is_some() {
+        // Editor open with no AI session to split with: it fills the pane.
+        draw_pty(f, area, " editor ", app.editor_parser.as_ref(), term_focused, term_focused);
+    } else {
+        let title = primary_pane_title(app);
+        draw_pty(f, area, &title, app.parser.as_ref(), term_focused, term_focused);
+    }
+}
+
+/// Draw one bordered terminal sub-pane, optionally placing the hardware cursor.
+fn draw_pty(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    parser: Option<&vt100::Parser>,
+    focused: bool,
+    place_cursor: bool,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" terminal ")
-        .border_style(border_style(app.focus == Focus::Term));
+        .title(title.to_string())
+        .border_style(border_style(focused));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    match app.parser.as_ref() {
+    match parser {
         Some(parser) => {
             let screen = parser.screen();
             f.render_widget(PseudoTerminal::new(screen), inner);
-            if app.focus == Focus::Term {
+            if place_cursor {
                 let (cy, cx) = screen.cursor_position();
                 f.set_cursor_position(Position::new(inner.x + cx, inner.y + cy));
             }
@@ -1084,7 +1527,7 @@ mod tests {
             name: name.into(),
             command: String::new(),
             status,
-            agent_id: None,
+            agent: None,
         }
     }
     fn agent(id: &str) -> AgentInfo {
@@ -1125,6 +1568,9 @@ mod tests {
             focus: Focus::Nav,
             attached: None,
             parser: None,
+            editor: None,
+            editor_parser: None,
+            editor_focused: false,
             term_dims: (80, 24),
             prompt: None,
             footer: String::new(),
@@ -1133,6 +1579,42 @@ mod tests {
         };
         app.rebuild_rows();
         (app, rx)
+    }
+
+    fn agent_sess(id: u64, name: &str, tool: AgentTool) -> SessionInfo {
+        SessionInfo {
+            id,
+            name: name.into(),
+            command: String::new(),
+            status: Status::Idle,
+            agent: Some(tool),
+        }
+    }
+
+    #[test]
+    fn primary_pane_title_reflects_attached_session() {
+        let mut app = app_with(vec![wt(
+            "/r/wt",
+            vec![
+                agent_sess(1, "Research XYZ", AgentTool::Claude),
+                agent_sess(2, "Refactor", AgentTool::Opencode),
+                sess(3, "playful-wolf"),
+            ],
+            vec![],
+        )]);
+
+        // Nothing attached → the generic terminal label.
+        assert_eq!(primary_pane_title(&app), " terminal ");
+
+        // Agent session → "<Provider> - <name>".
+        app.attached = Some(1);
+        assert_eq!(primary_pane_title(&app), " Claude - Research XYZ ");
+        app.attached = Some(2);
+        assert_eq!(primary_pane_title(&app), " OpenCode - Refactor ");
+
+        // Plain shell → the bare session name (no provider prefix).
+        app.attached = Some(3);
+        assert_eq!(primary_pane_title(&app), " playful-wolf ");
     }
 
     #[test]
@@ -1415,5 +1897,269 @@ mod tests {
         app.tree = vec![wt("/r/main", vec![sess(1, "a"), sess(2, "b")], vec![])];
         app.rebuild_rows();
         assert_eq!(app.rows.len(), 1); // still folded despite new child
+    }
+
+    fn agent_prompt(worktree: &str, tool: AgentTool, input: &str) -> Prompt {
+        Prompt {
+            kind: PromptKind::NewAgent {
+                worktree: worktree.into(),
+                tool,
+            },
+            label: String::new(),
+            input: input.into(),
+        }
+    }
+
+    #[test]
+    fn pressing_c_opens_name_prompt_without_creating() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.selected = 0; // worktree header
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()));
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| &p.kind),
+            Some(PromptKind::NewAgent { tool: AgentTool::Claude, .. })
+        ));
+        assert!(rx.try_recv().is_err()); // nothing created until the name is submitted
+    }
+
+    #[test]
+    fn blank_agent_name_gets_a_cute_default() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![], vec![])]);
+        submit_prompt(&mut app, agent_prompt("/r/a", AgentTool::Claude, ""));
+        match rx.try_recv() {
+            Ok(Request::CreateSession { name, command, agent, .. }) => {
+                assert!(!name.is_empty()); // auto-named, not blank
+                assert!(name.contains('-')); // adjective-pokemon
+                assert_eq!(command, "claude");
+                assert_eq!(agent, Some(AgentTool::Claude));
+            }
+            other => panic!("expected CreateSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_agent_name_is_used_verbatim() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![], vec![])]);
+        submit_prompt(&mut app, agent_prompt("/r/a", AgentTool::Opencode, "  my run  "));
+        match rx.try_recv() {
+            Ok(Request::CreateSession { name, command, agent, .. }) => {
+                assert_eq!(name, "my run"); // trimmed, not replaced
+                assert_eq!(command, "opencode");
+                assert_eq!(agent, Some(AgentTool::Opencode));
+            }
+            other => panic!("expected CreateSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cute_name_is_hyphenated_pair() {
+        let n = cute_name();
+        let (adj, mon) = n.split_once('-').expect("adjective-pokemon");
+        assert!(!adj.is_empty() && !mon.is_empty());
+        assert!(n.chars().all(|c| c.is_ascii_lowercase() || c == '-'));
+    }
+
+    // ---- split-view editor ----
+
+    #[test]
+    fn ctrl_rbracket_is_recognized_across_encodings() {
+        // Real terminals send Ctrl+] as byte 0x1D, which crossterm's legacy input
+        // reports as Ctrl+'5'; a kitty-protocol terminal would send Ctrl+']'.
+        assert!(is_editor_toggle(&ctrl('5')));
+        assert!(is_editor_toggle(&ctrl(']')));
+        // Without Ctrl, neither is the toggle.
+        assert!(!is_editor_toggle(&KeyEvent::new(KeyCode::Char('5'), KeyModifiers::empty())));
+        assert!(!is_editor_toggle(&KeyEvent::new(KeyCode::Char(']'), KeyModifiers::empty())));
+    }
+
+    #[test]
+    fn ctrl_5_from_a_real_terminal_toggles_the_editor() {
+        // This is what pressing Ctrl+] actually delivers on a normal terminal.
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.selected = 0;
+        handle_key(&mut app, ctrl('5'));
+        match rx.try_recv() {
+            Ok(Request::OpenEditor { worktree, .. }) => assert_eq!(worktree, "/r/a"),
+            other => panic!("expected OpenEditor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pick_editor_precedence_and_blank_handling() {
+        assert_eq!(pick_editor(Some("nvim"), Some("hx")), "nvim"); // ASM_EDITOR wins
+        assert_eq!(pick_editor(None, Some("hx")), "hx"); // falls back to EDITOR
+        assert_eq!(pick_editor(Some("  "), Some("hx")), "hx"); // blank ASM_EDITOR skipped
+        assert_eq!(pick_editor(Some(""), None), "vi"); // final fallback
+        assert_eq!(pick_editor(None, None), "vi");
+    }
+
+    #[test]
+    fn worktree_of_attached_finds_the_owning_worktree() {
+        let mut app = app_with(vec![
+            wt("/r/a", vec![sess(1, "x")], vec![]),
+            wt("/r/b", vec![sess(2, "y")], vec![]),
+        ]);
+        assert!(app.worktree_of_attached().is_none()); // nothing attached yet
+        app.attached = Some(2);
+        assert_eq!(
+            app.worktree_of_attached().map(|w| w.path.as_str()),
+            Some("/r/b")
+        );
+    }
+
+    #[test]
+    fn toggle_open_from_terminal_uses_attached_worktree() {
+        // Cursor parked on /r/a, but viewing a session that lives in /r/b.
+        let (mut app, mut rx) = app_with_rx(vec![
+            wt("/r/a", vec![sess(1, "x")], vec![]),
+            wt("/r/b", vec![sess(2, "y")], vec![]),
+        ]);
+        app.selected = 0;
+        app.attached = Some(2);
+        app.focus = Focus::Term;
+        handle_key(&mut app, ctrl(']'));
+        match rx.try_recv() {
+            Ok(Request::OpenEditor { worktree, .. }) => assert_eq!(worktree, "/r/b"),
+            other => panic!("expected OpenEditor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_open_from_nav_uses_selected_worktree() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.selected = 0; // /r/a header, nothing attached, focus Nav
+        handle_key(&mut app, ctrl(']'));
+        match rx.try_recv() {
+            Ok(Request::OpenEditor { worktree, .. }) => assert_eq!(worktree, "/r/a"),
+            other => panic!("expected OpenEditor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn editor_opened_attaches_the_editor_stream() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        handle_daemon_event(&mut app, Event::EditorOpened { id: 99 });
+        assert_eq!(app.editor, Some(99));
+        assert_eq!(app.focus, Focus::Term);
+        match rx.try_recv() {
+            Ok(Request::AttachEditor { id, .. }) => assert_eq!(id, 99),
+            other => panic!("expected AttachEditor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_close_detaches_editor_and_keeps_ai_session() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.attached = Some(1);
+        app.editor = Some(99);
+        app.editor_parser = Some(vt100::Parser::new(24, 80, 0));
+        app.focus = Focus::Term;
+        handle_key(&mut app, ctrl(']')); // hide
+        assert!(app.editor.is_none());
+        assert!(app.editor_parser.is_none());
+        assert_eq!(app.focus, Focus::Term); // AI still attached → stay in the terminal
+        match rx.try_recv() {
+            Ok(Request::DetachEditor) => {}
+            other => panic!("expected DetachEditor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_chord_is_never_forwarded_to_the_pty() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
+        app.attached = Some(7);
+        app.focus = Focus::Term;
+        handle_key(&mut app, ctrl(']'));
+        // It toggled the editor, but must never have sent Input to the PTY.
+        let mut saw_input = false;
+        while let Ok(req) = rx.try_recv() {
+            if matches!(req, Request::Input { .. }) {
+                saw_input = true;
+            }
+        }
+        assert!(!saw_input);
+    }
+
+    #[test]
+    fn toggle_chord_is_swallowed_during_a_prompt() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.prompt = Some(Prompt {
+            kind: PromptKind::NewWorktree,
+            label: String::new(),
+            input: "feat".into(),
+        });
+        handle_key(&mut app, ctrl(']'));
+        assert!(app.editor.is_none()); // did not toggle
+        assert_eq!(app.prompt.as_ref().unwrap().input, "feat"); // no stray ']'
+        assert!(rx.try_recv().is_err()); // nothing sent
+    }
+
+    #[test]
+    fn editor_stream_populates_editor_parser_not_primary() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.attached = Some(1);
+        app.editor = Some(99);
+        app.parser = Some(vt100::Parser::new(24, 80, 0)); // AI (primary) parser
+        // Editor's Attached must build the editor parser, routed by id.
+        handle_daemon_event(
+            &mut app,
+            Event::Attached { id: 99, scrollback: b"editor-hi".to_vec() },
+        );
+        handle_daemon_event(&mut app, Event::Output { id: 99, data: b" more".to_vec() });
+        let ed = app.editor_parser.as_ref().expect("editor parser built");
+        assert!(ed.screen().contents().contains("editor-hi more"));
+        // The primary parser must not have received the editor's bytes.
+        let primary = app.parser.as_ref().unwrap();
+        assert!(!primary.screen().contents().contains("editor-hi"));
+    }
+
+    // ---- click-to-focus ----
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    #[test]
+    fn clicking_the_tree_focuses_the_explorer() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.attached = Some(1);
+        app.focus = Focus::Term;
+        handle_mouse(&mut app, click(2, 3)); // col 2 < LEFT_WIDTH → tree
+        assert_eq!(app.focus, Focus::Nav);
+    }
+
+    #[test]
+    fn clicking_the_terminal_focuses_it() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.attached = Some(1);
+        app.focus = Focus::Nav;
+        handle_mouse(&mut app, click(LEFT_WIDTH + 5, 3)); // in the terminal pane
+        assert_eq!(app.focus, Focus::Term);
+    }
+
+    #[test]
+    fn clicking_a_split_side_focuses_that_session() {
+        // term_dims (80,24) → right_w 82 → ai/editor blocks are 41 cols each;
+        // ai spans [34,75), editor [75,…). LEFT_WIDTH is 34.
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.attached = Some(1);
+        app.editor = Some(99);
+        app.editor_focused = true;
+        app.focus = Focus::Term;
+        handle_mouse(&mut app, click(40, 3)); // AI side
+        assert!(!app.editor_focused);
+        assert_eq!(app.focused_session_id(), Some(1)); // keystrokes now go to AI
+        handle_mouse(&mut app, click(90, 3)); // editor side
+        assert!(app.editor_focused);
+        assert_eq!(app.focused_session_id(), Some(99));
+    }
+
+    #[test]
+    fn clicking_within_the_focused_pane_does_not_change_focus() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.attached = Some(1);
+        app.focus = Focus::Term; // single terminal, already focused
+        handle_mouse(&mut app, click(LEFT_WIDTH + 5, 3));
+        assert_eq!(app.focus, Focus::Term); // no-op focus-wise, click falls through
     }
 }

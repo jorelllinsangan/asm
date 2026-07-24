@@ -58,8 +58,12 @@ struct Session {
     name: Mutex<String>,
     command: String,
     worktree: PathBuf,
-    /// Set when this session is a resumed Claude Code session (its transcript id).
+    /// Set when this session is a resumed agent session (its transcript id).
     agent_id: Option<String>,
+    /// Which agent CLI this session runs, if any (`None` for a plain shell).
+    agent: Option<AgentTool>,
+    /// True for the hidden per-worktree scratch editor; excluded from the tree.
+    is_editor: bool,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
@@ -72,6 +76,9 @@ struct TitleCacheEntry {
     mtime: SystemTime,
     cwd: String,
     title: String,
+    /// Distinct non-`HEAD` git branches this transcript ran on (in order first
+    /// seen). Used to scope a recycled worktree path to the branch it's on now.
+    branches: Vec<String>,
 }
 
 struct Daemon {
@@ -83,11 +90,43 @@ struct Daemon {
     agents: Mutex<HashMap<PathBuf, Vec<AgentInfo>>>,
     /// Per-transcript-file parse cache to avoid re-reading unchanged files.
     title_cache: Mutex<HashMap<PathBuf, TitleCacheEntry>>,
+    /// The hidden scratch-editor session per (canonical) worktree path.
+    editors: Mutex<HashMap<PathBuf, SessionId>>,
 }
 
 impl Daemon {
-    fn create_session(&self, worktree: String, name: String, command: String) -> Result<SessionId> {
-        self.spawn_session(PathBuf::from(worktree), name, command, None)
+    fn create_session(
+        &self,
+        worktree: String,
+        name: String,
+        command: String,
+        agent: Option<AgentTool>,
+    ) -> Result<SessionId> {
+        self.spawn_session(PathBuf::from(worktree), name, command, None, agent, false)
+    }
+
+    /// Open (or reuse) the hidden scratch-editor session for `worktree`. Editor
+    /// sessions are cached one-per-worktree and hidden from the tree. Reuses a
+    /// cached live editor; a cached one that has exited (user did `:q`) is a
+    /// ghost — there is no session reaper — so it's killed and respawned.
+    fn open_editor(&self, worktree: String, command: String) -> Result<SessionId> {
+        let cwd = std::fs::canonicalize(&worktree).unwrap_or_else(|_| PathBuf::from(&worktree));
+        // Hold `editors` for the whole method so two clients toggling the same
+        // worktree can't both spawn. Lock order: editors → sessions → shared.
+        let mut editors = self.editors.lock().unwrap();
+        if let Some(&old) = editors.get(&cwd) {
+            let existing = self.sessions.lock().unwrap().get(&old).cloned();
+            match existing {
+                Some(s) if !s.shared.lock().unwrap().exited => return Ok(old),
+                _ => {
+                    editors.remove(&cwd);
+                    self.kill_session(old);
+                }
+            }
+        }
+        let id = self.spawn_session(cwd.clone(), "editor".into(), command, None, None, true)?;
+        editors.insert(cwd, id);
+        Ok(id)
     }
 
     /// Resume an existing agent session as a live PTY. Names it after the
@@ -113,8 +152,9 @@ impl Daemon {
         let command = match tool {
             AgentTool::Claude => format!("claude --resume {session_id}"),
             AgentTool::Opencode => format!("opencode --session {session_id}"),
+            AgentTool::Codex => format!("codex resume {session_id}"),
         };
-        self.spawn_session(cwd, name, command, Some(session_id))
+        self.spawn_session(cwd, name, command, Some(session_id), Some(tool), false)
     }
 
     fn spawn_session(
@@ -123,22 +163,25 @@ impl Daemon {
         name: String,
         command: String,
         agent_id: Option<String>,
+        agent: Option<AgentTool>,
+        is_editor: bool,
     ) -> Result<SessionId> {
         let pair = native_pty_system()
             .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
             .context("openpty failed")?;
 
-        let mut cmd = if command.trim().is_empty() {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-            let mut c = CommandBuilder::new(shell);
-            c.arg("-l");
-            c
-        } else {
-            let mut c = CommandBuilder::new("/bin/sh");
-            c.arg("-lc");
-            c.arg(&command);
-            c
-        };
+        // Run everything through the user's own login+interactive shell so the
+        // session sees the exact environment a normal terminal would — most
+        // importantly the version managers (nvm / fnm / asdf) and PATH set up in
+        // ~/.zshrc, which decide the default node and where global CLIs live. A
+        // bare `sh -c` skips ~/.zshrc entirely, so agent CLIs would otherwise run
+        // with the wrong node and think already-installed tools are missing.
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let argv = shell_argv(&shell, &command);
+        let mut cmd = CommandBuilder::new(&argv[0]);
+        for arg in &argv[1..] {
+            cmd.arg(arg);
+        }
         // Inherit the launching environment so PATH etc. find agent CLIs.
         for (k, v) in std::env::vars() {
             cmd.env(k, v);
@@ -178,6 +221,8 @@ impl Daemon {
             command,
             worktree: cwd,
             agent_id,
+            agent,
+            is_editor,
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
@@ -255,6 +300,12 @@ impl Daemon {
         for id in ids {
             self.kill_session(id);
         }
+        // The editor session (if any) was just killed by the path match above;
+        // drop its cache entry so a later open spawns fresh.
+        self.editors
+            .lock()
+            .unwrap()
+            .retain(|k, _| !paths_eq(k, &path));
         git::remove_worktree(&self.root, &path, force)?;
         Ok(())
     }
@@ -263,14 +314,14 @@ impl Daemon {
         let worktrees = git::list_worktrees_in(&self.root).unwrap_or_default();
         let map = self.sessions.lock().unwrap();
         let agents_cache = self.agents.lock().unwrap();
-        // Claude sessions currently live (resumed) — hide them from the on-disk list.
+        // Resumed sessions carry their on-disk id — hide that exact copy.
         let live_agent_ids: HashSet<String> =
             map.values().filter_map(|s| s.agent_id.clone()).collect();
         let mut wt_infos = Vec::new();
         for wt in &worktrees {
             let mut sessions: Vec<SessionInfo> = map
                 .values()
-                .filter(|s| paths_eq(&s.worktree, &wt.path))
+                .filter(|s| !s.is_editor && paths_eq(&s.worktree, &wt.path))
                 .map(|s| {
                     let status = compute_status(&s.shared.lock().unwrap());
                     SessionInfo {
@@ -278,18 +329,31 @@ impl Daemon {
                         name: s.name.lock().unwrap().clone(),
                         command: s.command.clone(),
                         status,
-                        agent_id: s.agent_id.clone(),
+                        agent: s.agent,
                     }
                 })
                 .collect();
             sessions.sort_by_key(|s| s.id);
-            let agents: Vec<AgentInfo> = agents_cache
-                .get(&wt.path)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|a| !live_agent_ids.contains(&a.session_id))
-                .collect();
+            // Freshly-launched agent sessions (no `agent_id`) write a brand-new
+            // transcript whose id we don't know yet, so it can't be hidden by id.
+            // Count them per tool; `visible_agents` then drops that many of the
+            // most-recent on-disk transcripts of each tool — the live session's
+            // own, actively-written copy is always the most recent.
+            let mut fresh_by_tool: HashMap<AgentTool, usize> = HashMap::new();
+            for s in map.values() {
+                if !s.is_editor
+                    && s.agent_id.is_none()
+                    && paths_eq(&s.worktree, &wt.path)
+                    && let Some(tool) = s.agent
+                {
+                    *fresh_by_tool.entry(tool).or_default() += 1;
+                }
+            }
+            let agents = visible_agents(
+                agents_cache.get(&wt.path).cloned().unwrap_or_default(),
+                &live_agent_ids,
+                fresh_by_tool,
+            );
             wt_infos.push(WorktreeInfo {
                 path: wt.path.display().to_string(),
                 branch: wt.branch.clone(),
@@ -329,6 +393,7 @@ impl Daemon {
             .unwrap_or(0);
         let claude_base = claude_projects_dir();
         let oc_by_dir = opencode_sessions();
+        let codex_by_dir = self.codex_sessions();
         let mut result: HashMap<PathBuf, Vec<AgentInfo>> = HashMap::new();
 
         for wt in &worktrees {
@@ -352,9 +417,14 @@ impl Daemon {
                 files.sort_by(|a, b| b.1.cmp(&a.1)); // most-recent first
                 files.truncate(AGENT_LIMIT);
                 for (path, mtime) in files {
-                    let (cwd, title) = self.title_for(&path, mtime);
+                    let (cwd, title, branches) = self.title_for(&path, mtime);
                     // Guard against encoding collisions.
                     if !paths_eq(Path::new(&cwd), &wt.path) {
+                        continue;
+                    }
+                    // Scope recycled paths to the current branch (a previous
+                    // tenant of this reused path lives on a different branch).
+                    if !transcript_matches_branch(&wt.branch, &branches) {
                         continue;
                     }
                     let session_id = path
@@ -374,7 +444,18 @@ impl Daemon {
 
             // --- OpenCode: rows keyed by the session's directory ---
             if let Some(rows) = oc_by_dir.get(&wt.path.to_string_lossy().to_string()) {
+                // OpenCode records no branch, so a recycled path can't be scoped
+                // the way Claude's can. Instead drop sessions created before this
+                // worktree's directory existed — they belonged to a prior tenant
+                // of the reused path. Skip the cutoff if birthtime is unknown.
+                let birth = dir_birthtime(&wt.path);
                 for r in rows {
+                    if let Some(birth) = birth {
+                        let created_secs = (r.time_created / 1000).max(0) as u64;
+                        if created_secs < birth {
+                            continue;
+                        }
+                    }
                     let updated_secs = (r.time_updated / 1000).max(0) as u64;
                     let age_secs = now_secs.saturating_sub(updated_secs);
                     agents.push(AgentInfo {
@@ -387,7 +468,31 @@ impl Daemon {
                 }
             }
 
-            // Merge both sources: most-recent first, capped.
+            // --- Codex: one rollout .jsonl per session, keyed by its recorded cwd ---
+            if let Some(rows) = codex_by_dir.get(&wt.path.to_string_lossy().to_string()) {
+                // Like OpenCode, Codex rollouts record no branch, so a recycled
+                // path can't be branch-scoped. Drop sessions last active before
+                // this worktree's directory was created (a prior tenant of the
+                // reused path). Skip the cutoff if birthtime is unknown.
+                let birth = dir_birthtime(&wt.path);
+                for r in rows {
+                    if let Some(birth) = birth
+                        && r.mtime_secs < birth
+                    {
+                        continue;
+                    }
+                    let age_secs = now_secs.saturating_sub(r.mtime_secs);
+                    agents.push(AgentInfo {
+                        session_id: r.session_id.clone(),
+                        title: r.title.clone(),
+                        last_active: humanize_secs(age_secs),
+                        age_secs,
+                        tool: AgentTool::Codex,
+                    });
+                }
+            }
+
+            // Merge all sources: most-recent first, capped.
             agents.sort_by_key(|a| a.age_secs);
             agents.truncate(AGENT_LIMIT);
             result.insert(wt.path.clone(), agents);
@@ -395,23 +500,94 @@ impl Daemon {
         *self.agents.lock().unwrap() = result;
     }
 
-    fn title_for(&self, path: &Path, mtime: SystemTime) -> (String, String) {
+    fn title_for(&self, path: &Path, mtime: SystemTime) -> (String, String, Vec<String>) {
         if let Some(e) = self.title_cache.lock().unwrap().get(path)
             && e.mtime == mtime
         {
-            return (e.cwd.clone(), e.title.clone());
+            return (e.cwd.clone(), e.title.clone(), e.branches.clone());
         }
-        let (cwd, title) = parse_transcript(path);
+        let (cwd, title, branches) = parse_transcript(path);
         self.title_cache.lock().unwrap().insert(
             path.to_path_buf(),
             TitleCacheEntry {
                 mtime,
                 cwd: cwd.clone(),
                 title: title.clone(),
+                branches: branches.clone(),
+            },
+        );
+        (cwd, title, branches)
+    }
+
+    /// Scan Codex rollout transcripts and group them by their recorded `cwd`.
+    /// Codex stores one `.jsonl` per session under a flat date tree (not per
+    /// project like Claude), so we parse each file's `session_meta` to learn the
+    /// cwd. Parsing is cached by mtime in the shared `title_cache` (paths are
+    /// disjoint from Claude's, so the two share the cache safely).
+    fn codex_sessions(&self) -> HashMap<String, Vec<CodexRow>> {
+        let mut out: HashMap<String, Vec<CodexRow>> = HashMap::new();
+        let Some(base) = codex_sessions_dir() else {
+            return out;
+        };
+        let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+        collect_rollouts(&base, &mut files);
+        for (path, mtime) in files {
+            let (cwd, title) = self.title_for_codex(&path, mtime);
+            if cwd.is_empty() {
+                continue;
+            }
+            let session_id = codex_session_id_from_path(&path);
+            if session_id.is_empty() {
+                continue;
+            }
+            let mtime_secs = mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            out.entry(cwd).or_default().push(CodexRow {
+                session_id,
+                title,
+                mtime_secs,
+            });
+        }
+        out
+    }
+
+    /// Cached parse of a Codex rollout, returning `(cwd, title)`. Mirrors
+    /// [`Self::title_for`] but for Codex's transcript format (no branch field).
+    fn title_for_codex(&self, path: &Path, mtime: SystemTime) -> (String, String) {
+        if let Some(e) = self.title_cache.lock().unwrap().get(path)
+            && e.mtime == mtime
+        {
+            return (e.cwd.clone(), e.title.clone());
+        }
+        let (cwd, title) = parse_codex_rollout(path);
+        self.title_cache.lock().unwrap().insert(
+            path.to_path_buf(),
+            TitleCacheEntry {
+                mtime,
+                cwd: cwd.clone(),
+                title: title.clone(),
+                branches: Vec::new(),
             },
         );
         (cwd, title)
     }
+}
+
+/// Build the argv for running `command` through the user's `shell`. An empty
+/// `command` (whitespace counts) is a plain login shell; the PTY makes it
+/// interactive, so ~/.zshrc is sourced. A command is run with `-l -i -c` so the
+/// *same* interactive rc files load before it — matching what the user would get
+/// typing the command in a normal terminal (nvm/fnm/asdf, PATH, etc.).
+fn shell_argv(shell: &str, command: &str) -> Vec<String> {
+    let mut argv = vec![shell.to_string(), "-l".to_string()];
+    if !command.trim().is_empty() {
+        argv.push("-i".to_string());
+        argv.push("-c".to_string());
+        argv.push(command.to_string());
+    }
+    argv
 }
 
 fn claude_projects_dir() -> Option<PathBuf> {
@@ -433,6 +609,7 @@ fn opencode_db_path() -> Option<PathBuf> {
 struct OcRow {
     id: String,
     title: String,
+    time_created: i64,
     time_updated: i64,
     directory: String,
 }
@@ -448,7 +625,7 @@ fn opencode_sessions() -> HashMap<String, Vec<OcRow>> {
     if !db.exists() {
         return out;
     }
-    let query = "SELECT id, title, time_updated, directory FROM session \
+    let query = "SELECT id, title, time_created, time_updated, directory FROM session \
                  WHERE time_archived IS NULL AND parent_id IS NULL \
                  ORDER BY time_updated DESC;";
     let output = std::process::Command::new("sqlite3")
@@ -478,6 +655,156 @@ fn opencode_sessions() -> HashMap<String, Vec<OcRow>> {
     out
 }
 
+/// Filter a worktree's on-disk agent list down to what the tree should show.
+/// `agents` must be most-recent-first (as [`Daemon::refresh_agents`] produces).
+///
+/// Two things get hidden so a live session never appears twice:
+/// - resumed sessions, matched by their exact on-disk id (`live_agent_ids`);
+/// - for each tool, the `fresh_by_tool[tool]` most-recent transcripts — those
+///   belong to freshly-launched live sessions of that tool, which write a new
+///   transcript whose id isn't known yet (so they can't be matched by id).
+fn visible_agents(
+    agents: Vec<AgentInfo>,
+    live_agent_ids: &HashSet<String>,
+    mut fresh_by_tool: HashMap<AgentTool, usize>,
+) -> Vec<AgentInfo> {
+    agents
+        .into_iter()
+        .filter(|a| !live_agent_ids.contains(&a.session_id))
+        .filter(|a| match fresh_by_tool.get_mut(&a.tool) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// One Codex rollout, reduced to what the tree needs. `mtime_secs` is the file's
+/// last-modified time (≈ last activity), used both for the age display and for
+/// the recycled-path birthtime cutoff.
+struct CodexRow {
+    session_id: String,
+    title: String,
+    mtime_secs: u64,
+}
+
+/// Root of Codex's rollout transcripts: `~/.codex/sessions` (override with
+/// `$ASM_CODEX_SESSIONS`, mirroring `$ASM_OPENCODE_DB`).
+fn codex_sessions_dir() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("ASM_CODEX_SESSIONS") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::home_dir().map(|h| h.join(".codex").join("sessions"))
+}
+
+/// Recursively collect Codex `rollout-*.jsonl` files under `dir` (a `YYYY/MM/DD`
+/// tree) with their mtimes. Non-rollout files and unreadable dirs are skipped.
+fn collect_rollouts(dir: &Path, out: &mut Vec<(PathBuf, SystemTime)>) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            collect_rollouts(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+            && path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.starts_with("rollout-"))
+            && let Ok(mtime) = entry.metadata().and_then(|m| m.modified())
+        {
+            out.push((path, mtime));
+        }
+    }
+}
+
+/// The session id (a UUID) is the last five hyphen-separated segments of the
+/// rollout filename: `rollout-<YYYY-MM-DDThh-mm-ss>-<8-4-4-4-12>.jsonl`. The
+/// leading timestamp also contains hyphens, so we take the tail, not a split.
+fn codex_session_id_from_path(path: &Path) -> String {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return String::new();
+    };
+    let parts: Vec<&str> = stem.split('-').collect();
+    if parts.len() < 5 {
+        return String::new();
+    }
+    parts[parts.len() - 5..].join("-")
+}
+
+/// Extract `(cwd, title)` from a Codex rollout. `cwd` comes from the leading
+/// `session_meta` line; `title` is the first real user prompt (the
+/// `event_msg`/`user_message` payload, which is the clean text without the
+/// injected AGENTS.md preamble that the `response_item` copy carries).
+fn parse_codex_rollout(path: &Path) -> (String, String) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return (String::new(), fallback_id(path));
+    };
+    parse_codex_content(&content, path)
+}
+
+/// The pure core of [`parse_codex_rollout`]: parses already-read JSONL `content`.
+fn parse_codex_content(content: &str, path: &Path) -> (String, String) {
+    let mut cwd = String::new();
+    let mut title: Option<String> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let payload = v.get("payload");
+        match v.get("type").and_then(|x| x.as_str()) {
+            Some("session_meta") => {
+                if let Some(c) = payload
+                    .and_then(|p| p.get("cwd"))
+                    .and_then(|x| x.as_str())
+                {
+                    cwd = c.to_string();
+                }
+            }
+            Some("event_msg") => {
+                if title.is_none()
+                    && payload.and_then(|p| p.get("type")).and_then(|x| x.as_str())
+                        == Some("user_message")
+                    && let Some(t) = payload
+                        .and_then(|p| p.get("message"))
+                        .and_then(|x| x.as_str())
+                {
+                    title = Some(t.to_string());
+                }
+            }
+            _ => {}
+        }
+        // Once both are known, stop early — rollout files can be large.
+        if !cwd.is_empty() && title.is_some() {
+            break;
+        }
+    }
+    let title = title.unwrap_or_else(|| fallback_id(path));
+    (cwd, clean_title(&title))
+}
+
+/// Creation time of a directory, in seconds since the epoch. On macOS this is
+/// `st_birthtime`; a `git worktree add` makes a fresh directory, so a path
+/// recycled by a drop+recreate gets a new birthtime. `None` if the filesystem
+/// doesn't record it (some Linux setups) — callers then skip the cutoff.
+fn dir_birthtime(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .and_then(|m| m.created())
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+}
+
 /// Claude Code encodes a project's cwd by replacing every non-alphanumeric
 /// character with `-` (no collapsing): `/Users/x/.config` -> `-Users-x--config`.
 fn encode_project(path: &Path) -> String {
@@ -487,16 +814,33 @@ fn encode_project(path: &Path) -> String {
         .collect()
 }
 
-/// Extract (cwd, title) from a transcript. Title preference: the latest
-/// `ai-title`, else the first user message, else the first `last-prompt`.
-fn parse_transcript(path: &Path) -> (String, String) {
+/// Whether a Claude transcript that ran on `branches` should be shown for a
+/// worktree currently on `wt_branch`. Shows when either side is unknown (a
+/// detached-HEAD worktree, or a transcript that records no branch); otherwise
+/// requires a match, so a recycled path only shows the current branch's work.
+fn transcript_matches_branch(wt_branch: &str, branches: &[String]) -> bool {
+    wt_branch.is_empty() || branches.is_empty() || branches.iter().any(|b| b == wt_branch)
+}
+
+/// Extract (cwd, title, branches) from a transcript. Title preference: the
+/// latest `ai-title`, else the first user message, else the first
+/// `last-prompt`. `branches` is the distinct set of non-`HEAD` `gitBranch`
+/// values seen, used to disambiguate a recycled worktree path.
+fn parse_transcript(path: &Path) -> (String, String, Vec<String>) {
     let Ok(content) = fs::read_to_string(path) else {
-        return (String::new(), fallback_id(path));
+        return (String::new(), fallback_id(path), Vec::new());
     };
+    parse_transcript_content(&content, path)
+}
+
+/// The pure core of [`parse_transcript`]: parses already-read JSONL `content`.
+/// `path` is used only for the title fallback when nothing else is found.
+fn parse_transcript_content(content: &str, path: &Path) -> (String, String, Vec<String>) {
     let mut cwd = String::new();
     let mut ai_title: Option<String> = None;
     let mut first_user: Option<String> = None;
     let mut first_prompt: Option<String> = None;
+    let mut branches: Vec<String> = Vec::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -510,6 +854,15 @@ fn parse_transcript(path: &Path) -> (String, String) {
             && let Some(c) = v.get("cwd").and_then(|x| x.as_str())
         {
             cwd = c.to_string();
+        }
+        // `gitBranch` appears on most entries; `HEAD` means detached (rebase,
+        // etc.) and carries no branch identity, so skip it.
+        if let Some(b) = v.get("gitBranch").and_then(|x| x.as_str())
+            && !b.is_empty()
+            && b != "HEAD"
+            && !branches.iter().any(|x| x == b)
+        {
+            branches.push(b.to_string());
         }
         match v.get("type").and_then(|x| x.as_str()) {
             Some("ai-title") => {
@@ -536,7 +889,7 @@ fn parse_transcript(path: &Path) -> (String, String) {
         .or(first_user)
         .or(first_prompt)
         .unwrap_or_else(|| fallback_id(path));
-    (cwd, clean_title(&title))
+    (cwd, clean_title(&title), branches)
 }
 
 fn extract_user_text(v: &serde_json::Value) -> Option<String> {
@@ -689,6 +1042,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
         tree_tx,
         agents: Mutex::new(HashMap::new()),
         title_cache: Mutex::new(HashMap::new()),
+        editors: Mutex::new(HashMap::new()),
     });
 
     // Periodic status refresh: recompute + push the tree to all clients.
@@ -760,6 +1114,8 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
     }
 
     let mut attach_task: Option<JoinHandle<()>> = None;
+    // Secondary stream for the split-view editor, independent of the primary.
+    let mut editor_task: Option<JoinHandle<()>> = None;
 
     loop {
         let req: Request = match read_frame(&mut rd).await {
@@ -789,8 +1145,8 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
                     }
                 }
             }
-            Request::CreateSession { worktree, name, command } => {
-                match daemon.create_session(worktree, name, command) {
+            Request::CreateSession { worktree, name, command, agent } => {
+                match daemon.create_session(worktree, name, command, agent) {
                     Ok(id) => {
                         let _ = out_tx.send(Event::SessionCreated { id });
                         daemon.broadcast_tree();
@@ -841,12 +1197,47 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
                     t.abort();
                 }
             }
+            Request::OpenEditor { worktree, command } => match daemon.open_editor(worktree, command)
+            {
+                // No broadcast_tree: the editor is hidden, so the tree is unchanged.
+                Ok(id) => {
+                    let _ = out_tx.send(Event::EditorOpened { id });
+                }
+                Err(e) => {
+                    let _ = out_tx.send(Event::Error { message: format!("{e:#}") });
+                }
+            },
+            Request::AttachEditor { id, cols, rows } => {
+                if let Some(t) = editor_task.take() {
+                    t.abort();
+                }
+                daemon.resize(id, cols, rows);
+                if let Some((scrollback, rx)) = daemon.attach(id) {
+                    let _ = out_tx.send(Event::Attached { id, scrollback });
+                    let out_tx = out_tx.clone();
+                    editor_task = Some(tokio::spawn(async move {
+                        forward_output(id, rx, out_tx).await;
+                    }));
+                } else {
+                    let _ = out_tx.send(Event::Error {
+                        message: format!("editor session {id} not found"),
+                    });
+                }
+            }
+            Request::DetachEditor => {
+                if let Some(t) = editor_task.take() {
+                    t.abort();
+                }
+            }
             Request::Input { id, data } => daemon.write_input(id, &data),
             Request::Resize { id, cols, rows } => daemon.resize(id, cols, rows),
         }
     }
 
     if let Some(t) = attach_task.take() {
+        t.abort();
+    }
+    if let Some(t) = editor_task.take() {
         t.abort();
     }
     writer_task.abort();
@@ -923,5 +1314,166 @@ mod tests {
         let mut sh = shared_fed(b"streaming\x07");
         sh.last_output = Instant::now(); // just produced output
         assert_eq!(compute_status(&sh), Status::Running);
+    }
+
+    #[test]
+    fn command_runs_in_login_interactive_shell() {
+        // -i is what sources ~/.zshrc (nvm/fnm/asdf, PATH); dropping it is the
+        // bug this guards against.
+        assert_eq!(
+            shell_argv("/bin/zsh", "claude"),
+            vec!["/bin/zsh", "-l", "-i", "-c", "claude"],
+        );
+    }
+
+    #[test]
+    fn plain_shell_is_login_only() {
+        assert_eq!(shell_argv("/bin/zsh", ""), vec!["/bin/zsh", "-l"]);
+        // Whitespace-only is still "no command" → a plain shell, not `-c "  "`.
+        assert_eq!(shell_argv("/bin/zsh", "   "), vec!["/bin/zsh", "-l"]);
+    }
+
+    #[test]
+    fn transcript_collects_distinct_non_head_branches() {
+        // A transcript that spanned two branches, with a detached-HEAD entry
+        // (e.g. mid-rebase) and a duplicate: HEAD is dropped, order preserved,
+        // no dups.
+        let jsonl = concat!(
+            r#"{"cwd":"/repo","type":"user","message":{"content":"hi"},"gitBranch":"feat-a"}"#,
+            "\n",
+            r#"{"type":"assistant","gitBranch":"feat-a"}"#,
+            "\n",
+            r#"{"type":"user","gitBranch":"HEAD"}"#,
+            "\n",
+            r#"{"type":"user","gitBranch":"feat-b"}"#,
+            "\n",
+        );
+        let (cwd, _title, branches) = parse_transcript_content(jsonl, Path::new("x.jsonl"));
+        assert_eq!(cwd, "/repo");
+        assert_eq!(branches, vec!["feat-a".to_string(), "feat-b".to_string()]);
+    }
+
+    #[test]
+    fn transcript_with_no_branch_field_yields_no_branches() {
+        let jsonl = concat!(
+            r#"{"cwd":"/repo","type":"user","message":{"content":"hi"}}"#,
+            "\n",
+        );
+        let (_cwd, _title, branches) = parse_transcript_content(jsonl, Path::new("x.jsonl"));
+        assert!(branches.is_empty());
+    }
+
+    #[test]
+    fn branch_scoping_hides_other_branches_but_keeps_current() {
+        let branches = vec!["pr-images-support".to_string()];
+        // Current branch matches → shown.
+        assert!(transcript_matches_branch("pr-images-support", &branches));
+        // A previous tenant of the recycled path → hidden.
+        assert!(!transcript_matches_branch("pave-session-started-webhook", &branches));
+    }
+
+    #[test]
+    fn branch_scoping_shows_when_either_side_unknown() {
+        // Detached-HEAD worktree (empty branch) → can't scope, show everything.
+        assert!(transcript_matches_branch("", &["feat-a".to_string()]));
+        // Transcript records no branch → can't scope, show it.
+        assert!(transcript_matches_branch("feat-a", &[]));
+    }
+
+    #[test]
+    fn codex_rollout_extracts_cwd_and_first_user_prompt() {
+        // cwd comes from session_meta; the title is the clean event_msg prompt,
+        // NOT the response_item copy (which carries an injected AGENTS.md
+        // preamble and appears earlier in the stream).
+        let jsonl = concat!(
+            r#"{"type":"session_meta","payload":{"session_id":"abc","cwd":"/repo/wt","cli_version":"0.1"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":null}"#,
+            "\n",
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md preamble junk"}]}}"##,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"add support for codex"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"a later prompt"}}"#,
+            "\n",
+        );
+        let (cwd, title) = parse_codex_content(jsonl, Path::new("rollout-x.jsonl"));
+        assert_eq!(cwd, "/repo/wt");
+        assert_eq!(title, "add support for codex");
+    }
+
+    #[test]
+    fn codex_rollout_falls_back_to_id_without_user_message() {
+        let jsonl =
+            r#"{"type":"session_meta","payload":{"session_id":"abc","cwd":"/repo"}}"#;
+        let (cwd, title) = parse_codex_content(jsonl, Path::new("rollout-deadbeef.jsonl"));
+        assert_eq!(cwd, "/repo");
+        // No user_message → title falls back to the filename stem prefix.
+        assert_eq!(title, "rollout-");
+    }
+
+    fn on_disk(id: &str, tool: AgentTool, age_secs: u64) -> AgentInfo {
+        AgentInfo {
+            session_id: id.to_string(),
+            title: id.to_string(),
+            last_active: String::new(),
+            age_secs,
+            tool,
+        }
+    }
+
+    #[test]
+    fn visible_agents_hides_fresh_live_transcript() {
+        // Most-recent-first: the fresh live Codex session's own transcript (c-new,
+        // active "just now") is first and must be hidden; the older resumable
+        // Codex session stays.
+        let agents = vec![
+            on_disk("c-new", AgentTool::Codex, 1),
+            on_disk("c-old", AgentTool::Codex, 9000),
+        ];
+        let mut fresh = HashMap::new();
+        fresh.insert(AgentTool::Codex, 1);
+        let out = visible_agents(agents, &HashSet::new(), fresh);
+        let ids: Vec<_> = out.iter().map(|a| a.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["c-old"]);
+    }
+
+    #[test]
+    fn visible_agents_hiding_is_per_tool() {
+        // A fresh live Codex session hides one Codex transcript but must not
+        // touch Claude's, even though Claude's is more recent overall.
+        let agents = vec![
+            on_disk("claude-recent", AgentTool::Claude, 1),
+            on_disk("codex-recent", AgentTool::Codex, 2),
+            on_disk("codex-old", AgentTool::Codex, 9000),
+        ];
+        let mut fresh = HashMap::new();
+        fresh.insert(AgentTool::Codex, 1);
+        let out = visible_agents(agents, &HashSet::new(), fresh);
+        let ids: Vec<_> = out.iter().map(|a| a.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["claude-recent", "codex-old"]);
+    }
+
+    #[test]
+    fn visible_agents_still_hides_resumed_by_id() {
+        // A resumed session is hidden by its exact id; the fresh-count logic is
+        // independent and here empty.
+        let agents = vec![on_disk("resumed-1", AgentTool::Codex, 5)];
+        let mut ids = HashSet::new();
+        ids.insert("resumed-1".to_string());
+        let out = visible_agents(agents, &ids, HashMap::new());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn codex_session_id_is_the_trailing_uuid() {
+        // The leading rollout timestamp also contains hyphens, so the id must be
+        // the LAST five 8-4-4-4-12 segments, not a naive split.
+        let path =
+            Path::new("rollout-2026-06-24T11-43-45-019efaf2-04a1-7c83-a05e-7c7e3aa3091f.jsonl");
+        assert_eq!(
+            codex_session_id_from_path(path),
+            "019efaf2-04a1-7c83-a05e-7c7e3aa3091f"
+        );
     }
 }

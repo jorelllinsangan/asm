@@ -20,10 +20,14 @@ pub enum Request {
     /// Remove a worktree (must not be the root).
     RemoveWorktree { path: String, force: bool },
     /// Spawn a session (PTY) inside a worktree. Empty `command` => login shell.
+    /// `agent` records which agent CLI this session runs (`None` for a shell),
+    /// so the tree can show the right tool glyph.
     CreateSession {
         worktree: String,
         name: String,
         command: String,
+        #[serde(default)]
+        agent: Option<AgentTool>,
     },
     KillSession { id: SessionId },
     RenameSession { id: SessionId, name: String },
@@ -34,9 +38,18 @@ pub enum Request {
         tool: AgentTool,
     },
     /// Begin streaming a session's output to this connection. Resets any prior
-    /// attachment on the same connection.
+    /// (primary) attachment on the same connection.
     Attach { id: SessionId, cols: u16, rows: u16 },
     Detach,
+    /// Open (or reuse) the hidden per-worktree editor session and stream it.
+    /// `command` is resolved client-side ($ASM_EDITOR → $EDITOR → vi) because the
+    /// daemon's env is frozen at daemon-spawn time. Daemon replies [`Event::EditorOpened`].
+    OpenEditor { worktree: String, command: String },
+    /// Begin streaming the editor session on this connection's *secondary* slot,
+    /// independent of the primary [`Request::Attach`], so both stream at once.
+    AttachEditor { id: SessionId, cols: u16, rows: u16 },
+    /// Drop the secondary (editor) stream; leaves the primary attachment intact.
+    DetachEditor,
     /// Forward bytes to the session's PTY.
     Input { id: SessionId, data: Vec<u8> },
     Resize { id: SessionId, cols: u16, rows: u16 },
@@ -59,6 +72,9 @@ pub enum Event {
     /// Sent to the requesting client after a successful create/resume so it can
     /// attach and focus the new session immediately.
     SessionCreated { id: SessionId },
+    /// Reply to [`Request::OpenEditor`]: the editor session's id, ready to be
+    /// streamed via [`Request::AttachEditor`].
+    EditorOpened { id: SessionId },
     Error { message: String },
 }
 
@@ -80,16 +96,19 @@ pub struct SessionInfo {
     pub name: String,
     pub command: String,
     pub status: Status,
-    /// Set when this live session is a resumed Claude Code session.
-    pub agent_id: Option<String>,
+    /// Which agent CLI this session runs, if any (`None` for a plain shell).
+    /// Drives the tool glyph shown in the tree.
+    #[serde(default)]
+    pub agent: Option<AgentTool>,
 }
 
 /// Which agent CLI a discovered session belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum AgentTool {
     #[default]
     Claude,
     Opencode,
+    Codex,
 }
 
 /// An existing agent session discovered on disk (Claude transcript / OpenCode DB).
