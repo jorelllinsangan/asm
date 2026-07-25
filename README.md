@@ -150,6 +150,7 @@ you're attached to.
 | key | action |
 |-----|--------|
 | `j`/`k`, `Ctrl+D`/`Ctrl+U`, `g`/`G` | move · half-page · top/bottom |
+| `f` or `Tab` | open the **file rail** (jump straight to a file) |
 | `]`/`[` | next / previous file |
 | `n`/`p` | next / previous hunk |
 | `v` | start / cancel a block selection (`j`/`k` extends it) |
@@ -165,6 +166,39 @@ it is marked in the gutter. Putting the cursor anywhere inside the block and
 pressing `c` edits that comment rather than starting a new one. A selection can
 span a changed hunk — the removed and added lines are both kept, and both are
 quoted in what gets submitted.
+
+#### The file rail
+
+`]`/`[` walk the files in order, which is fine for three of them and tedious for
+thirty. `f` (or `Tab`) opens a **file rail** down the left of the diff: the
+changed files as a directory tree, with each file's `+`/`-` counts and a `●n`
+badge for comments you've already left on it. `▶` marks the file you were
+looking at. `Enter` jumps there — its header lands at the top of the pane — and
+the rail closes.
+
+```
+┌ files · 12 ────────────────┐┌ diff — feat/rail ──────────────
+│ ▾ src/                   9 ││modified  src/client.rs  +81 -4
+│▶  client.rs  ●2  +81 -4    ││@@ -1649,6 +1649,7 @@
+│   diff.rs  +302 -8         ││ 1649 1649  fn draw(f: &mut Fra
+│ ▾ docs/                  1 ││      1650 +    let (rail, body)
+│   review.md  +4 -0         ││ 1650 1651      draw_diff(f, app
+│ README.md  +12 -1          ││
+```
+
+| key | action |
+|-----|--------|
+| `j`/`k`, arrows, `Ctrl+D`/`Ctrl+U`, `g`/`G` | move |
+| `Enter` / `l` | open the file (on a directory: unfold it) |
+| `Space` | fold / unfold the directory |
+| `h` | fold the directory |
+| `/` | filter by path — then type; `Backspace` edits, arrows still move |
+| `Esc` | clear the filter, or close the rail when there's none |
+| `f`, `Tab`, `q` | close the rail |
+
+Clicking a row works too: a file opens it, a directory folds it, and a click out
+on the diff hands the keyboard back. Folds and the filter survive `r`, and a
+file that leaves the diff can't strand the rail on a stale entry.
 
 **What's in the diff.** Everything the worktree has done since it branched off
 the root worktree's branch: commits, staged, unstaged, *and* untracked files.

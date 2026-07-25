@@ -207,6 +207,41 @@ Things that will bite if you change them:
   Hiding the diff retains it (`diff` stays `Some`, `diff_visible` goes false) so
   a stray `Ctrl+G` doesn't destroy a review in progress.
 
+#### The file rail (`f`) — a tree over the diff's files
+
+`f`/`Tab` opens `DiffView::nav: Option<FileNav>`, a directory tree of the changed
+files for jumping to one directly (`]`/`[` only step). Same split of
+responsibility as the diff itself: `FileNav` (in `diff.rs`) is pure and
+unit-tested, `client.rs` owns the keymap and `draw_file_nav`.
+
+- **`FileNav::rows` is the source of truth for its cursor *and* its rendering**,
+  the third instance of the invariant `App::rows` and `DiffView::rows` hold.
+- **It's a real column, not a floating overlay.** `diff_split()` (one helper, used
+  by `draw` *and* mouse hit-testing, for the same reason `split_widths` is one)
+  takes a rail off the left of the diff pane. This was tried as an overlay first:
+  every diff row starts at the pane's left edge, so a floating rail covers the
+  exact code you're navigating. The diff clips rather than wraps, so the narrower
+  pane costs only the right-hand end of long lines.
+- **`FileNav` is self-contained** — it captures `(file index, path)` pairs up
+  front, so a fold or filter keystroke rebuilds rows without borrowing the diff
+  back (the client holds `&mut FileNav` *through* the `DiffView`; needing
+  `&self.files` at the same time would not borrow-check).
+- **Two modes, and the split is load-bearing**: `j`/`k` navigate, but after `/`
+  every printable key extends the filter — so the filtering arms in
+  `handle_file_nav_key` must stay *above* the plain-letter bindings. Arrows work
+  in both modes so a pick never needs the filter turned off first.
+- **The filter ignores folds** (`is_collapsed` returns false while filtering): a
+  match hidden behind a collapsed directory is a filter that lied about there
+  being no match. Folds are kept, not dropped, so clearing the filter restores
+  them.
+- **A refresh re-points the rail** (`FileNav::retarget` from `DiffView::refresh`).
+  File indices shift when a file joins or leaves the diff; a rail left holding
+  the old ones opens the wrong file.
+- `jump_to_file` sets `scroll = cursor` so the file header lands at the *top* of
+  the pane, and clears any block selection — one carried across a jump would
+  silently span two files. Hiding the diff closes the rail (`hide_diff`), so a
+  retained review never comes back with an overlay the user didn't leave open.
+
 ### Headless subcommands (`cli.rs`) — the scriptable surface
 
 Besides the TUI (no arg) and `daemon`, `main.rs` dispatches a set of headless

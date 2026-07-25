@@ -9,6 +9,11 @@
 //! rendering — the same invariant the worktree tree holds for `App::rows`. A
 //! comment contributes one row per line of its body, beneath the last line it
 //! covers — a comment may span a block of lines, not just one.
+//!
+//! [`FileNav`] is the same idea one level up: a directory tree of the changed
+//! files, flattened into rows, for jumping straight to a file.
+
+use std::collections::HashSet;
 
 /// Which side of the diff a line (and so a comment on it) belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,6 +411,364 @@ pub enum DiffRow {
     Comment { ci: usize, li: usize },
 }
 
+/// One rendered/selectable row of the file explorer ([`FileNav`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRow {
+    Dir {
+        /// Full path of the directory — the fold key.
+        path: String,
+        /// What's shown. Joins several segments when a chain of single-child
+        /// directories has been compacted (`src/ui`, not `src` then `ui`).
+        label: String,
+        depth: usize,
+        /// Files underneath, at any depth, so a folded row still says how much
+        /// it's hiding.
+        files: usize,
+    },
+    File {
+        /// Index into [`DiffView::files`].
+        fi: usize,
+        /// The basename; the directory rows above carry the rest of the path.
+        label: String,
+        depth: usize,
+    },
+}
+
+/// A directory while the tree is being built, before it's flattened to rows.
+struct Node {
+    path: String,
+    label: String,
+    dirs: Vec<Node>,
+    /// `(index into DiffView::files, basename)`.
+    files: Vec<(usize, String)>,
+}
+
+impl Node {
+    fn root() -> Self {
+        Node {
+            path: String::new(),
+            label: String::new(),
+            dirs: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    /// The child directory named `seg`, created if this is the first file under it.
+    fn child(&mut self, seg: &str) -> &mut Node {
+        if let Some(i) = self.dirs.iter().position(|d| d.label == seg) {
+            return &mut self.dirs[i];
+        }
+        let path = if self.path.is_empty() {
+            seg.to_string()
+        } else {
+            format!("{}/{seg}", self.path)
+        };
+        self.dirs.push(Node {
+            path,
+            label: seg.to_string(),
+            dirs: Vec::new(),
+            files: Vec::new(),
+        });
+        self.dirs.last_mut().expect("just pushed")
+    }
+
+    fn insert(&mut self, fi: usize, path: &str) {
+        let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let Some((base, dirs)) = comps.split_last() else {
+            return;
+        };
+        let mut cur = self;
+        for seg in dirs {
+            cur = cur.child(seg);
+        }
+        cur.files.push((fi, (*base).to_string()));
+    }
+
+    /// Directories before files, each alphabetical — an explorer's ordering, not
+    /// the order git happened to emit the diff in.
+    fn sort(&mut self) {
+        self.dirs.sort_by(|a, b| a.label.cmp(&b.label));
+        self.files.sort_by(|a, b| a.1.cmp(&b.1));
+        for d in &mut self.dirs {
+            d.sort();
+        }
+    }
+
+    /// Fold a chain of single-child directories into one row. A rail that spends
+    /// three rows on `src` → `ui` → `widgets` to reach one file is worse at the
+    /// job than the flat path it replaced. Never called on the root, whose label
+    /// is empty.
+    fn compact(&mut self) {
+        while self.files.is_empty() && self.dirs.len() == 1 {
+            let child = self.dirs.pop().expect("len == 1");
+            self.path = child.path;
+            self.label = format!("{}/{}", self.label, child.label);
+            self.dirs = child.dirs;
+            self.files = child.files;
+        }
+        for d in &mut self.dirs {
+            d.compact();
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.files.len() + self.dirs.iter().map(Node::count).sum::<usize>()
+    }
+
+    fn flatten(&self, depth: usize, collapsed: &HashSet<String>, out: &mut Vec<FileRow>) {
+        for d in &self.dirs {
+            out.push(FileRow::Dir {
+                path: d.path.clone(),
+                label: d.label.clone(),
+                depth,
+                files: d.count(),
+            });
+            if !collapsed.contains(&d.path) {
+                d.flatten(depth + 1, collapsed, out);
+            }
+        }
+        for (fi, name) in &self.files {
+            out.push(FileRow::File {
+                fi: *fi,
+                label: name.clone(),
+                depth,
+            });
+        }
+    }
+}
+
+/// The file explorer shown beside the diff: the changed files as a directory
+/// tree, so reaching one is a jump rather than a walk through every hunk in
+/// between.
+///
+/// Deliberately self-contained — it captures the `(index, path)` pairs it needs
+/// up front, so a fold or a filter keystroke can rebuild `rows` without the diff
+/// being handed back in. The client reads `DiffView::files[fi]` for the parts it
+/// renders but doesn't navigate by (status, line counts, comment badge).
+pub struct FileNav {
+    /// `(index into DiffView::files, full path)` for every file in the diff.
+    entries: Vec<(usize, String)>,
+    /// Flattened tree; the single source of truth for the cursor *and* the
+    /// rendering, the same invariant [`DiffView::rows`] holds.
+    pub rows: Vec<FileRow>,
+    pub cursor: usize,
+    pub scroll: usize,
+    /// Case-insensitive substring match over whole paths. While it's set, folds
+    /// are ignored: a match hidden behind a collapsed directory is a filter that
+    /// silently lied about there being no match.
+    pub filter: String,
+    /// Whether typed characters extend the filter (entered with `/`).
+    pub filtering: bool,
+    /// Directory paths whose contents are hidden.
+    collapsed: HashSet<String>,
+}
+
+impl FileNav {
+    /// Build the tree, with the cursor on `current` — the explorer opens showing
+    /// where you already are, not the top of the diff.
+    pub fn new(files: &[FileDiff], current: Option<usize>) -> Self {
+        let mut nav = FileNav {
+            entries: Vec::new(),
+            rows: Vec::new(),
+            cursor: 0,
+            scroll: 0,
+            filter: String::new(),
+            filtering: false,
+            collapsed: HashSet::new(),
+        };
+        nav.retarget(files, current);
+        nav
+    }
+
+    /// Point the explorer at a freshly-parsed file list, keeping the filter and
+    /// folds — a refresh mid-review shouldn't undo where you'd navigated to.
+    pub fn retarget(&mut self, files: &[FileDiff], current: Option<usize>) {
+        self.entries = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.path.clone()))
+            .collect();
+        self.rebuild();
+        if let Some(fi) = current {
+            self.cursor_to_file(fi);
+        }
+    }
+
+    /// Group the (filtered) paths into a tree and flatten it, landing the cursor
+    /// back on whatever it was pointing at.
+    fn rebuild(&mut self) {
+        let target = self.rows.get(self.cursor).cloned();
+        let needle = self.filter.to_lowercase();
+        let mut root = Node::root();
+        for (fi, path) in &self.entries {
+            if needle.is_empty() || path.to_lowercase().contains(&needle) {
+                root.insert(*fi, path);
+            }
+        }
+        root.sort();
+        for d in &mut root.dirs {
+            d.compact();
+        }
+        root.sort(); // compaction rewrites labels, so order by the new ones
+
+        let unfolded: HashSet<String> = HashSet::new();
+        let collapsed = if needle.is_empty() {
+            &self.collapsed
+        } else {
+            &unfolded
+        };
+        let mut rows = Vec::new();
+        root.flatten(0, collapsed, &mut rows);
+        self.rows = rows;
+
+        let found = match target {
+            Some(FileRow::File { fi, .. }) => self.row_of_file(fi),
+            Some(FileRow::Dir { path, .. }) => self
+                .rows
+                .iter()
+                .position(|r| matches!(r, FileRow::Dir { path: p, .. } if *p == path)),
+            None => None,
+        };
+        self.cursor = found
+            .unwrap_or(self.cursor)
+            .min(self.rows.len().saturating_sub(1));
+    }
+
+    fn row_of_file(&self, fi: usize) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| matches!(r, FileRow::File { fi: f, .. } if *f == fi))
+    }
+
+    fn cursor_to_file(&mut self, fi: usize) {
+        if let Some(i) = self.row_of_file(fi) {
+            self.cursor = i;
+        }
+    }
+
+    /// The file at the cursor, or `None` on a directory row.
+    pub fn selected_file(&self) -> Option<usize> {
+        match self.rows.get(self.cursor)? {
+            FileRow::File { fi, .. } => Some(*fi),
+            FileRow::Dir { .. } => None,
+        }
+    }
+
+    /// Whether a directory row draws folded. Always false while filtering, since
+    /// the filter overrides folds.
+    pub fn is_collapsed(&self, path: &str) -> bool {
+        self.filter.is_empty() && self.collapsed.contains(path)
+    }
+
+    /// How many files match the current filter, for the header count.
+    pub fn matched(&self) -> usize {
+        let needle = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|(_, p)| needle.is_empty() || p.to_lowercase().contains(&needle))
+            .count()
+    }
+
+    pub fn total(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn set_collapsed_at_cursor(&mut self, want: bool) -> bool {
+        let Some(FileRow::Dir { path, .. }) = self.rows.get(self.cursor) else {
+            return false;
+        };
+        let path = path.clone();
+        let changed = if want {
+            self.collapsed.insert(path)
+        } else {
+            self.collapsed.remove(&path)
+        };
+        if changed {
+            self.rebuild();
+        }
+        changed
+    }
+
+    /// Fold/unfold the directory at the cursor. `false` when the cursor is on a
+    /// file, which is the caller's cue to open it instead.
+    pub fn toggle_at_cursor(&mut self) -> bool {
+        let Some(FileRow::Dir { path, .. }) = self.rows.get(self.cursor) else {
+            return false;
+        };
+        let want = !self.collapsed.contains(path);
+        self.set_collapsed_at_cursor(want)
+    }
+
+    pub fn collapse_at_cursor(&mut self) -> bool {
+        self.set_collapsed_at_cursor(true)
+    }
+
+    pub fn expand_at_cursor(&mut self) -> bool {
+        self.set_collapsed_at_cursor(false)
+    }
+
+    pub fn start_filter(&mut self) {
+        self.filtering = true;
+    }
+
+    pub fn push_filter(&mut self, c: char) {
+        self.filter.push(c);
+        self.rebuild();
+    }
+
+    pub fn pop_filter(&mut self) {
+        if self.filter.pop().is_some() {
+            self.rebuild();
+        }
+    }
+
+    /// Drop the filter and leave filter mode. `false` when there was nothing to
+    /// clear — the caller's cue that Esc means "close the explorer".
+    pub fn clear_filter(&mut self) -> bool {
+        let had = self.filtering || !self.filter.is_empty();
+        self.filtering = false;
+        if !self.filter.is_empty() {
+            self.filter.clear();
+            self.rebuild();
+        }
+        had
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        self.cursor = move_within(self.cursor, self.rows.len(), delta);
+    }
+
+    pub fn cursor_to(&mut self, row: usize) {
+        self.cursor = row.min(self.rows.len().saturating_sub(1));
+    }
+
+    pub fn ensure_visible(&mut self, height: usize) {
+        self.scroll = scroll_for(self.cursor, self.scroll, self.rows.len(), height);
+    }
+}
+
+/// Move a row cursor by `delta`, stopping at either end. Shared by the diff and
+/// the file explorer so the two cursors clamp identically.
+fn move_within(cursor: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (cursor as isize + delta).clamp(0, len as isize - 1) as usize
+}
+
+/// The smallest scroll offset that keeps `cursor` inside a `height`-row viewport.
+fn scroll_for(cursor: usize, scroll: usize, len: usize, height: usize) -> usize {
+    let height = height.max(1);
+    let scroll = if cursor < scroll {
+        cursor
+    } else if cursor >= scroll + height {
+        cursor + 1 - height
+    } else {
+        scroll
+    };
+    scroll.min(len.saturating_sub(height))
+}
+
 pub struct DiffView {
     /// The worktree this diff belongs to; a review may only be submitted to an
     /// agent session living in it.
@@ -423,6 +786,10 @@ pub struct DiffView {
     /// reads top-to-bottom instead of in the order the notes happened to be
     /// written. Rebuilt with `rows`.
     pub comment_order: Vec<usize>,
+    /// The file explorer, when it's open. It takes a column off the diff rather
+    /// than covering it — every diff row starts at the pane's left edge, so an
+    /// overlay would hide the exact code you're navigating.
+    pub nav: Option<FileNav>,
 }
 
 impl DiffView {
@@ -436,6 +803,7 @@ impl DiffView {
             scroll: 0,
             sel_start: None,
             comment_order: Vec::new(),
+            nav: None,
         };
         v.rebuild_rows();
         v
@@ -622,12 +990,7 @@ impl DiffView {
     // ---- navigation ----
 
     pub fn move_cursor(&mut self, delta: isize) {
-        if self.rows.is_empty() {
-            return;
-        }
-        let last = self.rows.len() - 1;
-        let next = (self.cursor as isize + delta).clamp(0, last as isize);
-        self.cursor = next as usize;
+        self.cursor = move_within(self.cursor, self.rows.len(), delta);
     }
 
     pub fn cursor_to(&mut self, row: usize) {
@@ -677,14 +1040,56 @@ impl DiffView {
 
     /// Scroll the viewport the minimum amount needed to show the cursor.
     pub fn ensure_visible(&mut self, height: usize) {
-        let height = height.max(1);
-        if self.cursor < self.scroll {
-            self.scroll = self.cursor;
-        } else if self.cursor >= self.scroll + height {
-            self.scroll = self.cursor + 1 - height;
+        self.scroll = scroll_for(self.cursor, self.scroll, self.rows.len(), height);
+    }
+
+    // ---- file explorer ----
+
+    pub fn nav_open(&self) -> bool {
+        self.nav.is_some()
+    }
+
+    pub fn open_nav(&mut self) {
+        let current = self.current_file();
+        self.nav = Some(FileNav::new(&self.files, current));
+    }
+
+    pub fn close_nav(&mut self) {
+        self.nav = None;
+    }
+
+    /// The file the diff cursor is currently inside — including when it's parked
+    /// on a comment, which knows its path rather than its file index.
+    pub fn current_file(&self) -> Option<usize> {
+        match self.rows.get(self.cursor)? {
+            DiffRow::FileHeader { fi }
+            | DiffRow::HunkHeader { fi, .. }
+            | DiffRow::Line { fi, .. } => Some(*fi),
+            DiffRow::Comment { ci, .. } => {
+                let path = &self.comments.get(*ci)?.anchor.path;
+                self.files.iter().position(|f| &f.path == path)
+            }
         }
-        let max_scroll = self.rows.len().saturating_sub(height);
-        self.scroll = self.scroll.min(max_scroll);
+    }
+
+    pub fn file_header_row(&self, fi: usize) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::FileHeader { fi: f } if *f == fi))
+    }
+
+    /// Jump the diff cursor to a file, pinning its header to the top of the
+    /// viewport: landing on a file with its first hunk halfway up the pane reads
+    /// as having jumped to the wrong place.
+    pub fn jump_to_file(&mut self, fi: usize) -> bool {
+        let Some(row) = self.file_header_row(fi) else {
+            return false;
+        };
+        self.cursor = row;
+        self.scroll = row;
+        // A block selection carried across a jump would silently span two files.
+        self.sel_start = None;
+        true
     }
 
     /// Re-parse after the diff changed underneath us, carrying comments over.
@@ -704,6 +1109,15 @@ impl DiffView {
         self.sel_start = None;
         self.rebuild_rows();
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+        // File indices move when a file joins or leaves the diff, so an open
+        // explorer has to be re-pointed at the new list, not just left alone.
+        if self.nav.is_some() {
+            let current = self.current_file();
+            let Self { files, nav, .. } = self;
+            if let Some(nav) = nav.as_mut() {
+                nav.retarget(files, current);
+            }
+        }
         before - self.comments.len()
     }
 }
@@ -1351,6 +1765,295 @@ diff --git a/src/a.rs b/src/a.rs
         v.toggle_selection();
         v.refresh(BASIC);
         assert!(!v.selecting());
+    }
+
+    // ---- file explorer ----
+
+    /// A diff touching each of `paths`, one trivial hunk apiece.
+    fn diff_of(paths: &[&str]) -> String {
+        paths
+            .iter()
+            .map(|p| {
+                format!(
+                    "diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1,1 +1,2 @@\n keep\n+added to {p}\n"
+                )
+            })
+            .collect()
+    }
+
+    fn nav_of(paths: &[&str]) -> DiffView {
+        let mut v = DiffView::new("/w".into(), &diff_of(paths));
+        v.open_nav();
+        v
+    }
+
+    /// The explorer's rows as indented labels, directories marked with a slash.
+    fn sketch(nav: &FileNav) -> Vec<String> {
+        nav.rows
+            .iter()
+            .map(|r| match r {
+                FileRow::Dir { label, depth, .. } => {
+                    format!("{:i$}{label}/", "", i = depth * 2)
+                }
+                FileRow::File { label, depth, .. } => format!("{:i$}{label}", "", i = depth * 2),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_explorer_groups_files_under_their_directories() {
+        // Directories first, each alphabetical — not the order git emitted them.
+        let v = nav_of(&["src/diff.rs", "README.md", "src/client.rs"]);
+        let nav = v.nav.as_ref().unwrap();
+        assert_eq!(
+            sketch(nav),
+            vec!["src/", "  client.rs", "  diff.rs", "README.md"]
+        );
+        let FileRow::Dir { files, path, .. } = &nav.rows[0] else {
+            panic!("expected a directory row");
+        };
+        assert_eq!((*files, path.as_str()), (2, "src"));
+    }
+
+    #[test]
+    fn a_chain_of_single_child_directories_becomes_one_row() {
+        // Three rows to reach one file is worse than the flat path it replaced.
+        let v = nav_of(&["src/ui/widgets/rail.rs", "README.md"]);
+        let nav = v.nav.as_ref().unwrap();
+        assert_eq!(sketch(nav), vec!["src/ui/widgets/", "  rail.rs", "README.md"]);
+        // The fold key is the full path, not the joined label.
+        let FileRow::Dir { path, .. } = &nav.rows[0] else {
+            panic!("expected a directory row");
+        };
+        assert_eq!(path, "src/ui/widgets");
+    }
+
+    #[test]
+    fn a_directory_holding_files_of_its_own_does_not_compact() {
+        let v = nav_of(&["src/main.rs", "src/ui/rail.rs"]);
+        let nav = v.nav.as_ref().unwrap();
+        assert_eq!(sketch(nav), vec!["src/", "  ui/", "    rail.rs", "  main.rs"]);
+    }
+
+    #[test]
+    fn folding_a_directory_hides_its_files_but_keeps_the_count() {
+        let mut v = nav_of(&["src/a.rs", "src/b.rs", "README.md"]);
+        let nav = v.nav.as_mut().unwrap();
+        nav.cursor = 0; // the `src/` row
+        assert!(nav.toggle_at_cursor());
+        assert_eq!(sketch(nav), vec!["src/", "README.md"]);
+        assert!(nav.is_collapsed("src"));
+        let FileRow::Dir { files, .. } = &nav.rows[0] else {
+            panic!("expected a directory row");
+        };
+        assert_eq!(*files, 2, "a folded row still says what it hides");
+        // And unfolding brings them back.
+        assert!(nav.toggle_at_cursor());
+        assert_eq!(sketch(nav).len(), 4);
+    }
+
+    #[test]
+    fn toggling_on_a_file_row_does_nothing_and_says_so() {
+        // `false` is the client's cue to open the file instead.
+        let mut v = nav_of(&["src/a.rs"]);
+        let nav = v.nav.as_mut().unwrap();
+        nav.cursor = 1; // the file
+        assert!(!nav.toggle_at_cursor());
+        assert_eq!(nav.selected_file(), Some(0));
+    }
+
+    #[test]
+    fn the_filter_matches_on_the_whole_path() {
+        let mut v = nav_of(&["src/client.rs", "src/diff.rs", "docs/diffing.md"]);
+        let nav = v.nav.as_mut().unwrap();
+        for c in "diff".chars() {
+            nav.push_filter(c);
+        }
+        assert_eq!(sketch(nav), vec!["docs/", "  diffing.md", "src/", "  diff.rs"]);
+        assert_eq!(nav.matched(), 2);
+        assert_eq!(nav.total(), 3);
+        // Case-insensitive, and a directory segment counts as part of the path.
+        nav.clear_filter();
+        for c in "DOCS".chars() {
+            nav.push_filter(c);
+        }
+        assert_eq!(sketch(nav), vec!["docs/", "  diffing.md"]);
+    }
+
+    #[test]
+    fn the_filter_overrides_a_fold_rather_than_hiding_matches_behind_it() {
+        let mut v = nav_of(&["src/client.rs", "README.md"]);
+        let nav = v.nav.as_mut().unwrap();
+        nav.cursor = 0;
+        nav.toggle_at_cursor(); // fold src/
+        assert_eq!(sketch(nav), vec!["src/", "README.md"]);
+        for c in "client".chars() {
+            nav.push_filter(c);
+        }
+        assert_eq!(sketch(nav), vec!["src/", "  client.rs"], "match must show");
+        assert!(!nav.is_collapsed("src"), "drawn unfolded while filtering");
+        // Clearing the filter restores the fold rather than losing it.
+        assert!(nav.clear_filter());
+        assert_eq!(sketch(nav), vec!["src/", "README.md"]);
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_leaves_no_rows_and_no_selection() {
+        let mut v = nav_of(&["src/a.rs"]);
+        let nav = v.nav.as_mut().unwrap();
+        for c in "zzz".chars() {
+            nav.push_filter(c);
+        }
+        assert!(nav.rows.is_empty());
+        assert_eq!(nav.selected_file(), None);
+        assert!(!nav.toggle_at_cursor());
+        nav.pop_filter();
+        nav.pop_filter();
+        nav.pop_filter();
+        assert_eq!(sketch(nav), vec!["src/", "  a.rs"]);
+    }
+
+    #[test]
+    fn clearing_reports_whether_there_was_anything_to_clear() {
+        // The client leans on this to decide whether Esc closes the explorer.
+        let mut v = nav_of(&["src/a.rs"]);
+        let nav = v.nav.as_mut().unwrap();
+        assert!(!nav.clear_filter(), "nothing to clear yet");
+        nav.start_filter();
+        assert!(nav.clear_filter(), "filter mode alone is worth peeling off");
+        nav.push_filter('a');
+        assert!(nav.clear_filter());
+        assert!(nav.filter.is_empty());
+    }
+
+    #[test]
+    fn the_explorer_opens_on_the_file_the_diff_cursor_is_in() {
+        let mut v = DiffView::new("/w".into(), &diff_of(&["src/a.rs", "src/b.rs"]));
+        let row = v.file_header_row(1).expect("second file");
+        v.cursor = row + 2; // somewhere inside src/b.rs
+        v.open_nav();
+        assert_eq!(v.nav.as_ref().unwrap().selected_file(), Some(1));
+    }
+
+    #[test]
+    fn the_explorer_finds_the_file_from_a_comment_row() {
+        // A comment row carries a path, not a file index — the lookup has to go
+        // through the comment, or `f` would open on the wrong file.
+        let mut v = DiffView::new("/w".into(), &diff_of(&["src/a.rs", "src/b.rs"]));
+        let row = v.file_header_row(1).expect("second file");
+        v.cursor = row + 2;
+        comment_here(&mut v, "note");
+        v.cursor += 1; // onto the comment's own row
+        assert!(matches!(v.rows[v.cursor], DiffRow::Comment { .. }));
+        assert_eq!(v.current_file(), Some(1));
+    }
+
+    #[test]
+    fn jumping_to_a_file_pins_its_header_to_the_top_of_the_viewport() {
+        let mut v = nav_of(&["src/a.rs", "src/b.rs"]);
+        let target = v.file_header_row(1).expect("second file");
+        v.cursor = 0;
+        v.scroll = 0;
+        assert!(v.jump_to_file(1));
+        assert_eq!(v.cursor, target);
+        assert_eq!(v.scroll, target, "the file starts at the top, not mid-pane");
+        v.ensure_visible(20);
+        assert_eq!(v.current_file(), Some(1));
+        assert!(!v.jump_to_file(9), "no such file");
+    }
+
+    #[test]
+    fn jumping_drops_a_block_selection_rather_than_spanning_two_files() {
+        let mut v = nav_of(&["src/a.rs", "src/b.rs"]);
+        v.cursor = 2;
+        v.toggle_selection();
+        assert!(v.selecting());
+        v.jump_to_file(1);
+        assert!(!v.selecting());
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_file_across_a_fold_elsewhere() {
+        let mut v = nav_of(&["docs/x.md", "src/a.rs", "src/b.rs"]);
+        let nav = v.nav.as_mut().unwrap();
+        assert_eq!(sketch(nav), vec!["docs/", "  x.md", "src/", "  a.rs", "  b.rs"]);
+        nav.cursor = 4; // src/b.rs
+        assert_eq!(nav.selected_file(), Some(2));
+        nav.cursor = 0; // fold docs/
+        nav.toggle_at_cursor();
+        nav.cursor = 3; // src/b.rs, one row higher now
+        assert_eq!(nav.selected_file(), Some(2));
+        // And a fold keeps the cursor on the directory it acted on, not adrift.
+        nav.cursor = 1;
+        nav.toggle_at_cursor();
+        assert_eq!(sketch(nav), vec!["docs/", "src/"]);
+        assert_eq!(nav.cursor, 1);
+    }
+
+    #[test]
+    fn a_refresh_repoints_the_explorer_at_the_new_file_indices() {
+        // A file leaving the diff shifts every index after it; an explorer left
+        // pointing at the old ones would open the wrong file.
+        let mut v = nav_of(&["docs/x.md", "src/a.rs"]);
+        let nav = v.nav.as_mut().unwrap();
+        nav.cursor = 3; // src/a.rs, index 1
+        assert_eq!(nav.selected_file(), Some(1));
+
+        v.refresh(&diff_of(&["src/a.rs"]));
+        let nav = v.nav.as_ref().expect("the explorer stays open");
+        assert_eq!(sketch(nav), vec!["src/", "  a.rs"]);
+        assert_eq!(nav.selected_file(), Some(0), "same file, new index");
+        assert_eq!(nav.total(), 1);
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_filter_and_the_folds() {
+        let mut v = nav_of(&["src/a.rs", "src/b.rs", "docs/x.md"]);
+        let nav = v.nav.as_mut().unwrap();
+        for c in "src".chars() {
+            nav.push_filter(c);
+        }
+        v.refresh(&diff_of(&["src/a.rs", "src/b.rs", "docs/x.md"]));
+        let nav = v.nav.as_ref().unwrap();
+        assert_eq!(nav.filter, "src");
+        assert_eq!(sketch(nav), vec!["src/", "  a.rs", "  b.rs"]);
+    }
+
+    #[test]
+    fn the_explorer_scrolls_only_as_far_as_needed() {
+        let v = nav_of(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+        let mut nav = v.nav.unwrap();
+        nav.cursor = 3;
+        nav.ensure_visible(2);
+        assert_eq!(nav.scroll, 2);
+        nav.cursor = 0;
+        nav.ensure_visible(2);
+        assert_eq!(nav.scroll, 0);
+        nav.scroll = 99;
+        nav.ensure_visible(2);
+        assert_eq!(nav.scroll, 0, "never past the end");
+    }
+
+    #[test]
+    fn the_explorer_cursor_clamps_at_both_ends() {
+        let v = nav_of(&["src/a.rs", "src/b.rs"]);
+        let mut nav = v.nav.unwrap();
+        nav.move_cursor(-5);
+        assert_eq!(nav.cursor, 0);
+        nav.move_cursor(1000);
+        assert_eq!(nav.cursor, nav.rows.len() - 1);
+        nav.cursor_to(usize::MAX);
+        assert_eq!(nav.cursor, nav.rows.len() - 1);
+    }
+
+    #[test]
+    fn an_empty_diff_has_an_empty_explorer() {
+        let mut v = DiffView::new("/w".into(), "");
+        v.open_nav();
+        let nav = v.nav.as_ref().unwrap();
+        assert!(nav.rows.is_empty());
+        assert_eq!(nav.total(), 0);
+        assert_eq!(v.current_file(), None);
     }
 
     // ---- review formatting ----

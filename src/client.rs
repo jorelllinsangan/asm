@@ -1,7 +1,9 @@
 //! The ratatui TUI client. Left pane is the worktree/session tree; right pane
 //! is a live embedded terminal for the focused session.
 
-use crate::diff::{CommentAnchor, DiffRow, DiffView, FileStatus, LineKind, format_review};
+use crate::diff::{
+    CommentAnchor, DiffRow, DiffView, FileNav, FileRow, FileStatus, LineKind, format_review,
+};
 use crate::ipc::{Frame as IpcFrame, read_frame, write_frame};
 use crate::paths;
 use crate::protocol::{
@@ -34,8 +36,10 @@ const NAV_HINT: &str =
     "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · x kill · Ctrl+] editor · Ctrl+G diff · q quit";
 const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor · Ctrl+G diff";
 const EDITOR_HINT: &str = "EDITOR · Ctrl+] hides it (keeps running) · Ctrl+H explorer";
-const DIFF_HINT: &str = "DIFF · j/k move · v select block · c comment · x delete · s submit · ]/[ file · n/p hunk · r refresh · Esc close";
+const DIFF_HINT: &str = "DIFF · j/k move · v block · c comment · x delete · s submit · f files · ]/[ file · n/p hunk · r refresh · Esc close";
 const COMMENT_HINT: &str = "COMMENT · Enter newline · Ctrl+S save · Esc cancel (blank = delete)";
+const FILES_HINT: &str =
+    "FILES · j/k move · Enter open · Space fold · / filter · f close · Esc back";
 /// Fraction of the terminal pane width given to the editor in the split view.
 const EDITOR_SPLIT_PCT: u16 = 50;
 /// Gutter width for the `old new` line-number columns in the diff view.
@@ -717,8 +721,18 @@ fn toggle_diff(app: &mut App) {
     app.footer = "loading diff…".into();
 }
 
-fn close_diff(app: &mut App) {
+/// Take the diff pane off screen, dropping the file explorer with it. Coming back
+/// to a retained review and finding an overlay you didn't leave open reads as a
+/// bug, so the two are hidden together.
+fn hide_diff(app: &mut App) {
     app.diff_visible = false;
+    if let Some(d) = app.diff.as_mut() {
+        d.close_nav();
+    }
+}
+
+fn close_diff(app: &mut App) {
+    hide_diff(app);
     app.comment_editor = None;
     if app.attached.is_some() {
         app.focus = Focus::Term;
@@ -730,6 +744,12 @@ fn close_diff(app: &mut App) {
 }
 
 fn handle_diff_key(app: &mut App, key: KeyEvent) {
+    // The file explorer is modal over the diff pane while it's open: plain letters
+    // drive it (and type into its filter), so nothing below may see them. The
+    // reserved Ctrl+G/Ctrl+] chords are intercepted before we ever get here.
+    if app.diff.as_ref().is_some_and(|d| d.nav_open()) {
+        return handle_file_nav_key(app, key);
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // Half-page jumps and the explorer chord are checked before the plain-letter
     // bindings so Ctrl+D isn't read as "delete comment".
@@ -779,6 +799,12 @@ fn handle_diff_key(app: &mut App, key: KeyEvent) {
                 d.cursor_to(usize::MAX);
             }
         }
+        // The explorer: for reaching a file directly instead of stepping past
+        // every one in between with `]`.
+        KeyCode::Char('f') | KeyCode::Tab => {
+            diff_nav(app, DiffView::open_nav);
+            app.footer = FILES_HINT.into();
+        }
         KeyCode::Char(']') => diff_nav(app, DiffView::next_file),
         KeyCode::Char('[') => diff_nav(app, DiffView::prev_file),
         KeyCode::Char('n') => diff_nav(app, DiffView::next_hunk),
@@ -812,6 +838,158 @@ fn move_diff_cursor(app: &mut App, delta: isize) {
 fn diff_nav(app: &mut App, f: impl Fn(&mut DiffView)) {
     if let Some(d) = app.diff.as_mut() {
         f(d);
+    }
+}
+
+/// What a keystroke in the file explorer does to the diff underneath it. The
+/// explorer borrows from the `DiffView`, so a key first mutates the explorer and
+/// only then — once that borrow is gone — acts on the diff.
+enum NavAct {
+    /// Stay open; the keystroke was the explorer's own business.
+    Stay,
+    /// Dismiss the explorer, back to the diff.
+    Close,
+    /// Dismiss it and hand focus to the tree.
+    Tree,
+    /// Move the diff to this file and dismiss.
+    Jump(usize),
+}
+
+/// Keys while the file explorer is open.
+///
+/// Two modes, and the split matters: normally `j`/`k` navigate, but after `/`
+/// every printable character extends the filter instead — with the arrows still
+/// moving, so a pick never needs the filter turned off first.
+fn handle_file_nav_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let page = (app.term_dims.1 / 2).max(1) as isize;
+    let Some(nav) = app.diff.as_mut().and_then(|d| d.nav.as_mut()) else {
+        return;
+    };
+
+    let act = if ctrl {
+        match key.code {
+            KeyCode::Char('d') => {
+                nav.move_cursor(page);
+                NavAct::Stay
+            }
+            KeyCode::Char('u') => {
+                nav.move_cursor(-page);
+                NavAct::Stay
+            }
+            KeyCode::Char('h') | KeyCode::Char('q') => NavAct::Tree,
+            _ => NavAct::Stay,
+        }
+    } else {
+        match key.code {
+            // Esc peels one layer at a time, as it does in the diff: the filter
+            // first, the explorer only once there's no filter left to lose.
+            KeyCode::Esc => {
+                if nav.clear_filter() {
+                    NavAct::Stay
+                } else {
+                    NavAct::Close
+                }
+            }
+            KeyCode::Enter => match nav.selected_file() {
+                Some(fi) => NavAct::Jump(fi),
+                None => {
+                    nav.toggle_at_cursor();
+                    NavAct::Stay
+                }
+            },
+            // Arrows work in both modes, so filtering never blocks a pick.
+            KeyCode::Down => {
+                nav.move_cursor(1);
+                NavAct::Stay
+            }
+            KeyCode::Up => {
+                nav.move_cursor(-1);
+                NavAct::Stay
+            }
+            // Filter mode swallows every printable key; these two arms must stay
+            // above the letter bindings below.
+            KeyCode::Backspace if nav.filtering => {
+                nav.pop_filter();
+                NavAct::Stay
+            }
+            KeyCode::Char(c) if nav.filtering => {
+                nav.push_filter(c);
+                NavAct::Stay
+            }
+            KeyCode::Char('/') => {
+                nav.start_filter();
+                NavAct::Stay
+            }
+            KeyCode::Char('j') => {
+                nav.move_cursor(1);
+                NavAct::Stay
+            }
+            KeyCode::Char('k') => {
+                nav.move_cursor(-1);
+                NavAct::Stay
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                nav.cursor_to(0);
+                NavAct::Stay
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                nav.cursor_to(usize::MAX);
+                NavAct::Stay
+            }
+            KeyCode::Char(' ') => {
+                nav.toggle_at_cursor();
+                NavAct::Stay
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                nav.collapse_at_cursor();
+                NavAct::Stay
+            }
+            KeyCode::Char('l') | KeyCode::Right => match nav.selected_file() {
+                Some(fi) => NavAct::Jump(fi),
+                None => {
+                    nav.expand_at_cursor();
+                    NavAct::Stay
+                }
+            },
+            KeyCode::Char('f') | KeyCode::Char('q') | KeyCode::Tab => NavAct::Close,
+            _ => NavAct::Stay,
+        }
+    };
+
+    match act {
+        NavAct::Stay => app.footer = files_footer(app),
+        NavAct::Close => close_file_nav(app),
+        NavAct::Tree => {
+            close_file_nav(app);
+            app.focus = Focus::Nav;
+            app.footer = NAV_HINT.into();
+        }
+        NavAct::Jump(fi) => {
+            if let Some(d) = app.diff.as_mut() {
+                d.jump_to_file(fi);
+            }
+            close_file_nav(app);
+        }
+    }
+}
+
+fn close_file_nav(app: &mut App) {
+    diff_nav(app, DiffView::close_nav);
+    app.footer = DIFF_HINT.into();
+}
+
+/// Footer while the explorer is open: echo the filter as it's typed, since the
+/// rail itself is narrow and the row it shows in can scroll out of view.
+fn files_footer(app: &App) -> String {
+    match app.diff.as_ref().and_then(|d| d.nav.as_ref()) {
+        Some(nav) if nav.filtering || !nav.filter.is_empty() => format!(
+            "FILES · filter: {} · {}/{} match · Enter open · Esc clear",
+            nav.filter,
+            nav.matched(),
+            nav.total()
+        ),
+        _ => FILES_HINT.into(),
     }
 }
 
@@ -900,7 +1078,7 @@ fn toggle_editor(app: &mut App) {
     // The editor split and the diff both own the right pane; showing one hides
     // the other. The diff is retained, so Ctrl+G returns to the review intact.
     if app.diff_showing() {
-        app.diff_visible = false;
+        hide_diff(app);
     }
     if app.editor.is_some() {
         // Hide: drop the editor stream; the AI session was never detached.
@@ -1304,6 +1482,10 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
             }
             _ => {}
         },
+        // The explorer floats over the diff, so it gets the mouse first.
+        Focus::Diff if app.diff.as_ref().is_some_and(|d| d.nav_open()) => {
+            handle_file_nav_mouse(app, ev)
+        }
         Focus::Diff => match ev.kind {
             MouseEventKind::ScrollDown => move_diff_cursor(app, 3),
             MouseEventKind::ScrollUp => move_diff_cursor(app, -3),
@@ -1353,6 +1535,50 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
                 }
             }
         }
+    }
+}
+
+/// Mouse in the file rail: the wheel moves its cursor, a click on a row opens that
+/// file (or folds a directory), and a click outside the rail dismisses it — the
+/// rail holds the keyboard, so clicking away is how you hand it back to the diff.
+fn handle_file_nav_mouse(app: &mut App, ev: MouseEvent) {
+    let (rect, _) = diff_split(right_pane_rect(app));
+    let inside = ev.column >= rect.x
+        && ev.column < rect.x + rect.width
+        && ev.row >= rect.y
+        && ev.row < rect.y + rect.height;
+    if !inside {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            close_file_nav(app);
+        }
+        return;
+    }
+    let Some(nav) = app.diff.as_mut().and_then(|d| d.nav.as_mut()) else {
+        return;
+    };
+    match ev.kind {
+        MouseEventKind::ScrollDown => nav.move_cursor(3),
+        MouseEventKind::ScrollUp => nav.move_cursor(-3),
+        MouseEventKind::Down(MouseButton::Left) => {
+            // The rail's first and last rows are its border, not content.
+            if ev.row == rect.y || ev.row + 1 >= rect.y + rect.height {
+                return;
+            }
+            nav.cursor_to(nav.scroll + (ev.row - rect.y - 1) as usize);
+            let hit = nav.selected_file();
+            match hit {
+                Some(fi) => {
+                    if let Some(d) = app.diff.as_mut() {
+                        d.jump_to_file(fi);
+                    }
+                    close_file_nav(app);
+                }
+                None => {
+                    nav.toggle_at_cursor();
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1623,9 +1849,43 @@ fn sync_term_size(app: &mut App) {
 /// from [`sync_term_size`] so it can be exercised without a real terminal.
 fn sync_diff_viewport(app: &mut App) {
     let view_h = app.term_dims.1 as usize;
+    // The explorer scrolls within its own rail, two rows shorter for its border.
+    let nav_h = diff_split(right_pane_rect(app)).0.height.saturating_sub(2) as usize;
     if let Some(d) = app.diff.as_mut() {
         d.ensure_visible(view_h);
+        if let Some(nav) = d.nav.as_mut() {
+            nav.ensure_visible(nav_h);
+        }
     }
+}
+
+/// The right-hand pane's outer rect, rebuilt from the cached dims. Mirrors the
+/// draw layout for the paths that have no `Rect` from the last frame — the mouse
+/// handler and [`sync_diff_viewport`].
+fn right_pane_rect(app: &App) -> Rect {
+    Rect {
+        x: LEFT_WIDTH,
+        y: 0,
+        width: app.term_dims.0.saturating_add(2),
+        height: app.term_dims.1.saturating_add(2),
+    }
+}
+
+/// How the diff pane divides while the file rail is open: `(rail, diff)`.
+///
+/// A real column rather than an overlay, because every diff row starts at the
+/// pane's left edge — a floating rail would cover the exact code you're
+/// navigating. The diff clips rather than wraps, so the narrower pane loses only
+/// the right-hand end of long lines, and gets it back the moment the rail closes.
+///
+/// One helper for the renderer and mouse hit-testing both, for the same reason
+/// [`split_widths`] is one: two copies of this arithmetic would drift.
+fn diff_split(area: Rect) -> (Rect, Rect) {
+    // Never more than three fifths of the pane: a rail that squeezes the diff to
+    // nothing has navigated you to something you can't read.
+    let rail = (area.width * 2 / 5).clamp(26, 54).min(area.width * 3 / 5);
+    let cols = Layout::horizontal([Constraint::Length(rail), Constraint::Min(0)]).split(area);
+    (cols[0], cols[1])
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -1637,7 +1897,14 @@ fn draw(f: &mut Frame, app: &App) {
         Layout::horizontal([Constraint::Length(LEFT_WIDTH), Constraint::Min(0)]).split(main);
     draw_tree(f, app, cols[0]);
     if app.diff_showing() {
-        draw_diff(f, app, cols[1]);
+        // The file rail takes a column off the diff rather than covering it.
+        if app.diff.as_ref().is_some_and(|d| d.nav_open()) {
+            let (rail, body) = diff_split(cols[1]);
+            draw_diff(f, app, body);
+            draw_file_nav(f, app, rail);
+        } else {
+            draw_diff(f, app, cols[1]);
+        }
     } else {
         draw_terminal(f, app, cols[1]);
     }
@@ -1780,6 +2047,131 @@ fn diff_row_line(d: &DiffView, row: DiffRow, at_cursor: bool, in_block: bool) ->
                 ),
                 Span::styled(expand(&text), sel(Style::default().fg(Color::Yellow))),
             ])
+        }
+    }
+}
+
+/// The file rail: the diff's files as a directory tree, in its own column beside
+/// the diff. Renders straight from `FileNav::rows`, so what's drawn and what its
+/// cursor indexes can't drift apart.
+fn draw_file_nav(f: &mut Frame, app: &App, area: Rect) {
+    let Some(d) = app.diff.as_ref() else {
+        return;
+    };
+    let Some(nav) = d.nav.as_ref() else {
+        return;
+    };
+    let title = if nav.filter.is_empty() {
+        format!(" files · {} ", nav.total())
+    } else {
+        format!(" files · {}/{} ", nav.matched(), nav.total())
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style(true));
+    // The filter lives in the bottom border so it can't scroll away with the rows.
+    if nav.filtering || !nav.filter.is_empty() {
+        block = block.title_bottom(format!(" /{}▏ ", nav.filter));
+    }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if nav.rows.is_empty() {
+        let msg = if nav.filter.is_empty() {
+            "No changed files."
+        } else {
+            "Nothing matches that filter."
+        };
+        let hint = Paragraph::new(msg)
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(Wrap { trim: true });
+        f.render_widget(hint, inner);
+        return;
+    }
+
+    let here = d.current_file();
+    let lines: Vec<Line> = nav
+        .rows
+        .iter()
+        .enumerate()
+        .skip(nav.scroll)
+        .take(inner.height as usize)
+        .map(|(i, row)| file_nav_line(d, nav, row, i == nav.cursor, here))
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One explorer row. Column one is the "you are here" marker, so the file the
+/// diff cursor is in stays identifiable after the tree has been folded around it.
+///
+/// The comment badge is drawn before the line counts because the rail is narrow
+/// and the renderer clips the tail: in a review, which files you've already
+/// annotated outranks how big the change was.
+fn file_nav_line(
+    d: &DiffView,
+    nav: &FileNav,
+    row: &FileRow,
+    at_cursor: bool,
+    here: Option<usize>,
+) -> Line<'static> {
+    let sel = |s: Style| {
+        if at_cursor {
+            s.add_modifier(Modifier::REVERSED)
+        } else {
+            s
+        }
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    match row {
+        FileRow::Dir {
+            path,
+            label,
+            depth,
+            files,
+        } => {
+            let glyph = if nav.is_collapsed(path) { '▸' } else { '▾' };
+            Line::from(vec![
+                Span::styled(
+                    format!(" {:indent$}{glyph} {label}/", "", indent = depth * 2),
+                    sel(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                ),
+                Span::styled(format!("  {files}"), sel(dim)),
+            ])
+        }
+        FileRow::File { fi, label, depth } => {
+            let Some(file) = d.files.get(*fi) else {
+                return Line::from("");
+            };
+            let tint = match file.status {
+                FileStatus::Added => Color::Green,
+                FileStatus::Deleted => Color::Red,
+                FileStatus::Renamed => Color::Magenta,
+                FileStatus::Modified => Color::Gray,
+            };
+            let marker = if here == Some(*fi) { '▶' } else { ' ' };
+            let mut spans = vec![Span::styled(
+                format!("{marker}{:indent$}{label}", "", indent = depth * 2),
+                sel(Style::default().fg(tint)),
+            )];
+            let comments = d
+                .comments
+                .iter()
+                .filter(|c| c.anchor.path == file.path)
+                .count();
+            if comments > 0 {
+                spans.push(Span::styled(
+                    format!("  ●{comments}"),
+                    sel(Style::default().fg(Color::Yellow)),
+                ));
+            }
+            let counts = if file.binary {
+                "  (binary)".to_string()
+            } else {
+                format!("  +{} -{}", file.added(), file.removed())
+            };
+            spans.push(Span::styled(counts, sel(dim)));
+            Line::from(spans)
         }
     }
 }
@@ -3487,6 +3879,259 @@ diff --git a/src/a.rs b/src/a.rs
         sync_diff_viewport(&mut app);
         let d = app.diff.as_ref().unwrap();
         assert!(d.cursor >= d.scroll && d.cursor < d.scroll + 4, "cursor off screen");
+    }
+
+    // ---- the floating file explorer ----
+
+    /// A diff over three files in two directories, for the explorer's tree.
+    const MULTI: &str = "\
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,1 +1,2 @@
+ docs
++more docs
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -10,2 +10,3 @@
+ let keep = 1;
++let added = 2;
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1,1 +1,2 @@
+ let other = 1;
++let extra = 2;
+";
+
+    /// An app reviewing [`MULTI`], attached to an agent in `/r/a`.
+    fn app_reviewing_many() -> (App, mpsc::UnboundedReceiver<Request>) {
+        let (mut app, rx) = app_with_rx(vec![wt("/r/a", vec![claude_sess(1, "claude")], vec![])]);
+        app.attached = Some(1);
+        handle_daemon_event(
+            &mut app,
+            Event::Diff {
+                worktree: "/r/a".into(),
+                text: MULTI.into(),
+                skipped_untracked: 0,
+            },
+        );
+        (app, rx)
+    }
+
+    /// The explorer's rows, as `depth`-indented labels.
+    fn nav_sketch(app: &App) -> Vec<String> {
+        let nav = app
+            .diff
+            .as_ref()
+            .and_then(|d| d.nav.as_ref())
+            .expect("explorer open");
+        nav.rows
+            .iter()
+            .map(|r| match r {
+                FileRow::Dir { label, depth, .. } => format!("{:i$}{label}/", "", i = depth * 2),
+                FileRow::File { label, depth, .. } => format!("{:i$}{label}", "", i = depth * 2),
+            })
+            .collect()
+    }
+
+    fn nav_cursor(app: &App) -> usize {
+        app.diff.as_ref().and_then(|d| d.nav.as_ref()).unwrap().cursor
+    }
+
+    fn press(app: &mut App, c: char) {
+        handle_key(app, KeyEvent::from(KeyCode::Char(c)));
+    }
+
+    fn typed(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, c);
+        }
+    }
+
+    #[test]
+    fn f_opens_the_file_explorer_and_closes_it_again() {
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, 'f');
+        assert_eq!(nav_sketch(&app), vec!["src/", "  a.rs", "  b.rs", "README.md"]);
+        assert!(app.footer.starts_with("FILES"));
+        press(&mut app, 'f');
+        assert!(app.diff.as_ref().is_some_and(|d| !d.nav_open()));
+        assert!(app.footer.starts_with("DIFF"));
+    }
+
+    #[test]
+    fn enter_on_a_file_jumps_the_diff_there_and_dismisses_the_explorer() {
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, 'f');
+        press(&mut app, 'G'); // last row: README.md
+        assert_eq!(nav_sketch(&app)[nav_cursor(&app)], "README.md");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        let d = app.diff.as_ref().unwrap();
+        assert!(!d.nav_open(), "picking a file dismisses the explorer");
+        assert_eq!(d.files[d.current_file().unwrap()].path, "README.md");
+        assert_eq!(d.scroll, d.cursor, "the file lands at the top of the pane");
+    }
+
+    #[test]
+    fn space_folds_a_directory_rather_than_jumping() {
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, 'f');
+        press(&mut app, 'g'); // up to the `src/` row
+        assert_eq!(nav_cursor(&app), 0);
+        press(&mut app, ' ');
+        assert_eq!(nav_sketch(&app), vec!["src/", "README.md"]);
+        assert!(app.diff.as_ref().unwrap().nav_open(), "still open");
+    }
+
+    #[test]
+    fn slash_filters_and_enter_opens_the_match() {
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, 'f');
+        press(&mut app, '/');
+        typed(&mut app, "b.rs");
+        assert_eq!(nav_sketch(&app), vec!["src/", "  b.rs"]);
+        assert!(app.footer.contains("filter: b.rs"), "got {:?}", app.footer);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down)); // arrows work while filtering
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        let d = app.diff.as_ref().unwrap();
+        assert_eq!(d.files[d.current_file().unwrap()].path, "src/b.rs");
+    }
+
+    #[test]
+    fn while_filtering_letters_type_instead_of_navigating() {
+        // `j`/`k`/`f`/`q` are bindings outside filter mode; inside it they're text.
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, 'f');
+        press(&mut app, '/');
+        typed(&mut app, "jqf");
+        let nav = app.diff.as_ref().unwrap().nav.as_ref().expect("still open");
+        assert_eq!(nav.filter, "jqf");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Backspace));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Backspace));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Backspace));
+        typed(&mut app, "a.rs");
+        assert_eq!(nav_sketch(&app), vec!["src/", "  a.rs"]);
+    }
+
+    #[test]
+    fn esc_clears_the_filter_before_it_closes_the_explorer() {
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, 'f');
+        press(&mut app, '/');
+        typed(&mut app, "a.rs");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(nav_sketch(&app).len(), 4, "filter dropped, explorer kept");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.diff.as_ref().is_some_and(|d| !d.nav_open()));
+        // And the diff itself is still up — Esc peeled one layer, not two.
+        assert!(app.diff_showing());
+        assert_eq!(app.focus, Focus::Diff);
+    }
+
+    #[test]
+    fn explorer_keys_reach_neither_the_diff_nor_the_pty() {
+        // `c`/`x`/`s`/`v` are diff bindings; while the rail is up they must not
+        // open the comment editor, delete a comment, or submit a review.
+        let (mut app, mut rx) = app_reviewing_many();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "keep me");
+        press(&mut app, 'f');
+        for c in ['c', 'x', 's', 'v'] {
+            press(&mut app, c);
+        }
+        assert!(app.comment_editor.is_none(), "no comment editor");
+        let d = app.diff.as_ref().unwrap();
+        assert_eq!(d.comments.len(), 1, "comment untouched");
+        assert!(!d.selecting(), "no block selection started");
+        assert!(rx.try_recv().is_err(), "nothing sent to the daemon");
+    }
+
+    #[test]
+    fn hiding_the_diff_takes_the_explorer_with_it() {
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, 'f');
+        handle_key(&mut app, ctrl('g')); // hide the diff
+        assert!(!app.diff_showing());
+        assert!(
+            app.diff.as_ref().is_some_and(|d| !d.nav_open()),
+            "an overlay must not linger on a retained review"
+        );
+    }
+
+    #[test]
+    fn clicking_a_file_row_jumps_and_clicking_outside_dismisses() {
+        let (mut app, _rx) = app_reviewing_many();
+        app.term_dims = (86, 22); // matches the 120x24 render geometry
+        press(&mut app, 'f');
+        // The rail's row 0 is its top border, so row 1 is `src/` and row 2 is
+        // `src/a.rs`.
+        handle_mouse(&mut app, click(LEFT_WIDTH + 4, 2));
+        let d = app.diff.as_ref().unwrap();
+        assert!(!d.nav_open(), "a click on a file picks it");
+        assert_eq!(d.files[d.current_file().unwrap()].path, "src/a.rs");
+
+        press(&mut app, 'f');
+        handle_mouse(&mut app, click(LEFT_WIDTH + 70, 10)); // out on the diff column
+        assert!(app.diff.as_ref().is_some_and(|d| !d.nav_open()), "dismissed");
+    }
+
+    #[test]
+    fn clicking_a_directory_row_folds_it_and_keeps_the_rail_up() {
+        let (mut app, _rx) = app_reviewing_many();
+        app.term_dims = (86, 22);
+        press(&mut app, 'f');
+        handle_mouse(&mut app, click(LEFT_WIDTH + 4, 1)); // the `src/` row
+        assert_eq!(nav_sketch(&app), vec!["src/", "README.md"]);
+    }
+
+    #[test]
+    fn the_explorer_draws_over_the_diff_with_counts_and_comment_badges() {
+        let (mut app, _rx) = app_reviewing_many();
+        cursor_on_line(&mut app, "let added = 2;");
+        write_comment(&mut app, "note");
+        press(&mut app, 'f');
+        let screen = render(&app, 120, 24).join("\n");
+        assert!(screen.contains("files · 3"), "header count:\n{screen}");
+        assert!(screen.contains("src/"), "directory row missing");
+        assert!(screen.contains("a.rs"), "file row missing");
+        assert!(screen.contains("+1 -0"), "line counts missing:\n{screen}");
+        assert!(screen.contains("●1"), "comment badge missing:\n{screen}");
+        assert!(screen.contains("▶"), "you-are-here marker missing:\n{screen}");
+        // The diff is still behind it, not replaced.
+        assert!(screen.contains("@@ -10,2 +10,3 @@"), "diff gone:\n{screen}");
+    }
+
+    #[test]
+    fn the_explorer_survives_a_pane_far_too_small_for_it() {
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, 'f');
+        press(&mut app, '/');
+        typed(&mut app, "zzz"); // nothing matches
+        for (w, h) in [(40u16, 6u16), (36, 4), (80, 3), (LEFT_WIDTH + 2, 8)] {
+            app.term_dims = (w.saturating_sub(LEFT_WIDTH + 2), h.saturating_sub(3));
+            sync_diff_viewport(&mut app);
+            render(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn the_explorer_scrolls_to_keep_its_cursor_on_screen() {
+        let (mut app, _rx) = app_reviewing_many();
+        app.term_dims = (86, 2); // a rail two rows tall inside its border
+        press(&mut app, 'f');
+        press(&mut app, 'G');
+        sync_diff_viewport(&mut app);
+        let nav = app.diff.as_ref().unwrap().nav.as_ref().unwrap();
+        assert_eq!(nav.rows.len(), 4);
+        assert!(
+            nav.cursor >= nav.scroll && nav.cursor < nav.scroll + 2,
+            "cursor {} off a 2-row rail scrolled to {}",
+            nav.cursor,
+            nav.scroll
+        );
     }
 
     #[test]
