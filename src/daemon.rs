@@ -254,6 +254,13 @@ impl Daemon {
     }
 
     fn resize(&self, id: SessionId, cols: u16, rows: u16) {
+        // A zero in either axis makes a degenerate vt100 grid that panics on the
+        // next screen read (`contents_formatted`, `compute_status`). That read
+        // happens under `shared`, so the panic *poisons* the lock — and the
+        // poison then cascades through `build_tree` and bricks the whole daemon.
+        // Clamp here so no client, however buggy, can do that. (The TUI never
+        // sends 0, but a headless `asm attach` on a not-yet-sized pty can.)
+        let (cols, rows) = sane_dims(cols, rows);
         if let Some(s) = self.sessions.lock().unwrap().get(&id).cloned() {
             let _ = s.master.lock().unwrap().resize(PtySize {
                 rows,
@@ -988,6 +995,15 @@ fn mouse_mode_setup(screen: &vt100::Screen) -> Vec<u8> {
     out
 }
 
+/// Clamp requested terminal dimensions to something the emulator can hold.
+/// A zero in either axis yields a degenerate vt100 grid that panics on the next
+/// screen access; since those accesses run under the session lock, such a panic
+/// poisons the mutex and cascades into a dead daemon. One process-wide guard
+/// (all resize paths funnel through [`Daemon::resize`]) makes that unreachable.
+fn sane_dims(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.max(1), rows.max(1))
+}
+
 fn compute_status(sh: &SessionShared) -> Status {
     if sh.exited {
         Status::Exited
@@ -1318,6 +1334,20 @@ mod tests {
     fn audible_bell_marks_waiting() {
         let sh = shared_fed(b"working done\x07");
         assert_eq!(compute_status(&sh), Status::Waiting);
+    }
+
+    #[test]
+    fn zero_terminal_dims_are_clamped_away_from_the_poison() {
+        // A 0 in either axis is what bricked a live daemon: it makes a
+        // zero-sized vt100 grid that panics on the next screen read, under the
+        // session lock, poisoning it. `resize` funnels every dimension through
+        // here, so this is the one place that has to refuse a zero.
+        assert_eq!(sane_dims(0, 0), (1, 1));
+        assert_eq!(sane_dims(0, 24), (1, 24));
+        assert_eq!(sane_dims(80, 0), (80, 1));
+        // Real sizes pass through untouched.
+        assert_eq!(sane_dims(80, 24), (80, 24));
+        assert_eq!(sane_dims(1, 1), (1, 1));
     }
 
     #[test]

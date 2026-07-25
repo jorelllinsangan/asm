@@ -209,6 +209,25 @@ cargo build --release
 ./target/release/asm
 ```
 
+## Headless / scripting
+
+Besides the TUI, the same binary exposes headless subcommands that drive the
+daemon without ratatui — the surface external front-ends (e.g. the `asm.nvim`
+Neovim plugin) build on. Each spawns the daemon if needed:
+
+```
+asm tree [--watch]                       # tree as newline-delimited JSON (stream with --watch)
+asm attach <id>                          # raw byte pipe to a live session's PTY
+asm socket-path                          # this repo's daemon socket path
+asm new-session <wt> <shell|claude|opencode|codex> [name]   # spawn; prints new id
+asm resume <wt> <claude|opencode|codex> <session-id>        # resume on-disk agent; prints new id
+asm kill <id> · asm rename <id> <name> · asm refresh
+asm new-worktree <branch> · asm rm-worktree <path> [--force]
+```
+
+`asm attach` renders in whatever terminal runs it, so a front-end can embed a
+live session natively. See `asm --help`.
+
 ## Applying changes (rebuild & restart)
 
 `asm` is two processes from one binary — the **TUI** (`asm`) and a long-lived

@@ -1182,7 +1182,7 @@ fn agent_label(tool: AgentTool) -> &'static str {
 }
 
 /// The CLI a fresh agent session runs.
-fn agent_command(tool: AgentTool) -> &'static str {
+pub(crate) fn agent_command(tool: AgentTool) -> &'static str {
     match tool {
         AgentTool::Claude => "claude",
         AgentTool::Opencode => "opencode",
@@ -1192,7 +1192,7 @@ fn agent_command(tool: AgentTool) -> &'static str {
 
 /// A whimsical default label for an unnamed session: `adjective-pokemon`, drawn
 /// from the original 151. Seeded from the clock so successive sessions differ.
-fn cute_name() -> String {
+pub(crate) fn cute_name() -> String {
     const ADJ: &[&str] = &[
         "swift", "brave", "cosmic", "gentle", "fuzzy", "clever", "mellow", "snappy", "witty",
         "sunny", "dapper", "zesty", "lucky", "nimble", "quiet", "plucky", "bold", "cheeky",
@@ -2152,7 +2152,7 @@ fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
 }
 
 /// Connect to the daemon, spawning it (detached) if it is not already running.
-async fn connect_or_spawn(root: &Path) -> Result<UnixStream> {
+pub(crate) async fn connect_or_spawn(root: &Path) -> Result<UnixStream> {
     let sock = paths::socket_path(root);
     if let Ok(s) = UnixStream::connect(&sock).await {
         return Ok(s);

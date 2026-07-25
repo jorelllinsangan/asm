@@ -207,6 +207,46 @@ Things that will bite if you change them:
   Hiding the diff retains it (`diff` stays `Some`, `diff_visible` goes false) so
   a stray `Ctrl+G` doesn't destroy a review in progress.
 
+### Headless subcommands (`cli.rs`) — the scriptable surface
+
+Besides the TUI (no arg) and `daemon`, `main.rs` dispatches a set of headless
+subcommands implemented in `cli.rs`. They exist so external front-ends — the
+`asm.nvim` Neovim plugin lives in a sibling repo — can drive the daemon without
+ratatui. Each is a **thin client**: it `connect_or_spawn`s the same per-repo
+daemon, speaks the same `protocol.rs`/`ipc.rs`, and exits. **No daemon changes
+were needed** — every subcommand is built from existing `Request`s, which is the
+whole point (the neovim plugin talks to an unmodified daemon).
+
+- `asm tree [--watch]` — the tree as newline-delimited JSON, one object per
+  line (`{"kind":"tree",…}` / `{"kind":"error",…}`). `--watch` streams a fresh
+  line on every daemon push; the plugin drives its sidebar straight off this.
+- `asm attach <id>` — a raw byte pipe between local stdio and a session's PTY
+  (stdin→`Input`, `Output`→stdout, `SIGWINCH`→`Resize`), exiting when the
+  session exits (observed via the pushed `Tree`) or the daemon dies. A front-end
+  runs it inside its own terminal widget for native rendering; the daemon keeps
+  its own emulator/status parser regardless of who is attached.
+- `asm socket-path` — pure path math (no daemon), so a front-end can locate its
+  daemon without reimplementing the `paths.rs` root hashing.
+- Mutations — `new-session` / `resume` (print the new session id), `kill`,
+  `rename`, `refresh`, `new-worktree`, `rm-worktree`. Each sends its request then
+  waits for one reply (a `Tree`, or the new id) via `request_until`, both to
+  surface a daemon `Error` and to stay connected long enough for the frame to be
+  read.
+
+`read_frame` is **not cancel-safe**, so `attach` never puts it inside a
+`select!` arm — a dedicated task drains the socket into a channel, and the
+`select!` only ever awaits cancel-safe channel/​signal receivers. Getting this
+wrong desyncs the framed stream.
+
+**Terminal dims must never reach the daemon as 0.** `Daemon::resize` funnels all
+sizes through `sane_dims` (clamp each axis to ≥1). A zero-sized vt100 grid
+panics on the next screen read (`contents_formatted`/`compute_status`), and
+because that read holds the `shared` lock the panic **poisons** it and cascades
+through `build_tree` into a dead daemon. The TUI never sends 0, but a headless
+`asm attach` on a not-yet-sized pty can — `cli.rs::term_size` also guards the
+client side (0 → 80×24). This was a real incident, pinned by
+`zero_terminal_dims_are_clamped_away_from_the_poison`.
+
 ### Session spawning
 
 Every session runs through the user's own `$SHELL` as a **login + interactive**
