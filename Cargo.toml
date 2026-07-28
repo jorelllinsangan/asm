@@ -19,7 +19,8 @@ vt100 = "0.16.2"
 # whole screen, which throws away the scrollback of any app that pins a prompt to
 # the last row (Codex emits `CSI 1;39r`) — the wheel then has no history to move.
 # The patched branch archives rows whenever the region is anchored to the top.
-# Submitted upstream as doy/vt100-rust; drop this once it lands in a release.
+# This is a permanent fork we maintain, not a temporary hold — on a vt100 bump,
+# rebase the branch onto the new tag rather than dropping the patch.
 #
 # It must patch the `vt100` name rather than be a separate dependency: tui-term's
 # widget takes a `&vt100::Screen`, so a differently-named fork would not typecheck.

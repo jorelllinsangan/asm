@@ -319,7 +319,8 @@ by construction** (`vt100`'s `Screen::new` builds it with `Grid::new(size, 0)`, 
 `set_scrollback` acts on whichever grid is active). No buffer, nothing to scroll.
 
 **2. Patch `vt100` so the buffer actually fills** (`[patch.crates-io]` in
-`Cargo.toml`, branch on a fork of `doy/vt100-rust`, submitted upstream). Codex pins
+`Cargo.toml`, branch on our fork of `doy/vt100-rust` — a fork we keep, not a
+temporary hold; a `vt100` bump means rebasing that branch). Codex pins
 its composer to the last row by setting a scroll region above it — a real capture
 shows `CSI 1;39r` on a 40-row pane. Stock `vt100` archives a scrolled-off row only
 when **no** region is active at all (`Grid::scroll_up`, gated on

@@ -271,8 +271,8 @@ to be unscrollable in asm, and it needed one change on each side of the problem:
    on a 40-row pane). Stock `vt100` only saves scrolled-off rows when *no* region
    is set, so it discarded every line Codex scrolled away — the buffer existed
    but stayed empty. The patch saves them whenever the region is anchored to the
-   top row, which is exactly the "pinned prompt, scrolling output" case. It's
-   submitted upstream; the patch goes away when it lands in a release.
+   top row, which is exactly the "pinned prompt, scrolling output" case. The fork
+   is ours to keep — building asm needs access to it.
 
 Either fix alone does nothing, which is worth knowing before "simplifying" one of
 them away. A nice consequence of the second: the pinned row sits *below* the
