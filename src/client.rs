@@ -1913,9 +1913,13 @@ fn sync_diff_viewport(app: &mut App) {
 /// The right-hand pane's outer rect, rebuilt from the cached dims. Mirrors the
 /// draw layout for the paths that have no `Rect` from the last frame — the mouse
 /// handler and [`sync_diff_viewport`].
+///
+/// The origin comes from [`App::nav_width`], not `LEFT_WIDTH`: with the tree
+/// hidden the pane starts at column 0, and a hard-coded 34 here would misroute
+/// every click in the file rail by exactly that much.
 fn right_pane_rect(app: &App) -> Rect {
     Rect {
-        x: LEFT_WIDTH,
+        x: app.nav_width(),
         y: 0,
         width: app.term_dims.0.saturating_add(2),
         height: app.term_dims.1.saturating_add(2),
@@ -4235,6 +4239,22 @@ diff --git a/src/b.rs b/src/b.rs
         press(&mut app, 'f');
         handle_mouse(&mut app, click(LEFT_WIDTH + 70, 10)); // out on the diff column
         assert!(app.diff.as_ref().is_some_and(|d| !d.nav_open()), "dismissed");
+    }
+
+    #[test]
+    fn the_rail_hit_test_follows_the_tree_being_hidden() {
+        // With `Ctrl+H` the tree is gone and the diff pane starts at column 0, so
+        // the rail's rows sit 34 columns left of where they were. A hard-coded
+        // LEFT_WIDTH in `right_pane_rect` would send every click into the "click
+        // outside" branch and just dismiss the rail.
+        let (mut app, _rx) = app_reviewing_many();
+        app.term_dims = (120, 22);
+        app.nav_hidden = true;
+        press(&mut app, 'f');
+        handle_mouse(&mut app, click(4, 2)); // `src/a.rs`, no tree column offset
+        let d = app.diff.as_ref().unwrap();
+        assert!(!d.nav_open(), "the click landed on a row, not outside the rail");
+        assert_eq!(d.files[d.current_file().unwrap()].path, "src/a.rs");
     }
 
     #[test]
