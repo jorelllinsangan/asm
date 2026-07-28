@@ -159,6 +159,16 @@ Split of responsibility:
   /dev/null <path>`, one process each (capped at `MAX_UNTRACKED`), deliberately
   in preference to `git add -N .` — that would write to the index of a repo the
   agent is concurrently using.
+  - **The base is taken against the root branch *and* its `@{upstream}`, keeping
+    whichever is closer to HEAD** (`merge_base` → `newer_of`). Either ref can be
+    the stale one: a local `main` nobody has pulled sits *behind* the branch
+    under review, so basing on it drags every mainline commit the branch already
+    contains into the review (this was a real report — 168 files for a 37-file
+    change); a local `main` with unpushed commits sits *ahead* of its upstream,
+    so basing on the upstream would replay those instead. The three
+    `the_review_base_*` tests in `git.rs` pin both directions and the
+    no-upstream fallback — and they're the only tests in the crate that build a
+    real repo on disk, because the bug is a property of refs, not of text.
 - **`diff.rs`** is pure: parser → `FileDiff`/`Hunk`/`DiffLine`, the `DiffView`
   model, and `format_review`. No I/O, no ratatui. All the real logic lives here
   and is unit-tested directly.

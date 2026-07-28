@@ -73,9 +73,49 @@ fn merge_base(root: &Path, worktree: &Path) -> Option<String> {
     if branch.is_empty() {
         return None;
     }
-    let base = run(&["merge-base", branch, "HEAD"], worktree).ok()?;
+    // Both the local root branch *and* its upstream are candidates, because
+    // either can be the stale one:
+    //
+    // - a local `main` nobody has pulled sits *behind* the branch under review,
+    //   which then contains other people's merged commits. Basing on it drags
+    //   all of them into the review — the reported symptom was 168 files for a
+    //   37-file change.
+    // - a local `main` with unpushed commits sits *ahead* of the upstream, and
+    //   basing on the upstream would replay those into the review instead.
+    //
+    // So take the merge-base against each and keep whichever is closer to HEAD:
+    // "changes not already on the mainline, local or remote".
+    let upstream = format!("{branch}@{{upstream}}");
+    let bases: Vec<String> = [branch, upstream.as_str()]
+        .iter()
+        .filter_map(|r| base_against(r, worktree))
+        .collect();
+    match bases.as_slice() {
+        [] => None,
+        [only] => Some(only.clone()),
+        [a, b, ..] => Some(newer_of(a, b, worktree)),
+    }
+}
+
+/// `git merge-base <r> HEAD`, or `None` when `r` doesn't resolve — an upstream
+/// that was never configured, a remote that hasn't been fetched.
+fn base_against(r: &str, worktree: &Path) -> Option<String> {
+    let base = run(&["merge-base", r, "HEAD"], worktree).ok()?;
     let base = base.trim().to_string();
     (!base.is_empty()).then_some(base)
+}
+
+/// Whichever of two ancestors of HEAD is the later one, i.e. gives the tighter
+/// review range. When one is an ancestor of the other, `merge-base` returns that
+/// ancestor, so the *other* one is the answer.
+fn newer_of(a: &str, b: &str, worktree: &Path) -> String {
+    match run(&["merge-base", a, b], worktree) {
+        Ok(m) if m.trim() == a => b.to_string(),
+        Ok(_) => a.to_string(),
+        // Unrelated histories shouldn't happen (both reach HEAD), but a wider
+        // range is a recoverable review, so prefer one over bailing out.
+        Err(_) => a.to_string(),
+    }
 }
 
 /// Render untracked files as additions.
@@ -197,4 +237,134 @@ pub fn remove_worktree(root: &Path, path: &Path, force: bool) -> Result<()> {
     args.push(&path_str);
     run(&args, root)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The only tests in the crate that touch the filesystem, and they have to:
+    /// the review range is a property of real refs (a stale local branch, an
+    /// upstream that has moved), which can't be faked without a repo.
+    /// Everything here is offline — the "remote" is a hand-written ref.
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch() -> Scratch {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("asm-git-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Scratch(dir)
+    }
+
+    /// Run git with no user config and a fixed identity, panicking on failure —
+    /// a fixture that half-built would fail the test for the wrong reason.
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn commit(cwd: &Path, name: &str) -> String {
+        std::fs::write(cwd.join(name), name).expect("write file");
+        git(cwd, &["add", "."]);
+        git(cwd, &["commit", "-q", "-m", name]);
+        git(cwd, &["rev-parse", "HEAD"])
+    }
+
+    /// A repo with `main`, a hand-written `origin/main` upstream, and a worktree
+    /// on `feature`. `local_main` / `origin_main` say where each ref sits.
+    fn fixture(local_main: usize, origin_main: Option<usize>) -> (Scratch, PathBuf, PathBuf, Vec<String>) {
+        let s = scratch();
+        let root = s.0.join("repo");
+        std::fs::create_dir_all(&root).expect("repo dir");
+        git(&root, &["init", "-q", "-b", "main"]);
+        // Two commits of shared/mainline history, then `feature` off the second.
+        let shas = vec![commit(&root, "a"), commit(&root, "b")];
+        git(&root, &["branch", "feature"]);
+        git(&root, &["reset", "-q", "--hard", &shas[local_main]]);
+        if let Some(o) = origin_main {
+            git(&root, &["update-ref", "refs/remotes/origin/main", &shas[o]]);
+            // `@{upstream}` resolves through the remote's fetch refspec, not the
+            // branch config alone — without it the ref exists but is unreachable
+            // by that name, which is a fixture that silently tests nothing.
+            git(&root, &["config", "remote.origin.url", "."]);
+            git(&root, &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+            git(&root, &["config", "branch.main.remote", "origin"]);
+            git(&root, &["config", "branch.main.merge", "refs/heads/main"]);
+            assert_eq!(
+                git(&root, &["rev-parse", "--symbolic-full-name", "main@{upstream}"]),
+                "refs/remotes/origin/main",
+                "fixture: upstream must resolve"
+            );
+        }
+        let wt = s.0.join("wt");
+        git(&root, &["worktree", "add", "-q", wt.to_str().expect("utf8"), "feature"]);
+        (s, root, wt, shas)
+    }
+
+    #[test]
+    fn the_review_base_skips_mainline_commits_a_stale_local_branch_has_not_pulled() {
+        // The reported bug: the root worktree's `main` was 12 commits behind
+        // `origin/main`, the branch under review had been cut from the fetched
+        // upstream, so basing on local `main` pulled a dozen other people's
+        // merged PRs into the review — 168 files for a 37-file change.
+        let (_s, root, wt, shas) = fixture(0, Some(1));
+        let mine = commit(&wt, "c");
+
+        let base = merge_base(&root, &wt).expect("a base");
+        assert_eq!(base, shas[1], "base must follow origin/main, not the stale local main");
+        assert_ne!(base, shas[0]);
+
+        let (diff, _) = review_diff(&root, &wt).expect("diff");
+        assert!(diff.contains("+++ b/c"), "the work under review is missing:\n{diff}");
+        assert!(!diff.contains("+++ b/b"), "a mainline commit leaked into the review:\n{diff}");
+        assert!(!mine.is_empty());
+    }
+
+    #[test]
+    fn the_review_base_keeps_unpushed_local_mainline_commits_out_of_the_review() {
+        // The other direction: local `main` is *ahead* of its upstream. Basing on
+        // the upstream would replay those unpushed commits into every review.
+        let (_s, root, wt, shas) = fixture(1, Some(0));
+        commit(&wt, "c");
+
+        let base = merge_base(&root, &wt).expect("a base");
+        assert_eq!(base, shas[1], "base must be the local main, which is ahead here");
+
+        let (diff, _) = review_diff(&root, &wt).expect("diff");
+        assert!(diff.contains("+++ b/c"));
+        assert!(!diff.contains("+++ b/b"), "unpushed mainline commit leaked in:\n{diff}");
+    }
+
+    #[test]
+    fn the_review_base_falls_back_to_the_local_branch_with_no_upstream() {
+        // No remote configured at all — the base is just the local merge-base.
+        let (_s, root, wt, shas) = fixture(0, None);
+        commit(&wt, "c");
+        assert_eq!(merge_base(&root, &wt).expect("a base"), shas[0]);
+    }
 }
