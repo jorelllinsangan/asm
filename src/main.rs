@@ -17,6 +17,28 @@ mod protocol;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
+/// Codex is spawned in **inline** mode, unlike Claude Code and OpenCode which
+/// are inline already.
+///
+/// Codex's TUI otherwise enters the alternate screen (`CSI ?1049h`), and the
+/// alternate screen has **no scrollback by design** — a full-screen app repaints
+/// its own frames, so lines leaving the top are dropped rather than retained
+/// (`vt100`'s alternate grid is built with a scrollback length of 0). asm's wheel
+/// handler scrolls the local emulator's scrollback, so in a Codex session there
+/// was simply nothing behind the visible screen to scroll to, and a terminal-side
+/// drag could only ever select the current frame. Inline mode keeps Codex in the
+/// normal screen, which *has* a scrollback ring.
+///
+/// **This is half the fix and does nothing on its own.** Codex also pins its
+/// composer to the last row with a scroll region, and stock `vt100` discards rows
+/// scrolling out of any region — so the ring stays empty. The `[patch.crates-io]`
+/// entry in `Cargo.toml` is the other half; see the Codex scrollback section in
+/// `CLAUDE.md` before removing either.
+///
+/// This is passed as part of the spawn command, so it applies to newly created
+/// sessions only — see the daemon-restart notes in `CLAUDE.md`.
+pub(crate) const CODEX_INLINE_FLAG: &str = "--no-alt-screen";
+
 fn resolve_root() -> Result<PathBuf> {
     if let Ok(root) = std::env::var("ASM_ROOT")
         && !root.is_empty()

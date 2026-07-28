@@ -1490,11 +1490,16 @@ fn agent_label(tool: AgentTool) -> &'static str {
 }
 
 /// The CLI a fresh agent session runs.
+///
+/// Codex gets `--no-alt-screen` (see [`CODEX_INLINE_FLAG`]).
 pub(crate) fn agent_command(tool: AgentTool) -> &'static str {
     match tool {
         AgentTool::Claude => "claude",
         AgentTool::Opencode => "opencode",
-        AgentTool::Codex => "codex",
+        // Kept a literal because this returns `&'static str`; the test
+        // `a_fresh_codex_session_is_asked_for_inline_rendering` pins it to
+        // `CODEX_INLINE_FLAG` so the two can't drift.
+        AgentTool::Codex => "codex --no-alt-screen",
     }
 }
 
@@ -3121,6 +3126,36 @@ mod tests {
             Ok(Request::Input { data, .. }) => assert_eq!(data, vec![0x0c]),
             other => panic!("expected Input, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_pinned_bottom_row_does_not_cost_a_session_its_scrollback() {
+        // An app that keeps its input box on the last row pins a scroll region
+        // above it — Codex emits `CSI 1;39r` on a 40-row pane. Rows scrolling out
+        // of that region leave the screen, so they are the history the wheel
+        // handler pages through with `set_scrollback`. Stock vt100 discards them
+        // (it only archives when no region is set at all), which is why a Codex
+        // pane could not be scrolled at all; the `[patch.crates-io]` entry in
+        // Cargo.toml is what fixes it, and this test fails without it.
+        let mut p = vt100::Parser::new(40, 120, 1000);
+        p.process(b"\x1b[1;39r");
+        for i in 0..200 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        p.screen_mut().set_scrollback(50);
+        assert_eq!(p.screen().scrollback(), 50, "no history to scroll back to");
+    }
+
+    #[test]
+    fn a_fresh_codex_session_is_asked_for_inline_rendering() {
+        // Codex on the alternate screen has no scrollback to scroll back through
+        // (see CODEX_INLINE_FLAG); the other two are inline already and must not
+        // be handed a flag they don't know.
+        assert_eq!(agent_command(AgentTool::Codex), "codex --no-alt-screen");
+        // The literal above and the documented const are one decision.
+        assert!(agent_command(AgentTool::Codex).ends_with(crate::CODEX_INLINE_FLAG));
+        assert_eq!(agent_command(AgentTool::Claude), "claude");
+        assert_eq!(agent_command(AgentTool::Opencode), "opencode");
     }
 
     #[test]

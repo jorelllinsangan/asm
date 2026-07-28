@@ -306,6 +306,52 @@ what make the environment match a normal terminal.
 Because this runs in the daemon, editing it needs a daemon restart and only
 affects new sessions — see [Applying changes](#applying-changes-which-process-to-bounce).
 
+#### Why a Codex session is scrollable (two fixes, neither sufficient alone)
+
+Codex was unscrollable in asm while Claude Code and OpenCode were fine. It took a
+fix on each side, and removing either one silently breaks the feature again.
+
+**1. Spawn it inline.** `CODEX_INLINE_FLAG` (`--no-alt-screen`) in `main.rs`, applied
+by `client::agent_command` for fresh sessions and `daemon::resume_command` for
+resumed ones — the two are pinned to the const by their tests. Codex's TUI
+otherwise enters the alternate screen, and **the alternate grid has zero scrollback
+by construction** (`vt100`'s `Screen::new` builds it with `Grid::new(size, 0)`, and
+`set_scrollback` acts on whichever grid is active). No buffer, nothing to scroll.
+
+**2. Patch `vt100` so the buffer actually fills** (`[patch.crates-io]` in
+`Cargo.toml`, branch on a fork of `doy/vt100-rust`, submitted upstream). Codex pins
+its composer to the last row by setting a scroll region above it — a real capture
+shows `CSI 1;39r` on a 40-row pane. Stock `vt100` archives a scrolled-off row only
+when **no** region is active at all (`Grid::scroll_up`, gated on
+`!scroll_region_active()`), so every line Codex scrolled away was dropped: inline
+mode gave the session a 1000-line ring that stayed permanently empty. The patch
+archives rows whenever the region is *anchored to the top* (`scroll_top == 0`),
+since a row leaving a top-anchored region leaves the screen and is therefore
+history; a region starting further down is a window into mid-screen, where the
+rows are still visible above and saving them would double them up.
+
+`a_pinned_bottom_row_does_not_cost_a_session_its_scrollback` (`client.rs`) is the
+canary: it feeds Codex's exact sequence into a client-shaped parser and fails if
+the patch is ever dropped. The `tui-term` widget takes a `&vt100::Screen`, so this
+*must* be a `[patch.crates-io]` of the `vt100` name — a differently-named fork
+(e.g. `panoptes-vt100`) will not typecheck against it.
+
+A pleasant property of fix 2: the pinned row lives *below* the region, so it never
+enters the scrollback — the history is clean transcript, not a stack of old input
+boxes.
+
+**Blind alleys, so they aren't retried:** Codex enables no mouse reporting at all
+(its binary contains `?1049h` but none of `?1000h`/`?1002h`/`?1006h`), so the wheel
+was never being "stolen" by the app, and a Shift+wheel override would have had no
+history to reach. Codex's own `/raw` ("raw scrollback mode") doesn't help either —
+the pinned region stays, and this discard rule is standard xterm behavior, so the
+host terminal drops those rows too. Note the mouse-forwarding rule is still right
+as it stands: never swallow the wheel when an app *does* request mouse events, since
+paging back through an alt-screen app's previous redraws is visual garbage.
+
+Both fixes reach only sessions asm spawns, and the flag is part of the spawn
+command, so existing sessions keep the mode they were born with.
+
 ### Session status heuristic
 
 `compute_status` (`daemon.rs`) maps a session to `Running`/`Waiting`/`Idle`/

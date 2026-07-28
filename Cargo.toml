@@ -14,3 +14,14 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "macros", "time", "process", "signal"] }
 tui-term = "0.3.4"
 vt100 = "0.16.2"
+
+# vt100 discards rows that scroll out of a scroll region unless the region is the
+# whole screen, which throws away the scrollback of any app that pins a prompt to
+# the last row (Codex emits `CSI 1;39r`) — the wheel then has no history to move.
+# The patched branch archives rows whenever the region is anchored to the top.
+# Submitted upstream as doy/vt100-rust; drop this once it lands in a release.
+#
+# It must patch the `vt100` name rather than be a separate dependency: tui-term's
+# widget takes a `&vt100::Screen`, so a differently-named fork would not typecheck.
+[patch.crates-io]
+vt100 = { git = "https://github.com/jorelllinsangan/vt100-rust", branch = "scrollback-under-top-anchored-scroll-region" }

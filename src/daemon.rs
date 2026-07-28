@@ -149,11 +149,7 @@ impl Daemon {
                 let short = &session_id[..session_id.len().min(8)];
                 format!("resume {short}")
             });
-        let command = match tool {
-            AgentTool::Claude => format!("claude --resume {session_id}"),
-            AgentTool::Opencode => format!("opencode --session {session_id}"),
-            AgentTool::Codex => format!("codex resume {session_id}"),
-        };
+        let command = resume_command(tool, &session_id);
         self.spawn_session(cwd, name, command, Some(session_id), Some(tool), false)
     }
 
@@ -579,6 +575,19 @@ impl Daemon {
             },
         );
         (cwd, title)
+    }
+}
+
+/// The CLI invocation that resumes an on-disk agent session. The mirror of
+/// [`crate::client::agent_command`] (fresh sessions), and like it, Codex is asked
+/// for inline rendering — see [`crate::CODEX_INLINE_FLAG`].
+fn resume_command(tool: AgentTool, session_id: &str) -> String {
+    match tool {
+        AgentTool::Claude => format!("claude --resume {session_id}"),
+        AgentTool::Opencode => format!("opencode --session {session_id}"),
+        AgentTool::Codex => {
+            format!("codex resume {} {session_id}", crate::CODEX_INLINE_FLAG)
+        }
     }
 }
 
@@ -1392,6 +1401,31 @@ mod tests {
         assert_eq!(shell_argv("/bin/zsh", ""), vec!["/bin/zsh", "-l"]);
         // Whitespace-only is still "no command" → a plain shell, not `-c "  "`.
         assert_eq!(shell_argv("/bin/zsh", "   "), vec!["/bin/zsh", "-l"]);
+    }
+
+    #[test]
+    fn a_resumed_codex_session_is_asked_for_inline_rendering() {
+        // Without --no-alt-screen, Codex repaints on the alternate screen, which
+        // holds no scrollback — the session becomes unscrollable, so this flag is
+        // load-bearing rather than cosmetic. It must precede the session id to
+        // stay a flag of `resume` and not an argument to it.
+        assert_eq!(
+            resume_command(AgentTool::Codex, "abc-123"),
+            "codex resume --no-alt-screen abc-123",
+        );
+    }
+
+    #[test]
+    fn resuming_claude_and_opencode_is_left_alone() {
+        // Both already render inline; only Codex needs the flag.
+        assert_eq!(
+            resume_command(AgentTool::Claude, "abc-123"),
+            "claude --resume abc-123",
+        );
+        assert_eq!(
+            resume_command(AgentTool::Opencode, "abc-123"),
+            "opencode --session abc-123",
+        );
     }
 
     #[test]

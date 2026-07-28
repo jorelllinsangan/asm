@@ -253,6 +253,35 @@ Every keystroke is forwarded to the session **except** `Ctrl+H`/`Ctrl+Q` (which
 return to the explorer), so agent keybindings like `Ctrl+A` (start of line) and
 `Ctrl+L` (clear screen) work normally.
 
+The mouse wheel scrolls the session's history. If the app has asked for mouse
+reporting, the wheel goes to the app instead (so nvim in the `Ctrl+]` split
+scrolls the file, not asm's saved frames). Selecting text to copy is your
+terminal's job, not asm's — asm holds the mouse for click-to-focus, so use your
+terminal's bypass modifier: **Shift**-drag in Ghostty and most others,
+**Option**-drag in iTerm2.
+
+**Scrolling a Codex session takes two fixes**, both already in place. Codex used
+to be unscrollable in asm, and it needed one change on each side of the problem:
+
+1. **Codex is started with `--no-alt-screen`.** Its TUI otherwise runs on the
+   alternate screen, which has no scrollback by construction — so there was no
+   history buffer to fill in the first place.
+2. **`vt100` is patched** (see `[patch.crates-io]` in `Cargo.toml`). Codex pins
+   its input box to the last row by setting a scroll region above it (`CSI 1;39r`
+   on a 40-row pane). Stock `vt100` only saves scrolled-off rows when *no* region
+   is set, so it discarded every line Codex scrolled away — the buffer existed
+   but stayed empty. The patch saves them whenever the region is anchored to the
+   top row, which is exactly the "pinned prompt, scrolling output" case. It's
+   submitted upstream; the patch goes away when it lands in a release.
+
+Either fix alone does nothing, which is worth knowing before "simplifying" one of
+them away. A nice consequence of the second: the pinned row sits *below* the
+region, so it never enters the history — you scroll clean transcript, not a stack
+of old input boxes.
+
+This covers sessions asm spawns, fresh and resumed. A `codex` you launch by hand
+inside a shell session renders however it likes.
+
 ## Build
 
 ```
