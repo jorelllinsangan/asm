@@ -153,7 +153,9 @@ you're attached to.
 | `j`/`k`, `Ctrl+D`/`Ctrl+U`, `g`/`G` | move · half-page · top/bottom |
 | `f` or `Tab` | open the **file rail** (jump straight to a file) |
 | `]`/`[` | next / previous file |
-| `n`/`p` | next / previous hunk |
+| `/` | search visible diff text; type a query and press `Enter` |
+| `n`/`N` | next / previous search match (while a search is active) |
+| `n`/`p` | next / previous hunk (when there is no active search) |
 | `v` | start / cancel a block selection (`j`/`k` extends it) |
 | `c` or `Enter` | comment on the selection, or the cursor line (edits the one that's there) |
 | `x` | delete the comment under the cursor |
@@ -161,6 +163,11 @@ you're attached to.
 | `r` | reload the diff (comments are re-pinned to their lines) |
 | `Esc` | cancel the selection, or close the pane when there isn't one |
 | `q` | close (the review is kept — `Ctrl+G` returns to it) |
+
+Diff search is case-insensitive and wraps at either end, like Vim. It covers
+file paths, hunk headers, source lines, and inline review comments; matching
+rows stay highlighted after `Enter`. Press `Esc` once to clear the search, then
+again to close the diff pane.
 
 A block comment renders once, under the last line it covers, and every line in
 it is marked in the gutter. Putting the cursor anywhere inside the block and

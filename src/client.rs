@@ -36,7 +36,7 @@ const NAV_HINT: &str =
     "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · x kill · Ctrl+H hide tree · Ctrl+] editor · Ctrl+G diff · q quit";
 const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor · Ctrl+G diff";
 const EDITOR_HINT: &str = "EDITOR · Ctrl+] hides it (keeps running) · Ctrl+H explorer";
-const DIFF_HINT: &str = "DIFF · j/k move · v block · c comment · x delete · s submit · f files · ]/[ file · n/p hunk · r refresh · Esc close";
+const DIFF_HINT: &str = "DIFF · j/k move · / search · v block · c comment · x delete · s submit · f files · ]/[ file · n/p hunk · r refresh · Esc close";
 const COMMENT_HINT: &str = "COMMENT · Enter newline · Ctrl+S save · Esc cancel (blank = delete)";
 const FILES_HINT: &str =
     "FILES · j/k move · Enter open · Space fold · / filter · f close · Esc back";
@@ -772,6 +772,11 @@ fn handle_diff_key(app: &mut App, key: KeyEvent) {
     if app.diff.as_ref().is_some_and(|d| d.nav_open()) {
         return handle_file_nav_key(app, key);
     }
+    // Search input is modal too: its printable characters are the query rather
+    // than diff bindings. The global pane toggles were already intercepted.
+    if app.diff.as_ref().is_some_and(DiffView::search_editing) {
+        return handle_diff_search_key(app, key);
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // Half-page jumps and the explorer chord are checked before the plain-letter
     // bindings so Ctrl+D isn't read as "delete comment".
@@ -789,9 +794,11 @@ fn handle_diff_key(app: &mut App, key: KeyEvent) {
     }
     match key.code {
         // Esc backs out one layer at a time: an in-progress block selection
-        // first, the pane only once there's no selection to lose.
+        // or active search first, the pane only once there's no state to lose.
         KeyCode::Esc => {
-            if app.diff.as_ref().is_some_and(|d| d.selecting()) {
+            if app.diff.as_mut().is_some_and(DiffView::clear_search) {
+                app.footer = DIFF_HINT.into();
+            } else if app.diff.as_ref().is_some_and(|d| d.selecting()) {
                 diff_nav(app, DiffView::clear_selection);
                 app.footer = "selection cleared".into();
             } else {
@@ -805,7 +812,7 @@ fn handle_diff_key(app: &mut App, key: KeyEvent) {
             app.footer = if app.diff.as_ref().is_some_and(|d| d.selecting()) {
                 "selecting a block — j/k to extend · c to comment on it · Esc to cancel".into()
             } else {
-                DIFF_HINT.into()
+                diff_footer(app)
             };
         }
         KeyCode::Char('j') | KeyCode::Down => move_diff_cursor(app, 1),
@@ -828,7 +835,28 @@ fn handle_diff_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char(']') => diff_nav(app, DiffView::next_file),
         KeyCode::Char('[') => diff_nav(app, DiffView::prev_file),
-        KeyCode::Char('n') => diff_nav(app, DiffView::next_hunk),
+        KeyCode::Char('/') => {
+            diff_nav(app, DiffView::start_search);
+            app.footer = search_footer(app);
+        }
+        KeyCode::Char('n') => {
+            if app.diff.as_ref().is_some_and(|d| d.search.is_some()) {
+                diff_nav(app, |d| {
+                    d.next_search_match(true);
+                });
+                app.footer = search_footer(app);
+            } else {
+                diff_nav(app, DiffView::next_hunk);
+            }
+        }
+        KeyCode::Char('N') => {
+            if app.diff.as_ref().is_some_and(|d| d.search.is_some()) {
+                diff_nav(app, |d| {
+                    d.next_search_match(false);
+                });
+                app.footer = search_footer(app);
+            }
+        }
         KeyCode::Char('p') => diff_nav(app, DiffView::prev_hunk),
         KeyCode::Char('c') | KeyCode::Enter => open_comment_editor(app),
         KeyCode::Char('x') => {
@@ -845,6 +873,34 @@ fn handle_diff_key(app: &mut App, key: KeyEvent) {
                 app.send(Request::Diff { worktree: d.worktree.clone() });
                 app.footer = "refreshing diff…".into();
             }
+        }
+        _ => {}
+    }
+}
+
+/// Keys captured by the `/` prompt in the diff pane.
+fn handle_diff_search_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            diff_nav(app, |d| {
+                d.clear_search();
+            });
+            app.footer = DIFF_HINT.into();
+        }
+        KeyCode::Enter => {
+            diff_nav(app, |d| {
+                d.finish_search();
+            });
+            app.footer = diff_footer(app);
+        }
+        KeyCode::Backspace if !ctrl => {
+            diff_nav(app, DiffView::pop_search);
+            app.footer = search_footer(app);
+        }
+        KeyCode::Char(c) if !ctrl => {
+            diff_nav(app, |d| d.push_search(c));
+            app.footer = search_footer(app);
         }
         _ => {}
     }
@@ -997,7 +1053,7 @@ fn handle_file_nav_key(app: &mut App, key: KeyEvent) {
 
 fn close_file_nav(app: &mut App) {
     diff_nav(app, DiffView::close_nav);
-    app.footer = DIFF_HINT.into();
+    app.footer = diff_footer(app);
 }
 
 /// Footer while the explorer is open: echo the filter as it's typed, since the
@@ -1011,6 +1067,33 @@ fn files_footer(app: &App) -> String {
             nav.total()
         ),
         _ => FILES_HINT.into(),
+    }
+}
+
+fn search_footer(app: &App) -> String {
+    let Some(search) = app.diff.as_ref().and_then(|d| d.search.as_ref()) else {
+        return DIFF_HINT.into();
+    };
+    let matches = app.diff.as_ref().map_or(0, DiffView::search_match_count);
+    let noun = if matches == 1 { "match" } else { "matches" };
+    if search.editing {
+        format!(
+            "SEARCH · /{}▏ · {matches} {noun} · Enter find · Esc cancel",
+            search.query
+        )
+    } else {
+        format!(
+            "DIFF · /{} · {matches} {noun} · n/N next/previous · Esc clear",
+            search.query
+        )
+    }
+}
+
+fn diff_footer(app: &App) -> String {
+    if app.diff.as_ref().is_some_and(|d| d.search.is_some()) {
+        search_footer(app)
+    } else {
+        DIFF_HINT.into()
     }
 }
 
@@ -1054,7 +1137,7 @@ fn handle_comment_key(app: &mut App, key: KeyEvent) {
             // the next movement isn't still dragging it.
             d.clear_selection();
         }
-        app.footer = DIFF_HINT.into();
+        app.footer = diff_footer(app);
         return;
     }
     let Some(ed) = app.comment_editor.as_mut() else {
@@ -1063,7 +1146,7 @@ fn handle_comment_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             app.comment_editor = None;
-            app.footer = DIFF_HINT.into();
+            app.footer = diff_footer(app);
         }
         // Enter is a newline here, not submit — Ctrl+S saves. A review comment
         // that can't span lines isn't worth much.
@@ -1092,7 +1175,7 @@ fn diff_status(app: &App, dropped: usize, skipped_untracked: usize) -> String {
     if app.diff.as_ref().is_some_and(|d| d.is_empty()) {
         return "no changes in this worktree".into();
     }
-    DIFF_HINT.into()
+    diff_footer(app)
 }
 
 fn toggle_editor(app: &mut App) {
@@ -1500,7 +1583,7 @@ fn focus_pane(app: &mut App, pane: ClickPane) {
         }
         ClickPane::Diff => {
             app.focus = Focus::Diff;
-            app.footer = DIFF_HINT.into();
+            app.footer = diff_footer(app);
         }
     }
 }
@@ -1986,10 +2069,14 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
         1 => format!(" diff — {} · 1 comment ", short_path(&d.worktree)),
         n => format!(" diff — {} · {n} comments ", short_path(&d.worktree)),
     };
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .border_style(border_style(focused));
+    if let Some(search) = d.search.as_ref() {
+        let caret = if search.editing { "▏" } else { "" };
+        block = block.title_bottom(format!(" /{}{caret} ", search.query));
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2010,18 +2097,38 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .skip(d.scroll)
         .take(inner.height as usize)
-        .map(|(i, row)| diff_row_line(d, *row, i == d.cursor && focused, d.is_selected(i)))
+        .map(|(i, row)| {
+            diff_row_line(
+                d,
+                *row,
+                i == d.cursor && focused,
+                d.is_selected(i),
+                d.is_search_match(i),
+            )
+        })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Render one row. Tabs are expanded because a raw `\t` in a ratatui `Line`
 /// collapses to a single cell and wrecks the diff's alignment.
-fn diff_row_line(d: &DiffView, row: DiffRow, at_cursor: bool, in_block: bool) -> Line<'static> {
+fn diff_row_line(
+    d: &DiffView,
+    row: DiffRow,
+    at_cursor: bool,
+    in_block: bool,
+    search_match: bool,
+) -> Line<'static> {
     // The cursor reverses; a row inside the pending block gets a band behind it,
-    // so the two read differently where they overlap.
+    // and search matches get their own highlight.
     let sel = |s: Style| {
-        let s = if in_block { s.bg(Color::Indexed(237)) } else { s };
+        let s = if search_match {
+            s.bg(Color::Indexed(58))
+        } else if in_block {
+            s.bg(Color::Indexed(237))
+        } else {
+            s
+        };
         if at_cursor {
             s.add_modifier(Modifier::REVERSED)
         } else {
@@ -4044,6 +4151,72 @@ diff --git a/src/a.rs b/src/a.rs
         assert!(d.cursor >= d.scroll && d.cursor < d.scroll + 4, "cursor off screen");
     }
 
+    // ---- diff text search ----
+
+    #[test]
+    fn slash_captures_a_query_and_enter_jumps_to_the_first_match() {
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, '/');
+        typed(&mut app, "LET");
+
+        let d = app.diff.as_ref().unwrap();
+        let search = d.search.as_ref().expect("search active");
+        assert!(search.editing);
+        assert_eq!(search.query, "LET");
+        assert_eq!(d.search_match_count(), 4);
+        assert!(app.footer.contains("4 matches"), "got: {}", app.footer);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        let d = app.diff.as_ref().unwrap();
+        assert!(!d.search.as_ref().unwrap().editing);
+        assert_eq!(d.line_at(d.cursor).unwrap().1.text, "let keep = 1;");
+        assert!(app.footer.contains("n/N next/previous"));
+    }
+
+    #[test]
+    fn search_input_swallows_bindings_and_n_and_shift_n_repeat_after_enter() {
+        let (mut app, _rx) = app_reviewing_many();
+        press(&mut app, '/');
+        typed(&mut app, "let");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        let first = app.diff.as_ref().unwrap().cursor;
+
+        press(&mut app, 'n');
+        let second = app.diff.as_ref().unwrap().cursor;
+        assert!(second > first);
+        press(&mut app, 'N');
+        assert_eq!(app.diff.as_ref().unwrap().cursor, first);
+
+        press(&mut app, '/');
+        typed(&mut app, "nfp");
+        let d = app.diff.as_ref().unwrap();
+        assert_eq!(d.search.as_ref().unwrap().query, "nfp");
+        assert!(!d.nav_open(), "f typed into search must not open the file rail");
+    }
+
+    #[test]
+    fn esc_clears_a_search_before_it_closes_the_diff() {
+        let (mut app, _rx) = app_reviewing();
+        press(&mut app, '/');
+        typed(&mut app, "added");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.diff.as_ref().unwrap().search.is_none());
+        assert!(app.diff_showing(), "first Esc only clears search");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(!app.diff_showing(), "second Esc closes the diff");
+    }
+
+    #[test]
+    fn the_search_prompt_renders_in_the_diff_border() {
+        let (mut app, _rx) = app_reviewing();
+        press(&mut app, '/');
+        typed(&mut app, "added");
+        let screen = render(&app, 120, 24).join("\n");
+        assert!(screen.contains("/added▏"), "search prompt missing:\n{screen}");
+    }
+
     // ---- the floating file explorer ----
 
     /// A diff over three files in two directories, for the explorer's tree.
@@ -4325,4 +4498,3 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(rx.try_recv().is_err(), "diff keys must not reach the daemon");
     }
 }
-

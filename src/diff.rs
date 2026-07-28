@@ -411,6 +411,15 @@ pub enum DiffRow {
     Comment { ci: usize, li: usize },
 }
 
+/// Vim-style text search over the rendered diff. `editing` is the command-line
+/// phase entered with `/`; once Enter commits it, the query stays active for
+/// highlighting and `n`/`N` repetition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffSearch {
+    pub query: String,
+    pub editing: bool,
+}
+
 /// One rendered/selectable row of the file explorer ([`FileNav`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileRow {
@@ -790,6 +799,9 @@ pub struct DiffView {
     /// than covering it — every diff row starts at the pane's left edge, so an
     /// overlay would hide the exact code you're navigating.
     pub nav: Option<FileNav>,
+    /// Active text search, retained after Enter so matches stay highlighted and
+    /// can be repeated with `n`/`N`.
+    pub search: Option<DiffSearch>,
 }
 
 impl DiffView {
@@ -804,6 +816,7 @@ impl DiffView {
             sel_start: None,
             comment_order: Vec::new(),
             nav: None,
+            search: None,
         };
         v.rebuild_rows();
         v
@@ -1036,6 +1049,121 @@ impl DiffView {
         self.jump(false, |r| {
             matches!(r, DiffRow::HunkHeader { .. } | DiffRow::FileHeader { .. })
         });
+    }
+
+    // ---- text search ----
+
+    /// Open a fresh `/` prompt. Search input is deliberately separate from the
+    /// explorer's path filter: whichever pane owns the keyboard owns `/`.
+    pub fn start_search(&mut self) {
+        self.search = Some(DiffSearch { query: String::new(), editing: true });
+    }
+
+    pub fn search_editing(&self) -> bool {
+        self.search.as_ref().is_some_and(|search| search.editing)
+    }
+
+    pub fn push_search(&mut self, c: char) {
+        if let Some(search) = self.search.as_mut()
+            && search.editing
+        {
+            search.query.push(c);
+        }
+    }
+
+    pub fn pop_search(&mut self) {
+        if let Some(search) = self.search.as_mut()
+            && search.editing
+        {
+            search.query.pop();
+        }
+    }
+
+    /// Commit the prompt and jump forward, wrapping like Vim. An empty prompt
+    /// simply disappears rather than leaving a search that can never match.
+    pub fn finish_search(&mut self) -> bool {
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+        search.editing = false;
+        if search.query.is_empty() {
+            self.search = None;
+            return false;
+        }
+        self.next_search_match(true)
+    }
+
+    /// Clear either an in-progress prompt or a committed search. Returns whether
+    /// there was a search layer for Esc to peel off.
+    pub fn clear_search(&mut self) -> bool {
+        self.search.take().is_some()
+    }
+
+    /// Whether this rendered row contains the active query. File paths, hunk
+    /// headers, source lines, and inline review comments all count because all
+    /// four are visible text in the diff pane.
+    pub fn is_search_match(&self, row: usize) -> bool {
+        let Some(search) = self.search.as_ref() else {
+            return false;
+        };
+        if search.query.is_empty() {
+            return false;
+        }
+        self.row_contains(row, &search.query.to_lowercase())
+    }
+
+    pub fn search_match_count(&self) -> usize {
+        (0..self.rows.len()).filter(|row| self.is_search_match(*row)).count()
+    }
+
+    /// Repeat an active search in either direction. Both directions wrap, and a
+    /// sole match may land back on the current row.
+    pub fn next_search_match(&mut self, forward: bool) -> bool {
+        let Some(query) = self.search.as_ref().map(|search| search.query.to_lowercase()) else {
+            return false;
+        };
+        if query.is_empty() || self.rows.is_empty() {
+            return false;
+        }
+
+        let found = if forward {
+            (self.cursor + 1..self.rows.len())
+                .chain(0..=self.cursor)
+                .find(|row| self.row_contains(*row, &query))
+        } else {
+            (0..self.cursor)
+                .rev()
+                .chain((self.cursor..self.rows.len()).rev())
+                .find(|row| self.row_contains(*row, &query))
+        };
+        if let Some(row) = found {
+            self.cursor = row;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn row_contains(&self, row: usize, lowercase_query: &str) -> bool {
+        let Some(row) = self.rows.get(row) else {
+            return false;
+        };
+        let text = match row {
+            DiffRow::FileHeader { fi } => self.files.get(*fi).map(|file| file.path.as_str()),
+            DiffRow::HunkHeader { fi, hi } => self
+                .files
+                .get(*fi)
+                .and_then(|file| file.hunks.get(*hi))
+                .map(|hunk| hunk.header.as_str()),
+            DiffRow::Line { fi, hi, li } => self
+                .files
+                .get(*fi)
+                .and_then(|file| file.hunks.get(*hi))
+                .and_then(|hunk| hunk.lines.get(*li))
+                .map(|line| line.text.as_str()),
+            DiffRow::Comment { ci, li } => self.comment_line(*ci, *li),
+        };
+        text.is_some_and(|text| text.to_lowercase().contains(lowercase_query))
     }
 
     /// Scroll the viewport the minimum amount needed to show the cursor.
@@ -1647,6 +1775,67 @@ diff --git a/a.rs b/a.rs
         let a = v.pending_anchor().unwrap();
         assert!(a.lines.iter().all(|l| !l.text.starts_with("@@")));
         assert_eq!(a.lines.len(), 2);
+    }
+
+    // ---- text search ----
+
+    #[test]
+    fn search_is_case_insensitive_and_covers_every_visible_row_kind() {
+        let mut v = view();
+        cursor_on(&mut v, "let new = 2;");
+        comment_here(&mut v, "Please REVIEW this");
+
+        for (query, expected) in [
+            ("SRC/A.RS", 1),
+            ("FN THING", 1),
+            ("LET", 5),
+            ("review", 1),
+        ] {
+            v.start_search();
+            for c in query.chars() {
+                v.push_search(c);
+            }
+            assert_eq!(v.search_match_count(), expected, "query {query}");
+        }
+    }
+
+    #[test]
+    fn search_repeats_in_both_directions_and_wraps() {
+        let raw = format!("{BASIC}{}", BASIC.replace("a.rs", "b.rs"));
+        let mut v = DiffView::new("/w".into(), &raw);
+        v.start_search();
+        for c in "extra".chars() {
+            v.push_search(c);
+        }
+
+        assert!(v.finish_search());
+        let first = v.cursor;
+        assert!(v.next_search_match(true));
+        let second = v.cursor;
+        assert!(second > first);
+        assert!(v.next_search_match(true));
+        assert_eq!(v.cursor, first, "forward search wraps");
+        assert!(v.next_search_match(false));
+        assert_eq!(v.cursor, second, "backward search wraps");
+    }
+
+    #[test]
+    fn an_empty_or_unmatched_search_does_not_move_the_cursor() {
+        let mut v = view();
+        v.cursor = 3;
+        v.start_search();
+        assert!(!v.finish_search());
+        assert!(v.search.is_none(), "empty search is discarded");
+
+        v.start_search();
+        for c in "not in this diff".chars() {
+            v.push_search(c);
+        }
+        assert!(!v.finish_search());
+        assert_eq!(v.cursor, 3);
+        assert_eq!(v.search_match_count(), 0);
+        assert!(v.clear_search());
+        assert!(!v.clear_search());
     }
 
     // ---- refresh / re-anchoring ----
