@@ -33,7 +33,7 @@ const LEFT_WIDTH: u16 = 34;
 const OLD_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
 
 const NAV_HINT: &str =
-    "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · x kill · Ctrl+] editor · Ctrl+G diff · q quit";
+    "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · x kill · Ctrl+H hide tree · Ctrl+] editor · Ctrl+G diff · q quit";
 const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor · Ctrl+G diff";
 const EDITOR_HINT: &str = "EDITOR · Ctrl+] hides it (keeps running) · Ctrl+H explorer";
 const DIFF_HINT: &str = "DIFF · j/k move · v block · c comment · x delete · s submit · f files · ]/[ file · n/p hunk · r refresh · Esc close";
@@ -184,6 +184,10 @@ struct App {
     seen_worktrees: HashSet<String>,
     /// When false, Claude sessions older than [`OLD_THRESHOLD_SECS`] are hidden.
     show_old: bool,
+    /// When true the tree column is given zero width and the right-hand pane
+    /// takes the whole screen. Purely a view state — the tree's contents and
+    /// fold state are untouched, so revealing it restores exactly what was there.
+    nav_hidden: bool,
     focus: Focus,
     attached: Option<SessionId>,
     parser: Option<vt100::Parser>,
@@ -304,6 +308,16 @@ impl App {
         self.editor.or(self.attached)
     }
 
+    /// Width of the tree column: [`LEFT_WIDTH`], or 0 while it's hidden.
+    ///
+    /// Every layout, hit-test and PTY-sizing path goes through this, so they
+    /// can't disagree about where the right-hand pane starts. Missing one is the
+    /// bug this exists to prevent: a stale `LEFT_WIDTH` in the mouse hit-test
+    /// would silently misroute clicks by 34 columns.
+    fn nav_width(&self) -> u16 {
+        if self.nav_hidden { 0 } else { LEFT_WIDTH }
+    }
+
     /// The focused terminal sub-pane for mouse routing:
     /// `(parser, origin_x, origin_y, cols, rows)`, accounting for the split.
     fn focused_terminal(&self) -> Option<(&vt100::Parser, u16, u16, u16, u16)> {
@@ -314,11 +328,11 @@ impl App {
             if self.editor_focused {
                 let (c, r) = inner_dims(ed_w, main_h);
                 // Editor inner origin: tree width + ai block width + editor's border.
-                let ox = LEFT_WIDTH + ai_w + 1;
+                let ox = self.nav_width() + ai_w + 1;
                 return self.editor_parser.as_ref().map(|p| (p, ox, 1, c, r));
             }
             let (c, r) = inner_dims(ai_w, main_h);
-            return self.parser.as_ref().map(|p| (p, LEFT_WIDTH + 1, 1, c, r));
+            return self.parser.as_ref().map(|p| (p, self.nav_width() + 1, 1, c, r));
         }
         let (c, r) = self.term_dims;
         let p = if self.editor.is_some() {
@@ -326,13 +340,16 @@ impl App {
         } else {
             self.parser.as_ref()
         };
-        p.map(|p| (p, LEFT_WIDTH + 1, 1, c, r))
+        p.map(|p| (p, self.nav_width() + 1, 1, c, r))
     }
 
     /// Which pane the column `col` falls in (for click-to-focus). Mirrors the
     /// draw layout: tree, then the terminal pane (split into ai|editor or single).
+    ///
+    /// A hidden nav needs no special case: its width is 0, so no column can land
+    /// in it and the tree is simply unclickable while hidden.
     fn pane_at(&self, col: u16) -> ClickPane {
-        if col < LEFT_WIDTH {
+        if col < self.nav_width() {
             return ClickPane::Tree;
         }
         if self.diff_showing() {
@@ -341,7 +358,7 @@ impl App {
         if self.split_active() {
             let right_w = self.term_dims.0.saturating_add(2);
             let (ai_w, _) = split_widths(right_w);
-            if col < LEFT_WIDTH + ai_w {
+            if col < self.nav_width() + ai_w {
                 ClickPane::TermAi
             } else {
                 ClickPane::TermEditor
@@ -497,6 +514,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
         collapsed: HashSet::new(),
         seen_worktrees: HashSet::new(),
         show_old: false,
+        nav_hidden: false,
         focus: Focus::Nav,
         attached: None,
         parser: None,
@@ -645,9 +663,12 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
         Event::Error { message } => {
             app.footer = format!("error: {message}");
             // If a re-attach failed and we have nothing to show, drop to the
-            // explorer rather than leaving the user in an empty terminal.
+            // explorer rather than leaving the user in an empty terminal. Keep the
+            // error in the footer — `focus_pane` would overwrite it with the hint.
             if app.parser.is_none() && app.editor.is_none() && !app.diff_showing() {
-                app.focus = Focus::Nav;
+                let error = std::mem::take(&mut app.footer);
+                focus_pane(app, ClickPane::Tree);
+                app.footer = error;
             }
         }
     }
@@ -738,8 +759,9 @@ fn close_diff(app: &mut App) {
         app.focus = Focus::Term;
         app.footer = TERM_HINT.into();
     } else {
-        app.focus = Focus::Nav;
-        app.footer = NAV_HINT.into();
+        // Nothing left on the right — fall back to the tree, revealing it if the
+        // diff was what we hid it for.
+        focus_pane(app, ClickPane::Tree);
     }
 }
 
@@ -759,8 +781,7 @@ fn handle_diff_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('d') => return move_diff_cursor(app, page),
             KeyCode::Char('u') => return move_diff_cursor(app, -page),
             KeyCode::Char('h') | KeyCode::Char('q') => {
-                app.focus = Focus::Nav;
-                app.footer = NAV_HINT.into();
+                focus_pane(app, ClickPane::Tree);
                 return;
             }
             _ => return,
@@ -1089,8 +1110,9 @@ fn toggle_editor(app: &mut App) {
             app.focus = Focus::Term;
             app.footer = TERM_HINT.into();
         } else {
-            app.focus = Focus::Nav;
-            app.footer = NAV_HINT.into();
+            // Same fall-back as `close_diff`: the right pane is now empty, so the
+            // tree has to come back rather than stay hidden and focused.
+            focus_pane(app, ClickPane::Tree);
         }
         return;
     }
@@ -1228,12 +1250,13 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
                 app.toggle_collapse_selected();
             }
         }
-        // Vim-style pane navigation: Ctrl+L moves into the terminal, Ctrl+H
-        // back to the explorer (a no-op here since we're already in it).
+        // Vim-style pane navigation: Ctrl+L moves into the terminal. Ctrl+H is
+        // "move further left" — there's nothing left of the tree, so it hides the
+        // tree instead and hands the whole width to the right-hand pane.
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             focus_terminal(app);
         }
-        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => hide_nav(app),
         KeyCode::Char(' ') => app.toggle_collapse_selected(),
         KeyCode::Char('z') => app.toggle_collapse_all(),
         KeyCode::Char('a') => {
@@ -1337,6 +1360,30 @@ fn focus_terminal(app: &mut App) {
     }
 }
 
+/// Hide the tree column and move into the right-hand pane, handing it the full
+/// terminal width. Revealing it again is [`focus_pane`] with [`ClickPane::Tree`]
+/// — the tree keeps its selection and fold state throughout, so this is purely a
+/// view change.
+///
+/// Refused when the right-hand pane has nothing in it: hiding the tree then would
+/// leave no usable pane at all, just an empty box and no obvious way back. Same
+/// shape as [`toggle_editor`]'s "select a worktree first" bail.
+fn hide_nav(app: &mut App) {
+    if app.attached.is_none() && app.editor.is_none() && !app.diff_showing() {
+        app.footer = "open a session first — nothing on the right to hide the tree for".into();
+        return;
+    }
+    app.nav_hidden = true;
+    // `Term` leaves `editor_focused` alone, so hiding mid-split keeps whichever
+    // side you were on and picks the matching footer hint.
+    let pane = if app.diff_showing() {
+        ClickPane::Diff
+    } else {
+        ClickPane::Term
+    };
+    focus_pane(app, pane);
+}
+
 /// Prompt for a name, then launch a fresh agent session (`claude` / `opencode`)
 /// in the selected worktree. A blank name gets a cute auto-generated one. It
 /// auto-opens when the daemon reports it created (see [`submit_prompt`]).
@@ -1409,12 +1456,11 @@ pub(crate) fn cute_name() -> String {
 
 fn handle_term_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // Ctrl+H (vim: move left) and Ctrl+Q return to the explorer. Everything
-    // else — including Ctrl+L (clear screen) and Ctrl+A (start of line) — is
-    // forwarded untouched to the session.
+    // Ctrl+H (vim: move left) and Ctrl+Q return to the explorer, revealing it if
+    // it was hidden. Everything else — including Ctrl+L (clear screen) and
+    // Ctrl+A (start of line) — is forwarded untouched to the session.
     if ctrl && matches!(key.code, KeyCode::Char('h') | KeyCode::Char('q')) {
-        app.focus = Focus::Nav;
-        app.footer = NAV_HINT.into();
+        focus_pane(app, ClickPane::Tree);
         return;
     }
     if let Some(bytes) = encode_key(&key) {
@@ -1422,10 +1468,15 @@ fn handle_term_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Switch focus to the clicked pane.
+/// Switch focus to `pane`. The single way focus moves between panes — clicks,
+/// the Ctrl+H/Ctrl+L chords, and the fall-backs taken when a pane closes all go
+/// through here, which is what keeps `Focus::Nav` and a visible nav in step.
 fn focus_pane(app: &mut App, pane: ClickPane) {
     match pane {
         ClickPane::Tree => {
+            // Focusing the tree always reveals it: a focused pane you can't see
+            // would swallow every keystroke with nothing on screen to explain why.
+            app.nav_hidden = false;
             app.focus = Focus::Nav;
             app.footer = NAV_HINT.into();
         }
@@ -1828,7 +1879,7 @@ fn sync_term_size(app: &mut App) {
     };
     // Mirror the draw layout: 1-line footer, left column, bordered right pane(s).
     let main_h = rows.saturating_sub(1);
-    let right_w = cols.saturating_sub(LEFT_WIDTH);
+    let right_w = cols.saturating_sub(app.nav_width());
     let full = inner_dims(right_w, main_h);
     app.term_dims = full;
 
@@ -1894,8 +1945,12 @@ fn draw(f: &mut Frame, app: &App) {
     let footer_area = vertical[1];
 
     let cols =
-        Layout::horizontal([Constraint::Length(LEFT_WIDTH), Constraint::Min(0)]).split(main);
-    draw_tree(f, app, cols[0]);
+        Layout::horizontal([Constraint::Length(app.nav_width()), Constraint::Min(0)]).split(main);
+    // Drawing into the zero-width rect would render nothing anyway; skipping just
+    // avoids rebuilding the whole item list every frame while it's hidden.
+    if !app.nav_hidden {
+        draw_tree(f, app, cols[0]);
+    }
     if app.diff_showing() {
         // The file rail takes a column off the diff rather than covering it.
         if app.diff.as_ref().is_some_and(|d| d.nav_open()) {
@@ -2636,6 +2691,7 @@ mod tests {
             collapsed: HashSet::new(),
             seen_worktrees: HashSet::new(),
             show_old: false,
+            nav_hidden: false,
             focus: Focus::Nav,
             attached: None,
             parser: None,
@@ -2880,6 +2936,66 @@ mod tests {
         handle_key(&mut app, ctrl('h'));
         assert_eq!(app.focus, Focus::Nav);
         assert!(rx.try_recv().is_err()); // nothing forwarded to the PTY
+    }
+
+    // ---- hiding the worktree nav ----
+
+    #[test]
+    fn ctrl_h_from_nav_hides_the_nav_and_focuses_the_terminal() {
+        let (mut app, _rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
+        app.attached = Some(7);
+        handle_key(&mut app, ctrl('h'));
+        assert!(app.nav_hidden);
+        assert_eq!(app.nav_width(), 0);
+        assert_eq!(app.focus, Focus::Term);
+    }
+
+    #[test]
+    fn ctrl_h_from_nav_does_nothing_with_nothing_attached() {
+        // No attachment, no editor, no diff: hiding would leave no usable pane.
+        let (mut app, _rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
+        handle_key(&mut app, ctrl('h'));
+        assert!(!app.nav_hidden);
+        assert_eq!(app.focus, Focus::Nav);
+    }
+
+    #[test]
+    fn ctrl_h_from_the_terminal_reveals_a_hidden_nav() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
+        app.attached = Some(7);
+        app.nav_hidden = true;
+        app.focus = Focus::Term;
+        handle_key(&mut app, ctrl('h'));
+        assert!(!app.nav_hidden);
+        assert_eq!(app.focus, Focus::Nav);
+        assert!(rx.try_recv().is_err()); // still not forwarded to the PTY
+    }
+
+    #[test]
+    fn a_hidden_nav_cannot_be_clicked() {
+        let (mut app, _rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
+        app.attached = Some(7);
+        assert_eq!(app.pane_at(0), ClickPane::Tree);
+        app.nav_hidden = true;
+        app.focus = Focus::Term;
+        assert_eq!(app.pane_at(0), ClickPane::Term);
+    }
+
+    #[test]
+    fn hiding_the_nav_moves_the_terminal_pane_to_the_left_edge() {
+        // The layout assertion that needs no real terminal: every consumer of the
+        // tree width has to agree, so a missed `LEFT_WIDTH` shows up as a pane
+        // origin still 34 columns in.
+        let (mut app, _rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
+        app.attached = Some(7);
+        app.parser = Some(vt100::Parser::new(24, 80, 0));
+        app.focus = Focus::Term;
+        let (_, ox, ..) = app.focused_terminal().expect("a focused terminal");
+        assert_eq!(ox, LEFT_WIDTH + 1);
+
+        app.nav_hidden = true;
+        let (_, ox, ..) = app.focused_terminal().expect("a focused terminal");
+        assert_eq!(ox, 1);
     }
 
     #[test]
@@ -3827,6 +3943,49 @@ diff --git a/src/a.rs b/src/a.rs
         assert!(screen.contains("11 +"), "new-side line number missing");
         assert!(screen.contains("┃ hoist this"), "inline comment missing");
         assert!(screen.contains("1 comment"), "title count missing");
+    }
+
+    #[test]
+    fn a_hidden_nav_gives_its_columns_to_the_terminal_pane() {
+        let (mut app, _rx) = app_with_rx(vec![wt("/r/mybranch", vec![sess(7, "s")], vec![])]);
+        app.attached = Some(7);
+        app.parser = Some(vt100::Parser::new(24, 80, 0));
+        app.focus = Focus::Term;
+        app.collapsed.clear();
+
+        // Shown: two bordered blocks on the top row, and the branch is on screen.
+        let shown = render(&app, 120, 10);
+        assert!(
+            shown.join("\n").contains("mybranch"),
+            "tree missing while shown:\n{}",
+            shown.join("\n")
+        );
+        assert_eq!(
+            shown[0].matches('┌').count(),
+            2,
+            "expected a tree block and a terminal block:\n{}",
+            shown[0]
+        );
+
+        // Hidden: one block spanning the full width, and no trace of the tree.
+        app.nav_hidden = true;
+        let hidden = render(&app, 120, 10);
+        assert!(
+            !hidden.join("\n").contains("mybranch"),
+            "tree still drawn while hidden:\n{}",
+            hidden.join("\n")
+        );
+        assert_eq!(
+            hidden[0].matches('┌').count(),
+            1,
+            "expected a single full-width block:\n{}",
+            hidden[0]
+        );
+        assert!(
+            hidden[0].starts_with('┌') && hidden[0].ends_with('┐'),
+            "the terminal block should span the whole width:\n{}",
+            hidden[0]
+        );
     }
 
     #[test]

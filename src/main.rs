@@ -152,7 +152,7 @@ fn print_help() {
          asm kill <id> · asm rename <id> <name> · asm refresh\n  \
          asm new-worktree <branch> · asm rm-worktree <path> [--force]\n\n\
          KEYS (nav):    j/k move · Space fold · Enter open · c new claude · o new opencode · n shell · w new worktree · x kill · d rm worktree · r refresh · R rename · a show old · q quit\n  \
-         PANES:         Ctrl+L  focus terminal · Ctrl+H (or Ctrl+Q)  focus explorer · Ctrl+]  split editor · Ctrl+G  diff review\n  \
+         PANES:         Ctrl+L  focus terminal · Ctrl+H  hide the tree (from the explorer) / show + focus it (from a pane) · Ctrl+Q  focus explorer · Ctrl+]  split editor · Ctrl+G  diff review\n  \
          KEYS (term):   all other keys go to the session (Ctrl+L clears the screen there)"
     );
 }

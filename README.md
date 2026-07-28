@@ -96,6 +96,7 @@ Run it from inside a git repository.
 | `d` | remove the selected worktree (not the root) |
 | `r` | force refresh (also runs `git worktree prune`) |
 | `R` | rename the selected session |
+| `Ctrl+H` | **hide the tree** and move into the right-hand pane, which takes the full width (`Ctrl+H` there brings it back) |
 | `Ctrl+]` | toggle the **split-view editor** for the current worktree |
 | `Ctrl+G` | toggle the **diff review** pane for the current worktree |
 | `q` | quit the TUI (sessions keep running in the daemon) |
@@ -224,11 +225,20 @@ how many.
 | key | action |
 |-----|--------|
 | `Ctrl+L` | focus the terminal (from the explorer) |
-| `Ctrl+H` | focus the explorer (from the terminal); `Ctrl+Q` also works |
+| `Ctrl+H` | from the terminal or diff: show + focus the explorer (`Ctrl+Q` also works). From the explorer: **hide** it |
+
+`Ctrl+H` reads as "move left" in both directions. There is nothing to the left of
+the explorer, so pressing it there hides the tree instead and gives its 34 columns
+to the terminal or diff — useful on a narrow window, or when an agent is printing
+something wide. Pressing `Ctrl+H` in that pane brings the tree back with its
+selection and folds intact. The tree is never hidden while focused, so you can't
+end up typing into a pane you can't see; it's also refused when there's nothing on
+the right yet, since that would leave no usable pane at all.
 
 You can also **click a pane to focus it** — the tree, or (in the split) the AI
 side vs the editor side. The first click just moves focus; clicks inside the
-already-focused pane pass through to the app as normal.
+already-focused pane pass through to the app as normal. A hidden tree isn't
+clickable — it has no width — so `Ctrl+H` is the way back.
 
 ### Keys — terminal focus
 
