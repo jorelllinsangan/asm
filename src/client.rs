@@ -12,8 +12,9 @@ use crate::protocol::{
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -130,6 +131,13 @@ impl CommentEditor {
         self.cursor += c.len_utf8();
     }
 
+    /// Insert a whole pasted block. Newlines are kept — the popup is multi-line,
+    /// and `Enter` inserts one here too — so a pasted snippet arrives intact.
+    fn insert_str(&mut self, s: &str) {
+        self.body.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
     fn backspace(&mut self) {
         if let Some(prev) = self.body[..self.cursor].chars().next_back() {
             self.cursor -= prev.len_utf8();
@@ -165,6 +173,9 @@ impl CommentEditor {
 enum Msg {
     Daemon(Event),
     Key(KeyEvent),
+    /// A bracketed paste from the host terminal, arriving as one whole block
+    /// rather than as the key-by-key stream it would be without the mode on.
+    Paste(String),
     Mouse(MouseEvent),
     Resize,
     /// A frame arrived that this build can't decode (daemon newer than client).
@@ -489,6 +500,14 @@ pub async fn run(root: PathBuf) -> Result<()> {
                             break;
                         }
                     }
+                    // Only ever delivered because we asked the host terminal for
+                    // bracketed paste; without that this same text arrives as
+                    // individual keys, newlines included (see `EnableBracketedPaste`).
+                    Ok(CtEvent::Paste(text)) => {
+                        if msg_tx.send(Msg::Paste(text)).is_err() {
+                            break;
+                        }
+                    }
                     Ok(CtEvent::Mouse(m)) => {
                         if msg_tx.send(Msg::Mouse(m)).is_err() {
                             break;
@@ -534,9 +553,14 @@ pub async fn run(root: PathBuf) -> Result<()> {
     app.send(Request::Hello);
 
     let mut terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // Bracketed paste is not a nicety: without it the host terminal replays a
+    // paste as keystrokes, so every newline in the pasted text reaches the
+    // session as Enter and an agent chat fires on the first line. With it on,
+    // crossterm hands us the block whole (`Msg::Paste`) and we re-wrap it for
+    // whichever app is receiving it (`paste_bytes`).
+    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let result = event_loop(&mut terminal, &mut app, &mut msg_rx).await;
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     if let Some(msg) = app.exit_message.as_deref() {
         eprintln!("\nasm: {msg}");
@@ -556,6 +580,7 @@ async fn event_loop(
         match msg {
             Msg::Daemon(ev) => handle_daemon_event(app, ev),
             Msg::Key(k) => handle_key(app, k),
+            Msg::Paste(text) => handle_paste(app, &text),
             Msg::Mouse(m) => handle_mouse(app, m),
             Msg::Resize => sync_term_size(app),
             Msg::UnknownEvent(e) => {
@@ -704,6 +729,74 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Focus::Term => handle_term_key(app, key),
         Focus::Diff => handle_diff_key(app, key),
     }
+}
+
+/// Route a pasted block to whatever is taking text right now, mirroring
+/// [`handle_key`]'s dispatch order.
+///
+/// Every text surface has to be listed here: with bracketed paste on, a paste no
+/// longer arrives as keys, so a surface left out would silently swallow it.
+/// The single-line surfaces take only the first line — see [`first_line`].
+fn handle_paste(app: &mut App, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(ed) = app.comment_editor.as_mut() {
+        ed.insert_str(text);
+        return;
+    }
+    if let Some(prompt) = app.prompt.as_mut() {
+        prompt.input.push_str(first_line(text));
+        return;
+    }
+    match app.focus {
+        Focus::Term => paste_into_session(app, text),
+        Focus::Diff => paste_into_diff(app, text),
+        // Nothing in the tree takes text; say so rather than drop it silently.
+        Focus::Nav => app.footer = "nothing here takes a paste — focus a session first".into(),
+    }
+}
+
+/// The filter and the search box are the diff pane's only text surfaces; a paste
+/// anywhere else in it has nowhere to go.
+fn paste_into_diff(app: &mut App, text: &str) {
+    let line = first_line(text);
+    if let Some(nav) = app.diff.as_mut().and_then(|d| d.nav.as_mut()) {
+        if nav.filtering {
+            for c in line.chars() {
+                nav.push_filter(c);
+            }
+            app.footer = files_footer(app);
+        }
+        return;
+    }
+    if app.diff.as_ref().is_some_and(DiffView::search_editing) {
+        diff_nav(app, |d| {
+            for c in line.chars() {
+                d.push_search(c);
+            }
+        });
+        app.footer = search_footer(app);
+    }
+}
+
+/// Forward a paste to the focused session's PTY, re-wrapped for that app.
+fn paste_into_session(app: &mut App, text: &str) {
+    let bracketed = app
+        .focused_terminal()
+        .is_some_and(|(p, ..)| p.screen().bracketed_paste());
+    let bytes = paste_bytes(text, bracketed);
+    if !bytes.is_empty() {
+        send_input(app, &bytes);
+    }
+}
+
+/// A paste flattened for a single-line input. Taking the first line beats
+/// joining them: a name or a search query built from a whole pasted paragraph is
+/// never what was meant, and the trailing newline that comes with a copied line
+/// would otherwise land in the value.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("")
 }
 
 /// Toggle the diff review pane for the current worktree.
@@ -1245,12 +1338,19 @@ fn review_target(app: &App, worktree: &str) -> Result<SessionId, &'static str> {
 /// Without bracketed paste every `\n` reads as Enter: the agent would fire on
 /// the first line and treat the rest as separate follow-up prompts. All three
 /// agent CLIs turn the mode on, so the unwrapped branch is a last resort.
+/// `bracketed` must come from the *receiving* session's emulator, never assumed.
 ///
-/// No trailing newline is sent either way — the review lands in the agent's
-/// input box and the user presses Enter themselves. Auto-submitting into an
-/// agent that happens to be mid-turn is how a review gets swallowed.
+/// No trailing newline is sent either way — the text lands in the agent's input
+/// box and the user presses Enter themselves. Auto-submitting into an agent that
+/// happens to be mid-turn is how a review (or a pasted prompt) gets swallowed,
+/// and it's what a copied line's trailing newline would do on its own.
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    let text = text.trim_end();
+    // Only the line endings go: trailing spaces can be meaningful inside a
+    // pasted code block, and the review text has none to lose.
+    let text = text.trim_end_matches(['\r', '\n']);
+    if text.is_empty() {
+        return Vec::new();
+    }
     if bracketed {
         format!("\x1b[200~{text}\x1b[201~").into_bytes()
     } else {
@@ -3861,6 +3961,154 @@ diff --git a/src/a.rs b/src/a.rs
             let payload = s.trim_start_matches("\x1b[200~").trim_end_matches("\x1b[201~");
             assert_eq!(payload, "body");
         }
+    }
+
+    #[test]
+    fn paste_keeps_the_trailing_indentation_of_a_pasted_block() {
+        // Only line endings are stripped: a code block's last line may end in
+        // significant whitespace.
+        let s = String::from_utf8(paste_bytes("    indented   \n", true)).unwrap();
+        assert!(s.contains("    indented   "), "got: {s:?}");
+    }
+
+    // ---- pasting into the app ----
+
+    /// An app attached to an agent session whose emulator was rebuilt from an
+    /// attach snapshot — including the bracketed-paste mode the agent had on.
+    fn app_pasting() -> (App, mpsc::UnboundedReceiver<Request>) {
+        let (mut app, rx) = app_with_rx(vec![wt("/r/a", vec![claude_sess(1, "claude")], vec![])]);
+        app.focus = Focus::Term;
+        handle_daemon_event(
+            &mut app,
+            Event::Attached { id: 1, scrollback: b"\x1b[?2004h> ".to_vec() },
+        );
+        (app, rx)
+    }
+
+    fn next_input(rx: &mut mpsc::UnboundedReceiver<Request>) -> String {
+        loop {
+            match rx.try_recv() {
+                Ok(Request::Input { data, .. }) => return String::from_utf8(data).unwrap(),
+                Ok(_) => continue,
+                Err(e) => panic!("expected Input, got {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pasted_block_reaches_the_session_wrapped_instead_of_line_by_line() {
+        // The bug: pasted newlines arrived as Enter, so the agent sent the
+        // message on the first line of the paste.
+        let (mut app, mut rx) = app_pasting();
+        handle_paste(&mut app, "first line\nsecond line\n");
+        let sent = next_input(&mut rx);
+        assert_eq!(sent, "\x1b[200~first line\nsecond line\x1b[201~");
+        assert!(!sent.ends_with('\n'), "a trailing newline would send it");
+    }
+
+    #[test]
+    fn an_attach_snapshot_without_bracketed_paste_pastes_raw() {
+        // vi and friends never turn the mode on; the block still has to arrive,
+        // just unwrapped — and still without the newline that would submit it.
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "vi")], vec![])]);
+        app.focus = Focus::Term;
+        handle_daemon_event(&mut app, Event::Attached { id: 1, scrollback: b"~ ".to_vec() });
+        handle_paste(&mut app, "a\nb\n");
+        assert_eq!(next_input(&mut rx), "a\nb");
+    }
+
+    #[test]
+    fn a_paste_goes_to_the_focused_half_of_the_split() {
+        let (mut app, mut rx) = app_pasting();
+        app.editor = Some(9);
+        app.editor_focused = true;
+        handle_daemon_event(
+            &mut app,
+            Event::Attached { id: 9, scrollback: b"editor".to_vec() },
+        );
+        handle_paste(&mut app, "text");
+        loop {
+            match rx.try_recv() {
+                Ok(Request::Input { id, data }) => {
+                    assert_eq!(id, 9, "the editor is focused, not the agent");
+                    // The editor's own emulator has bracketed paste off.
+                    assert_eq!(String::from_utf8(data).unwrap(), "text");
+                    return;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("expected Input, got {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pasting_into_the_comment_editor_keeps_the_block_intact() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        handle_paste(&mut app, "why not\nthis instead\n");
+        let ed = app.comment_editor.as_ref().expect("still editing");
+        assert_eq!(ed.body, "why not\nthis instead\n");
+        assert_eq!(ed.cursor, ed.body.len());
+    }
+
+    #[test]
+    fn pasting_into_the_comment_editor_lands_at_the_cursor() {
+        let (mut app, _rx) = app_reviewing();
+        cursor_on_line(&mut app, "let added = 2;");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        handle_paste(&mut app, "tail");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left));
+        handle_paste(&mut app, "X");
+        assert_eq!(app.comment_editor.as_ref().unwrap().body, "taiXl");
+    }
+
+    #[test]
+    fn a_paste_into_a_prompt_takes_only_its_first_line() {
+        // The footer prompt is single-line, so the rest would be invisible — and
+        // a copied line's trailing newline must not name the session.
+        let mut app = app_with(vec![wt("/r/a", vec![], vec![])]);
+        app.prompt = Some(Prompt {
+            kind: PromptKind::NewSession { worktree: "/r/a".into() },
+            label: "name".into(),
+            input: "pre-".into(),
+        });
+        handle_paste(&mut app, "my-branch\nnoise\n");
+        assert_eq!(app.prompt.as_ref().unwrap().input, "pre-my-branch");
+    }
+
+    #[test]
+    fn a_paste_extends_the_diff_search_query() {
+        let (mut app, _rx) = app_reviewing();
+        app.focus = Focus::Diff;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('/')));
+        handle_paste(&mut app, "added\nignored");
+        let search = app.diff.as_ref().unwrap().search.as_ref().expect("searching");
+        assert_eq!(search.query, "added");
+        assert!(search.editing, "still composing the query");
+    }
+
+    #[test]
+    fn a_paste_extends_the_file_rail_filter_only_while_filtering() {
+        let (mut app, _rx) = app_reviewing();
+        app.focus = Focus::Diff;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('f')));
+        // Not filtering yet: the rail's letters are bindings, so a paste has
+        // nowhere to go and must not become a filter.
+        handle_paste(&mut app, "a.rs");
+        assert_eq!(app.diff.as_ref().unwrap().nav.as_ref().unwrap().filter, "");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('/')));
+        handle_paste(&mut app, "a.rs\nmore");
+        assert_eq!(app.diff.as_ref().unwrap().nav.as_ref().unwrap().filter, "a.rs");
+    }
+
+    #[test]
+    fn a_paste_into_the_tree_is_reported_rather_than_swallowed() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "s")], vec![])]);
+        app.focus = Focus::Nav;
+        handle_paste(&mut app, "some text");
+        assert!(rx.try_recv().is_err(), "nothing forwarded");
+        assert!(app.footer.contains("nothing here takes a paste"), "got: {}", app.footer);
     }
 
     // ---- navigation ----

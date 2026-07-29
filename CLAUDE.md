@@ -114,9 +114,38 @@ calls `broadcast_tree()` immediately for responsiveness.
 the broadcast channel while holding the `SessionShared` lock. `reader_loop`
 processes bytes into the parser and sends to the channel under the *same* lock.
 This makes the (snapshot, subscription) boundary atomic, so no output bytes are
-lost or duplicated across the handoff. The snapshot also re-emits the app's
-active mouse-mode escape sequences (`mouse_mode_setup`), which
-`contents_formatted` omits.
+lost or duplicated across the handoff.
+
+The snapshot also re-emits the app's active **input modes**
+(`input_mode_setup`, a thin wrapper over vt100's `input_mode_formatted`), which
+`contents_formatted` omits. The client rebuilds its emulator from the snapshot
+alone on every `Attached`, then reads two of those modes back off it to decide
+how to *send* input, so a mode missing here silently degrades the client:
+mouse mode/encoding gates mouse forwarding, and bracketed paste gates paste
+wrapping (see below). Hand-rolling this list is how bracketed paste got left out
+of it — pinned now by `an_attach_snapshot_carries_the_apps_bracketed_paste_mode`.
+
+### Pasting (bracketed paste, both ends)
+
+The client asks the *host* terminal for bracketed paste
+(`EnableBracketedPaste` beside `EnableMouseCapture`). Without it the terminal
+replays a paste as keystrokes, so every newline in the pasted text reaches the
+session as Enter — pasting a block into an agent chat sends it on line one and
+files the rest as follow-up prompts.
+
+With the mode on, a paste arrives whole as `CtEvent::Paste` → `Msg::Paste` →
+`handle_paste`, which mirrors `handle_key`'s dispatch order. **Every text
+surface has to be listed there** — the comment popup, the footer prompt, the
+diff search box, the file-rail filter — because a paste no longer arrives as
+keys, so a surface left out swallows it. Single-line surfaces take `first_line`
+only; the comment popup keeps the newlines (it is multi-line, and `Enter`
+inserts one there too).
+
+Pastes bound for a PTY go through `paste_bytes`, the same helper the review
+submission uses: it re-wraps in `ESC[200~`/`ESC[201~` **only if the receiving
+session's own emulator has the mode on** (never assumed — that's the value the
+attach snapshot has to preserve), and it never sends a trailing newline, since
+that alone is enough to submit whatever landed.
 
 ### Split-view editor (two live streams on one connection)
 

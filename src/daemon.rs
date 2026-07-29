@@ -275,8 +275,8 @@ impl Daemon {
     /// Snapshot the current screen and subscribe to live output atomically
     /// w.r.t. the reader thread (which processes + sends while holding `shared`),
     /// so no bytes are lost or duplicated across the handoff. The snapshot is
-    /// the emulator's current screen plus the mouse-mode setup the app enabled
-    /// (which `contents_formatted` omits) so the client can forward mouse input.
+    /// the emulator's current screen plus the input modes the app enabled
+    /// (which `contents_formatted` omits) — see [`input_mode_setup`].
     fn attach(&self, id: SessionId) -> Option<(Vec<u8>, broadcast::Receiver<Vec<u8>>)> {
         let s = self.sessions.lock().unwrap().get(&id).cloned()?;
         let shared = s.shared.lock().unwrap();
@@ -284,7 +284,7 @@ impl Daemon {
         shared.bell.store(false, Ordering::Relaxed);
         let rx = s.output_tx.subscribe();
         let screen = shared.parser.screen();
-        let mut snapshot = mouse_mode_setup(screen);
+        let mut snapshot = input_mode_setup(screen);
         snapshot.extend_from_slice(&screen.contents_formatted());
         Some((snapshot, rx))
     }
@@ -973,26 +973,20 @@ fn reader_loop(
     }
 }
 
-/// Terminal escape sequences to re-enable the mouse mode/encoding an app had
-/// active — `contents_formatted` does not include them, but the client needs
-/// them to decide whether to forward mouse input.
-fn mouse_mode_setup(screen: &vt100::Screen) -> Vec<u8> {
-    use vt100::MouseProtocolEncoding as E;
-    use vt100::MouseProtocolMode as M;
-    let mut out = Vec::new();
-    match screen.mouse_protocol_mode() {
-        M::None => {}
-        M::Press => out.extend_from_slice(b"\x1b[?9h"),
-        M::PressRelease => out.extend_from_slice(b"\x1b[?1000h"),
-        M::ButtonMotion => out.extend_from_slice(b"\x1b[?1002h"),
-        M::AnyMotion => out.extend_from_slice(b"\x1b[?1003h"),
-    }
-    match screen.mouse_protocol_encoding() {
-        E::Default => {}
-        E::Utf8 => out.extend_from_slice(b"\x1b[?1005h"),
-        E::Sgr => out.extend_from_slice(b"\x1b[?1006h"),
-    }
-    out
+/// Terminal escape sequences to re-establish the input modes an app has active —
+/// `contents_formatted` carries only the visible cells, so a client that rebuilds
+/// its emulator from a snapshot alone believes every mode is off.
+///
+/// The client reads two of these back off its own parser and would get the
+/// forwarding decision wrong without them: the mouse mode/encoding (whether to
+/// forward mouse events at all) and **bracketed paste** (whether a pasted block
+/// can be wrapped, or has to go in raw with each newline acting as Enter — which
+/// makes an agent chat submit on the first line of the paste).
+///
+/// `input_mode_formatted` is vt100's own rendering of that mode set, so a mode
+/// added upstream is covered without this having to grow a new arm.
+fn input_mode_setup(screen: &vt100::Screen) -> Vec<u8> {
+    screen.input_mode_formatted()
 }
 
 /// Clamp requested terminal dimensions to something the emulator can hold.
@@ -1328,6 +1322,29 @@ mod tests {
             exited: false,
             bell,
         }
+    }
+
+    #[test]
+    fn an_attach_snapshot_carries_the_apps_bracketed_paste_mode() {
+        // The client rebuilds its emulator from the snapshot alone, and gates
+        // paste wrapping on the mode it finds there. Lose `?2004h` here and a
+        // pasted block goes to the agent raw, so its newlines read as Enter and
+        // the chat sends on the first line.
+        let sh = shared_fed(b"\x1b[?2004h\x1b[?1006h\x1b[?1002hclaude> ");
+        let setup = input_mode_setup(sh.parser.screen());
+        let seq = String::from_utf8(setup).unwrap();
+        assert!(seq.contains("\x1b[?2004h"), "bracketed paste lost: {seq:?}");
+        // The mouse mode/encoding the client also reads back must still be there.
+        assert!(seq.contains("\x1b[?1002h"), "mouse mode lost: {seq:?}");
+        assert!(seq.contains("\x1b[?1006h"), "mouse encoding lost: {seq:?}");
+    }
+
+    #[test]
+    fn an_attach_snapshot_reports_bracketed_paste_off_when_it_is_off() {
+        // A plain `vi` never turns it on; the client must not be told otherwise.
+        let sh = shared_fed(b"~ ");
+        let seq = String::from_utf8(input_mode_setup(sh.parser.screen())).unwrap();
+        assert!(!seq.contains("\x1b[?2004h"), "claimed bracketed paste: {seq:?}");
     }
 
     #[test]
