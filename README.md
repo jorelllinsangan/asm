@@ -91,13 +91,18 @@ Run it from inside a git repository.
 | `n` | new **shell** session in the selected worktree (prompts for a name; runs your login shell) |
 | `Space` | fold/unfold the selected worktree (`z` folds/unfolds all) |
 | `a` | toggle showing agent sessions older than 3 days (hidden by default) |
-| `w` | new worktree (prompts for a branch name; created as a sibling dir) |
+| `w` | new worktree (prompts for a branch name; created as a sibling dir). Files listed in the root's `.worktreeinclude` (`.gitignore` syntax) that git ignores — `.env` and the like — are copied in, as Claude Code does |
 | `x` | kill the selected session |
-| `d` | remove the selected worktree (not the root) |
+| `d` | remove the selected worktree (not the root); refused if it has local changes |
+| `D` | **force**-remove the selected worktree, discarding its uncommitted changes (type `yes` to confirm) |
+| `b` | put a new branch on a **detached** worktree's commit (prompts for the name) |
 | `r` | force refresh (also runs `git worktree prune`) |
 | `R` | rename the selected session |
+| `s` | toggle worktree order: **newest first** (default, by creation time; the root stays on top) or by name |
+| `e` | **widen the tree** to fit the longest name (names shown in full, up to 2/3 of the screen); `e` again restores the default width |
 | `Ctrl+H` | **hide the tree** and move into the right-hand pane, which takes the full width (`Ctrl+H` there brings it back) |
 | `Ctrl+]` | toggle the **split-view editor** for the current worktree |
+| `Ctrl+\` | toggle the **bottom terminal drawer** for the current worktree (see below) |
 | `Ctrl+G` | toggle the **diff review** pane for the current worktree |
 | `q` | quit the TUI (sessions keep running in the daemon) |
 
@@ -127,6 +132,23 @@ worktree, spawned on first use; it never shows up as a session in the tree.
 ```
 ASM_EDITOR=nvim asm
 ```
+
+### Terminal drawer
+
+`Ctrl+\` slides a shell up from the bottom of the right-hand pane, in the
+worktree of the session you're viewing (the diff's worktree from the diff, the
+selected one from the tree). It sits under whatever is showing — a session, the
+editor split, or a review — and works from any of them.
+
+- Closed: `Ctrl+\` opens it and focuses it.
+- Open but you're in another pane: `Ctrl+\` focuses it.
+- Open and focused: `Ctrl+\` hides it. The shell is **not** closed — like the
+  editor, it keeps running in the daemon (one per worktree, never shown in the
+  tree), so the next `Ctrl+\` returns to it with its history and any running
+  command intact. `exit` in it ends the shell; the next open starts a fresh one.
+
+Click above or below its top edge to move between the drawer and the pane above;
+`Ctrl+H` goes to the explorer as usual.
 
 ### Reviewing a diff
 
@@ -250,8 +272,39 @@ clickable — it has no width — so `Ctrl+H` is the way back.
 ### Keys — terminal focus
 
 Every keystroke is forwarded to the session **except** `Ctrl+H`/`Ctrl+Q` (which
-return to the explorer), so agent keybindings like `Ctrl+A` (start of line) and
+return to the explorer) and `Shift+PageUp`/`Shift+PageDown` (which page through
+the pane's scrollback), so agent keybindings like `Ctrl+A` (start of line) and
 `Ctrl+L` (clear screen) work normally.
+
+Keys are encoded the way the session's app asked for, as a real terminal would:
+
+- **Shift+Enter** inserts a newline in Claude Code and Codex. asm asks the host
+  terminal for the kitty keyboard protocol so it can see the Shift at all
+  (Ghostty, kitty, WezTerm, iTerm2, foot and Alacritty support it), then sends it
+  on as `CSI 13;2u` / modifyOtherKeys / `ESC CR`, whichever the app turned on.
+- Alt/Ctrl-modified arrows, `Alt+Backspace`, function keys, and
+  application-cursor mode (vim, less) are forwarded intact.
+- **Scrolling**: the wheel scrolls the pane's history when the app doesn't use
+  the mouse — including Codex's inline transcript. Over a full-screen app with no
+  mouse support (a pager) it sends arrow keys instead. The border says when
+  you're scrolled back; typing returns to the live screen. Scrollback survives
+  detaching and reattaching.
+- **Copy**: an app's OSC 52 clipboard write (e.g. Claude Code's copy) is relayed
+  to the host terminal.
+
+### Detached worktrees
+
+A worktree on a detached HEAD — every Codex-app worktree, anything mid-rebase —
+has no branch to show, so the tree labels it by what tells it apart:
+
+- mid-rebase: the branch being rebased, `feat/x (rebasing)`;
+- otherwise its directory (the parent directory when the name is just the repo's,
+  as in `~/.codex/worktrees/<id>/<repo>`) and short SHA, `13d6 @0864a77`, drawn
+  in yellow, followed by its agent session's name or title (or, failing that,
+  the commit subject).
+
+They sort below every branch worktree. `b` gives one a branch; `D` force-removes
+one whose leftover changes make `d` refuse.
 
 ## Build
 
@@ -283,21 +336,21 @@ live session natively. See `asm --help`.
 
 `asm` is two processes from one binary — the **TUI** (`asm`) and a long-lived
 background **daemon** (`asm daemon`) that owns every session. The daemon keeps
-running after you quit the TUI, and **rebuilding does not restart a
-daemon that's already running**, so which processes you need to bounce depends
-on what you changed:
+running after you quit the TUI, and rebuilding doesn't stop it. Instead, every
+client checks on connect that the daemon runs the same build it does
+(`asm --version` shows yours):
 
-| What you changed | What to do | Live sessions |
-|------------------|------------|---------------|
-| **TUI only** — tree rendering, key handling, layout, mouse | rebuild, quit the TUI (`q`), relaunch `asm` | **kept** — the old daemon stays up and reconnects |
-| **Daemon behavior** — session spawning (incl. the shell env), status heuristics, agent discovery, git ops | rebuild, restart the daemon, relaunch `asm` | **lost** — killing the daemon ends running sessions (agent conversations are on disk and resumable) |
-| **Wire protocol** — `protocol.rs` / `ipc.rs` | rebuild, restart the daemon **and** relaunch `asm` from the new binary | **lost** — client and daemon must be the same version; never mix old/new across the socket |
+| What you changed | What happens on relaunch | Live sessions |
+|------------------|--------------------------|---------------|
+| **TUI only** — `client.rs`, `cli.rs`, `diff.rs` | nothing to do; the TUI reconnects to the running daemon | **kept** |
+| **Anything the daemon runs** — spawning, status, discovery, git ops, the wire protocol, dependencies | a daemon with no live sessions is restarted from the new binary automatically; with live sessions the TUI asks first | **lost** if you say yes — agent conversations are on disk and resumable |
 
-Restart the daemon with:
+Headless subcommands (`asm tree`, `asm attach`, …) never end live sessions on
+their own: on a mismatch they warn on stderr and use the running daemon. Launch
+`asm` to restart it. As a manual reset:
 
 ```
-pkill -f 'asm daemon'     # stop the background server (ends live sessions)
-./target/release/asm      # relaunch — auto-spawns a fresh daemon from this binary
+pkill -f 'asm daemon'     # stops every repo's daemon (ends live sessions)
 ```
 
 Two gotchas:

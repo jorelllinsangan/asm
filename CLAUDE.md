@@ -35,12 +35,27 @@ This is the #1 dev footgun. The daemon is **long-lived and separate from the
 TUI**, and it's spawned from whatever binary the client was launched with
 (`current_exe()`). Consequences:
 
-- Rebuilding does **not** restart a daemon that's already running. A `cargo
-  build` + relaunch of the TUI reconnects to the *old* daemon still running old
-  code — the classic "my change didn't take effect."
+- Rebuilding does **not** restart a daemon that's already running. What catches
+  it is the **build handshake** (`handshake.rs`): every client connecting to an
+  existing daemon first sends `Request::Version` and compares the daemon's
+  `ASM_BUILD_ID` with its own. On a mismatch the daemon is replaced from the
+  client's binary — **silently if it has no live sessions**; otherwise the TUI
+  asks `[y/N]` before taking the screen, and headless subcommands only warn on
+  stderr (a front-end may have nobody at a prompt). Answer `n` and you're on the
+  old daemon, i.e. the classic "my change didn't take effect."
+- `ASM_BUILD_ID` (`build.rs`) hashes the sources the **daemon** runs — `src/`,
+  `vendor/`, `Cargo.{toml,lock}`, `build.rs` — minus a deny list of client-only
+  modules (`client.rs`, `cli.rs`, `diff.rs`), so a TUI-only change doesn't
+  prompt. A new module counts toward the id until it's added to that list; only
+  add one if nothing under `daemon::run` reaches it. `asm --version` prints the
+  build.
+- Daemons from before the handshake answer `Version` with an `Event::Error`;
+  `handshake::query` recognises that and counts their sessions from a tree.
+  The restart kills the daemon by the PID on the socket (`peer_cred`), so it
+  works on those old daemons too.
 - Quitting the TUI (`q`) does not stop the daemon; it keeps sessions alive.
 - If a global `asm` shadows `./target/release/asm`, the daemon runs the global
-  binary's code. Verify with `which asm`.
+  binary's code. Verify with `which asm` / `asm --version`.
 
 What each kind of change needs:
 
@@ -55,10 +70,12 @@ Restart recipe (also the always-safe "apply everything" flow):
 
 ```
 cargo build --release
-pkill -f 'asm daemon'     # ends live sessions; drops any open TUI's connection
-./target/release/asm      # relaunches; auto-spawns a fresh daemon from this binary
+./target/release/asm      # on a daemon-side change: prompts to restart the daemon (y ends live sessions)
 pgrep -fl 'asm daemon'    # confirm what's running (and spot stale daemons by start time)
 ```
+
+`pkill -f 'asm daemon'` still works as a manual reset, but it matches *every*
+repo's daemon — including one hosting the session you're working from.
 
 Spawn/env changes (e.g. `shell_argv`) apply only to **newly created** sessions;
 existing sessions keep the shell they were born with.
@@ -125,6 +142,75 @@ mouse mode/encoding gates mouse forwarding, and bracketed paste gates paste
 wrapping (see below). Hand-rolling this list is how bracketed paste got left out
 of it — pinned now by `an_attach_snapshot_carries_the_apps_bracketed_paste_mode`.
 
+**The snapshot also replays scrollback, the alternate screen, and keyboard
+modes** (`attach_snapshot`). Scrollback is re-printed row by row so it scrolls
+into the client emulator's own history (`scrollback_replay` pushes exactly the
+rows written — no blank rows ahead of them); `?1049h` is re-emitted so the client
+knows a full-screen app is up (the wheel turns into arrow keys there); and the
+kitty/modifyOtherKeys modes, which vt100 doesn't model, come from
+`SessionCallbacks::keys`. Each is pinned by an `an_attach_snapshot_*` test.
+
+### Terminal queries are answered by the daemon
+
+asm's emulators are the only terminal an app has, and vt100 has no write-back
+path, so a query nobody answers is one the app waits on. `SessionCallbacks`
+queues replies while parsing and `reader_loop` writes them to the PTY (outside
+the `shared` lock). Today that's the cursor position report (`CSI 6n` /
+`CSI ? 6n`): Codex sends it on every resize and stalls **2s** without an answer,
+which made every drawer open/close freeze it. Pinned by
+`a_cursor_position_query_is_answered_on_the_pty`. Codex also sends DA1, `CSI ?u`
+and OSC 10/11 at startup; those are still unanswered.
+
+### Keyboard (`keys.rs`) and the host terminal
+
+Shift+Enter is the motivating case: in the legacy encoding it's `\r`, identical to
+Enter, so an agent submits instead of inserting a newline. Two halves:
+
+- **Host → asm.** The client pushes kitty `DISAMBIGUATE_ESCAPE_CODES` to the host
+  terminal at startup (popped on exit), so crossterm can see the Shift at all.
+- **asm → app.** `KeyModes` tracks what the app asked for, fed from vt100's
+  `unhandled_csi` callback (`CSI > flags u` push, `CSI < n u` pop, `CSI = f;m u`,
+  `CSI > 4;n m`). It lives on **both** emulators: the daemon's (so the attach
+  snapshot can replay it) and the client's `TermCallbacks` (which
+  `keys::encode_key` reads, along with vt100's `application_cursor`). Encoding
+  prefers kitty → modifyOtherKeys → `ESC CR` for modified Enter; everything else
+  stays legacy unless legacy can't carry it.
+
+`keys.rs` is pure and unit-tested like `diff.rs`. `TermCallbacks` also queues
+OSC 52 clipboard writes, which `forward_clipboard` writes to the host's stdout
+after each draw.
+
+### vt100 is vendored (`vendor/vt100`, `[patch.crates-io]`)
+
+One change from 0.16.2, documented in `vendor/vt100/PATCHES.md`: rows scrolled
+off a scroll region anchored at the **top row** go to scrollback, as in xterm.
+Codex's inline UI prints its whole transcript through `ESC[1;Nr` regions, so
+upstream vt100 discarded all of it and Codex had no scrollback. It's a crate-wide
+patch because tui-term depends on vt100 too. Pinned by
+`history_scrolled_out_of_a_top_anchored_region_reaches_scrollback`.
+
+### `.worktreeinclude` on new worktrees
+
+`git::add_worktree` copies in the root worktree's `.worktreeinclude` files after
+`git worktree add` (`copy_worktree_includes`), with Claude Code's rule: a file is
+copied only if it matches a pattern there **and** the repo ignores it. Both tests
+are git's own — `ls-files --others --ignored --exclude-from=.worktreeinclude`,
+then `check-ignore --stdin` (whose exit 1 means "none ignored", not failure) — so
+pattern semantics are exactly `.gitignore`'s. Symlinks stay links; existing files
+are never overwritten. Copy failures don't fail the create: the daemon reports
+them as an `Error` after the tree push. These tests build real repos, like the
+review-base ones.
+
+### Detached worktrees
+
+`git::parse_porcelain` keeps each worktree's `HEAD`; for detached ones the daemon
+adds the commit subject (one batched `git log --no-walk --ignore-missing`, cached
+per SHA in `Daemon.subjects` so the 400ms tick doesn't respawn git) and, via
+plain file reads, the branch of an in-progress rebase (`git::rebasing_branch`).
+`branch` itself stays `(detached)` — the nvim plugin reads it — and the new
+`WorktreeInfo` fields are `#[serde(default)]`. `client::worktree_label` turns them
+into the row text; `b` (`Request::NameBranch`) runs `git switch -c` there.
+
 ### Pasting (bracketed paste, both ends)
 
 The client asks the *host* terminal for bracketed paste
@@ -167,6 +253,26 @@ in `OpenEditor`, since the daemon's env is frozen at spawn time. A `:q`'d editor
 becomes an exited ghost (no session reaper) — `open_editor` detects and respawns
 it. Split geometry lives in one helper (`split_widths`) used by both
 `draw_terminal` and `sync_term_size` so the two PTYs' dims never drift.
+
+### Bottom drawer terminal (a third stream)
+
+`Ctrl+\` (`toggle_drawer`) is the editor pattern again, as a bottom strip: a
+hidden per-worktree login shell (`Daemon::open_helper(Helper::Drawer, …)`),
+streamed on a **third** forward task (`drawer_task`, `Request::AttachDrawer` /
+`DetachDrawer`). The daemon's per-worktree cache is `helpers`, keyed by
+`(Helper, canonical path)`, so a worktree's editor and drawer never collide;
+the session flag that hides both from the tree is `hidden`.
+
+Client side, the drawer is **`Focus::Term` + `drawer_focused`**, not a new
+`Focus`, so key/paste/mouse routing all funnel through `focused_session_id` /
+`focused_parser_mut` / `focused_terminal` unchanged. That's why every "focus a
+session" path goes through `App::focus_term()` (clears `drawer_focused`) — a raw
+`app.focus = Focus::Term` would leave the drawer holding the keyboard. Geometry:
+`relayout` derives `term_dims` (the pane *above*) and `drawer_dims` from
+`right_outer` via `drawer_split`, the one helper `draw` also uses; mouse
+hit-testing is `pane_at_point` (row-aware), and the drawer's mouse origin is the
+pane's outer bottom + 1. The chord arrives as `Ctrl+'\\'` (kitty) or `Ctrl+'4'`
+(legacy `0x1C`), like `Ctrl+]`/`Ctrl+'5'`.
 
 ### Diff review (`diff.rs`) — the one feature that is *not* a PTY
 
@@ -389,6 +495,13 @@ mirroring the shell `n` flow; a blank name falls back to `cute_name()`
   filters; `tree_items` renders straight from the same `rows`. They must stay in
   lockstep — a folded worktree contributes zero child rows to both. There is a
   regression test for exactly this (`rendered_items_match_rows_when_folded`).
+- **Selection is kept by identity, not index.** `Row` is a set of indices into
+  `app.tree`, and the default newest-first order (`sort_by_age`; `s` toggles it off) reorders
+  the tree on toggle and on every push, since the daemon always sends its
+  own name order (`sort_worktrees`). `RowKey` names the selected item; take it
+  with `selected_key()` *before* `app.tree` changes, then `reorder(key)`. A key
+  read after the swap names whatever moved into the old slot. Age is
+  `WorktreeInfo::created_secs`, the directory's birthtime (`dir_birthtime`).
 - **Collapse state is preserved across tree pushes.** `seen_worktrees` records
   which worktrees have had the default (collapsed) state applied, so a refresh
   never re-collapses one the user expanded. New worktrees start collapsed unless

@@ -10,7 +10,9 @@ mod client;
 mod daemon;
 mod diff;
 mod git;
+mod handshake;
 mod ipc;
+mod keys;
 mod paths;
 mod protocol;
 
@@ -40,6 +42,10 @@ fn main() -> Result<()> {
         Some("daemon") => {
             let root = resolve_root()?;
             runtime()?.block_on(daemon::run(root))
+        }
+        Some("-V") | Some("--version") => {
+            println!("asm {} {}", env!("CARGO_PKG_VERSION"), handshake::BUILD_LABEL);
+            Ok(())
         }
         Some("-h") | Some("--help") => {
             print_help();
@@ -142,7 +148,8 @@ fn print_help() {
          USAGE:\n  \
          asm            launch the TUI (spawns the daemon if needed)\n  \
          asm daemon     run the background server in the foreground\n  \
-         asm --help     show this help\n\n\
+         asm --help     show this help\n  \
+         asm --version  show the build (compared against a running daemon's on connect)\n\n\
          HEADLESS (for front-ends like the neovim plugin; each spawns the daemon if needed):\n  \
          asm tree [--watch]                         tree snapshot(s) as newline-delimited JSON\n  \
          asm attach <id>                            raw byte pipe to a live session's PTY\n  \

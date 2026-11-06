@@ -12,6 +12,11 @@ pub type SessionId = u64;
 pub enum Request {
     /// Sent once on connect; daemon replies with a fresh [`Event::Tree`].
     Hello,
+    /// Ask which build the daemon is running; daemon replies [`Event::Version`].
+    /// The first thing a client sends (see [`crate::handshake`]). A daemon from
+    /// before this request existed answers with an [`Event::Error`] instead,
+    /// which is how the client recognises one.
+    Version,
     /// Force full reconciliation: prune dropped worktrees, drop caches, rescan
     /// agent sessions, and rebroadcast the tree.
     Refresh,
@@ -19,6 +24,8 @@ pub enum Request {
     CreateWorktree { branch: String },
     /// Remove a worktree (must not be the root).
     RemoveWorktree { path: String, force: bool },
+    /// Create `branch` at a detached worktree's HEAD and switch the worktree to it.
+    NameBranch { worktree: String, branch: String },
     /// Spawn a session (PTY) inside a worktree. Empty `command` => login shell.
     /// `agent` records which agent CLI this session runs (`None` for a shell),
     /// so the tree can show the right tool glyph.
@@ -50,6 +57,15 @@ pub enum Request {
     AttachEditor { id: SessionId, cols: u16, rows: u16 },
     /// Drop the secondary (editor) stream; leaves the primary attachment intact.
     DetachEditor,
+    /// Open (or reuse) the hidden per-worktree drawer terminal — a login shell in
+    /// `worktree` — for the `Ctrl+\` bottom drawer. Daemon replies
+    /// [`Event::DrawerOpened`].
+    OpenDrawer { worktree: String },
+    /// Begin streaming the drawer session on this connection's *third* slot,
+    /// independent of the primary and editor streams.
+    AttachDrawer { id: SessionId, cols: u16, rows: u16 },
+    /// Drop the drawer stream; its shell keeps running in the daemon.
+    DetachDrawer,
     /// Ask for the reviewable diff of `worktree` (see [`crate::git::review_diff`]).
     /// Daemon replies [`Event::Diff`].
     Diff { worktree: String },
@@ -78,6 +94,9 @@ pub enum Event {
     /// Reply to [`Request::OpenEditor`]: the editor session's id, ready to be
     /// streamed via [`Request::AttachEditor`].
     EditorOpened { id: SessionId },
+    /// Reply to [`Request::OpenDrawer`]: the drawer session's id, ready to be
+    /// streamed via [`Request::AttachDrawer`].
+    DrawerOpened { id: SessionId },
     /// Reply to [`Request::Diff`]: raw unified diff text, parsed client-side.
     /// `skipped_untracked` is non-zero when the untracked-file cap was hit.
     Diff {
@@ -87,6 +106,14 @@ pub enum Event {
         skipped_untracked: usize,
     },
     Error { message: String },
+    /// Reply to [`Request::Version`]. `build` is compared against the client's
+    /// own build id; `label` is only for showing a human which build is running;
+    /// `live` counts sessions that a restart would end (editors included).
+    Version {
+        build: String,
+        label: String,
+        live: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +121,22 @@ pub struct WorktreeInfo {
     pub path: String,
     pub branch: String,
     pub is_root: bool,
+    /// Abbreviated SHA of the checked-out commit. With `subject` and `rebasing`,
+    /// what the tree shows for a worktree whose `branch` is only `(detached)`.
+    /// All three are defaulted so an older daemon's tree still deserializes.
+    #[serde(default)]
+    pub head: String,
+    /// Subject line of the checked-out commit; filled for detached worktrees only.
+    #[serde(default)]
+    pub subject: String,
+    /// The branch being rebased, when a rebase has detached HEAD.
+    #[serde(default)]
+    pub rebasing: Option<String>,
+    /// When the worktree's directory was created, in seconds since the epoch;
+    /// drives the tree's newest-first sort. `None` where the filesystem doesn't
+    /// record a birthtime, or from an older daemon.
+    #[serde(default)]
+    pub created_secs: Option<u64>,
     /// Live PTY sessions asm is running in this worktree.
     pub sessions: Vec<SessionInfo>,
     /// Existing (on-disk, not currently live) Claude Code sessions for this

@@ -5,6 +5,9 @@ use crate::diff::{
     CommentAnchor, DiffRow, DiffView, FileNav, FileRow, FileStatus, LineKind, format_review,
 };
 use crate::ipc::{Frame as IpcFrame, read_frame, write_frame};
+use crate::keys::{self, KeyModes};
+use crate::git;
+use crate::handshake;
 use crate::paths;
 use crate::protocol::{
     AgentInfo, AgentTool, Event, Request, SessionId, SessionInfo, Status, WorktreeInfo,
@@ -13,8 +16,9 @@ use crate::protocol::{
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -22,6 +26,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,19 +35,35 @@ use tokio::sync::mpsc;
 use tui_term::widget::PseudoTerminal;
 
 const LEFT_WIDTH: u16 = 34;
+/// The most of the screen the widened tree (`e`) may take, in percent. The rest
+/// stays with the right-hand pane, so widening never hides the session.
+const NAV_WIDE_MAX_PCT: u16 = 66;
+/// Worktrees start newest-first; `s` flips to the daemon's name order. One
+/// const so the test `App` starts the way the real one does.
+const SORT_BY_AGE_DEFAULT: bool = true;
 /// Claude sessions inactive longer than this are hidden until toggled on.
 const OLD_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
 
 const NAV_HINT: &str =
-    "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · x kill · Ctrl+H hide tree · Ctrl+] editor · Ctrl+G diff · q quit";
-const TERM_HINT: &str = "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor · Ctrl+G diff";
+    "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · d/D rm worktree · x kill · s sort · e widen · Ctrl+H hide tree · Ctrl+] editor · Ctrl+\\ terminal · Ctrl+G diff · q quit";
+const TERM_HINT: &str =
+    "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor · Ctrl+\\ terminal · Ctrl+G diff";
+const DRAWER_HINT: &str =
+    "DRAWER · Ctrl+\\ hides it (keeps running) · Ctrl+H explorer · click above to leave it";
 const EDITOR_HINT: &str = "EDITOR · Ctrl+] hides it (keeps running) · Ctrl+H explorer";
 const DIFF_HINT: &str = "DIFF · j/k move · / search · v block · c comment · x delete · s submit · f files · ]/[ file · n/p hunk · r refresh · Esc close";
 const COMMENT_HINT: &str = "COMMENT · Enter newline · Ctrl+S save · Esc cancel (blank = delete)";
 const FILES_HINT: &str =
     "FILES · j/k move · Enter open · Space fold · / filter · f close · Esc back";
+/// Rows of scrollback each client-side session emulator keeps (matches the
+/// daemon's, which is what an attach snapshot replays).
+const CLIENT_SCROLLBACK: usize = 1000;
+/// Rows the wheel moves per notch, in scrollback and as arrow keys alike.
+const WHEEL_STEP: usize = 3;
 /// Fraction of the terminal pane width given to the editor in the split view.
 const EDITOR_SPLIT_PCT: u16 = 50;
+/// Fraction of the right-hand area's height the bottom drawer (`Ctrl+\`) takes.
+const DRAWER_PCT: u16 = 40;
 /// Gutter width for the `old new` line-number columns in the diff view.
 const GUTTER: usize = 11;
 
@@ -52,11 +73,20 @@ const GUTTER: usize = 11;
 /// `Ctrl+]` is the byte `0x1D`. crossterm's legacy (non-kitty) input decodes the
 /// `0x1C..=0x1F` range as `Ctrl+'4'..'7'`, so it reports `Ctrl+]` as `Ctrl+'5'`;
 /// a terminal running the kitty keyboard protocol would instead send `Ctrl+']'`.
-/// asm doesn't enable kitty flags, so in practice it's always `Ctrl+'5'` — accept
-/// both so the chord works regardless.
+/// asm asks the host for kitty flags (see [`run`]), so which one arrives depends
+/// on whether the host terminal supports the protocol — accept both.
 fn is_editor_toggle(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
+}
+
+/// The reserved chord for the bottom drawer terminal (see [`toggle_drawer`]).
+/// Same story as [`is_editor_toggle`]: `Ctrl+\` is the byte `0x1C`, which
+/// crossterm's legacy decoding reports as `Ctrl+'4'`, while a kitty-protocol
+/// host sends `Ctrl+'\\'` — accept both.
+fn is_drawer_toggle(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4'))
 }
 
 /// The reserved chord that toggles the diff review pane. Reserved for the same
@@ -65,6 +95,56 @@ fn is_editor_toggle(key: &KeyEvent) -> bool {
 /// `Ctrl+'g'` — none of the `Ctrl+]` legacy remapping applies.
 fn is_diff_toggle(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g'))
+}
+
+/// vt100 callbacks for a client-side session emulator.
+///
+/// `unhandled_csi` is where the keyboard-mode requests land (`CSI > 5 u`,
+/// `CSI > 4 ; 2 m`) — vt100 has no notion of them, but [`keys::encode_key`] has
+/// to know them to send Shift+Enter the way the app asked for it.
+///
+/// `copy_to_clipboard` is OSC 52: an app (Claude Code's copy, a remote vim) asking
+/// *its terminal* to set the clipboard. asm's emulator is that terminal, so it
+/// would otherwise swallow the request; queued here, it's re-sent to the host
+/// terminal by [`forward_clipboard`].
+#[derive(Default)]
+struct TermCallbacks {
+    keys: KeyModes,
+    clipboard: Vec<Vec<u8>>,
+}
+
+impl vt100::Callbacks for TermCallbacks {
+    fn unhandled_csi(
+        &mut self,
+        _: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        self.keys.on_csi(i1, params, c);
+    }
+
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        let mut seq = b"\x1b]52;".to_vec();
+        seq.extend_from_slice(ty);
+        seq.push(b';');
+        seq.extend_from_slice(data);
+        seq.push(0x07);
+        self.clipboard.push(seq);
+    }
+}
+
+/// A client-side session emulator.
+type Term = vt100::Parser<TermCallbacks>;
+
+fn new_term(rows: u16, cols: u16) -> Term {
+    vt100::Parser::new_with_callbacks(
+        rows.max(1),
+        cols.max(1),
+        CLIENT_SCROLLBACK,
+        TermCallbacks::default(),
+    )
 }
 
 /// Which pane keystrokes go to.
@@ -84,6 +164,8 @@ enum ClickPane {
     Term,
     TermAi,
     TermEditor,
+    /// The bottom drawer terminal, under whatever the right-hand pane shows.
+    Drawer,
     Diff,
 }
 
@@ -95,6 +177,16 @@ enum Row {
     Agent { wt: usize, ag: usize },
 }
 
+/// What a [`Row`] points at, by identity rather than position. A `Row` is a set
+/// of indices into `App::tree`, so it goes stale the moment the tree is
+/// reordered; this is what lets the selection follow its item instead.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum RowKey {
+    Worktree(String),
+    Session(SessionId),
+    Agent(String),
+}
+
 enum PromptKind {
     NewWorktree,
     /// A plain shell session; the input is its display name.
@@ -103,6 +195,11 @@ enum PromptKind {
     /// auto-generated one).
     NewAgent { worktree: String, tool: AgentTool },
     RenameSession { id: SessionId },
+    /// Put a branch on a detached worktree's HEAD; the input is the branch name.
+    NameBranch { worktree: String },
+    /// `git worktree remove --force`; the input must be `yes`, because this
+    /// throws away whatever uncommitted work the worktree holds.
+    ForceRemoveWorktree { path: String },
 }
 
 struct Prompt {
@@ -199,17 +296,46 @@ struct App {
     /// takes the whole screen. Purely a view state — the tree's contents and
     /// fold state are untouched, so revealing it restores exactly what was there.
     nav_hidden: bool,
+    /// When true the tree column grows to fit its widest row (names shown in
+    /// full, not truncated), up to [`NAV_WIDE_MAX_PCT`] of the screen. Like
+    /// `nav_hidden`, purely a view state; see [`App::nav_width`].
+    nav_wide: bool,
+    /// When true (the default) worktrees are ordered newest-created first; `s`
+    /// flips to the daemon's (root, then alphabetical) order. See [`sort_by_age`].
+    sort_by_age: bool,
+    /// Worktree paths in the order the daemon last sent them, so turning the
+    /// sort off restores that order without waiting for the next push.
+    daemon_order: Vec<String>,
+    /// The host terminal's width, cached by [`sync_term_size`]. Only the widened
+    /// tree reads it, to cap itself so the right-hand pane stays usable.
+    screen_cols: u16,
     focus: Focus,
     attached: Option<SessionId>,
-    parser: Option<vt100::Parser>,
+    parser: Option<Term>,
     /// The split-view editor session, when open. `Some` = the editor is shown;
     /// keystrokes route to it and it renders beside the AI session.
     editor: Option<SessionId>,
-    editor_parser: Option<vt100::Parser>,
+    editor_parser: Option<Term>,
     /// In the split, which side has keyboard focus: `true` = editor, `false` =
     /// the AI session. Only meaningful while the split is open.
     editor_focused: bool,
+    /// The bottom drawer terminal (`Ctrl+\`), when shown: a hidden per-worktree
+    /// daemon shell, streamed on the connection's third slot. Hiding it drops
+    /// only the stream — the shell keeps running, like the editor.
+    drawer: Option<SessionId>,
+    drawer_parser: Option<Term>,
+    /// The worktree the drawer's shell lives in, for its title.
+    drawer_worktree: Option<String>,
+    /// While focus is `Term`, the drawer — not the pane above it — has the
+    /// keyboard. See [`App::drawer_has_focus`].
+    drawer_focused: bool,
     term_dims: (u16, u16), // (cols, rows) of the terminal pane's inner area
+    /// (cols, rows) of the drawer's inner area; meaningful only while it's open.
+    drawer_dims: (u16, u16),
+    /// Outer (width, height) of the whole right-hand area — the terminal pane
+    /// plus the drawer under it — cached by [`sync_term_size`] so opening or
+    /// closing the drawer can lay out again without querying the terminal.
+    right_outer: (u16, u16),
     /// The parsed diff and its review comments. Retained while hidden so that
     /// an accidental `Ctrl+G` doesn't throw away a review in progress.
     diff: Option<DiffView>,
@@ -306,9 +432,28 @@ impl App {
         !self.diff_showing() && self.editor.is_some() && self.attached.is_some()
     }
 
-    /// The session that receives keystrokes: in the split, the active side; else
-    /// the editor when open, else the primary attachment.
+    /// Whether the drawer has the keyboard. Only while focus is `Term` — moving
+    /// to the tree or the diff leaves `drawer_focused` as it was, but it means
+    /// nothing until focus comes back.
+    fn drawer_has_focus(&self) -> bool {
+        self.focus == Focus::Term && self.drawer_focused && self.drawer.is_some()
+    }
+
+    /// Focus the terminal pane — the one *above* the drawer. Every path that
+    /// lands focus on a session goes through here so none leaves the drawer
+    /// holding the keyboard by accident.
+    fn focus_term(&mut self) {
+        self.focus = Focus::Term;
+        self.drawer_focused = false;
+    }
+
+    /// The session that receives keystrokes: the drawer when it has focus; in
+    /// the split, the active side; else the editor when open, else the primary
+    /// attachment.
     fn focused_session_id(&self) -> Option<SessionId> {
+        if self.drawer_has_focus() {
+            return self.drawer;
+        }
         if self.split_active() {
             return if self.editor_focused {
                 self.editor
@@ -319,21 +464,58 @@ impl App {
         self.editor.or(self.attached)
     }
 
-    /// Width of the tree column: [`LEFT_WIDTH`], or 0 while it's hidden.
+    /// The emulator of the session that receives keystrokes (see
+    /// [`Self::focused_session_id`]) — the one whose modes decide how a key is
+    /// encoded and whose scrollback the wheel moves.
+    fn focused_parser_mut(&mut self) -> Option<&mut Term> {
+        if self.drawer_has_focus() {
+            self.drawer_parser.as_mut()
+        } else if self.split_active() && !self.editor_focused {
+            self.parser.as_mut()
+        } else if self.editor.is_some() {
+            self.editor_parser.as_mut()
+        } else {
+            self.parser.as_mut()
+        }
+    }
+
+    /// Width of the tree column: [`LEFT_WIDTH`], 0 while it's hidden, or — while
+    /// widened — wide enough for its longest row plus the border, never narrower
+    /// than `LEFT_WIDTH` nor wider than [`NAV_WIDE_MAX_PCT`] of the screen.
     ///
     /// Every layout, hit-test and PTY-sizing path goes through this, so they
     /// can't disagree about where the right-hand pane starts. Missing one is the
     /// bug this exists to prevent: a stale `LEFT_WIDTH` in the mouse hit-test
     /// would silently misroute clicks by 34 columns.
     fn nav_width(&self) -> u16 {
-        if self.nav_hidden { 0 } else { LEFT_WIDTH }
+        if self.nav_hidden {
+            return 0;
+        }
+        if !self.nav_wide {
+            return LEFT_WIDTH;
+        }
+        // Fit is measured from the same items `draw_tree` renders, so the column
+        // can't end up a cell short of what it has to show.
+        let widest = tree_items(self).iter().map(ListItem::width).max().unwrap_or(0);
+        let fit = u16::try_from(widest).unwrap_or(u16::MAX).saturating_add(2);
+        // In u32: a u16 product overflows on a terminal ~1000 columns wide.
+        let cap = u32::from(self.screen_cols) * u32::from(NAV_WIDE_MAX_PCT) / 100;
+        let cap = u16::try_from(cap).unwrap_or(u16::MAX).max(LEFT_WIDTH);
+        fit.clamp(LEFT_WIDTH, cap)
     }
 
     /// The focused terminal sub-pane for mouse routing:
     /// `(parser, origin_x, origin_y, cols, rows)`, accounting for the split.
-    fn focused_terminal(&self) -> Option<(&vt100::Parser, u16, u16, u16, u16)> {
+    fn focused_terminal(&self) -> Option<(&Term, u16, u16, u16, u16)> {
         let right_w = self.term_dims.0.saturating_add(2);
         let main_h = self.term_dims.1.saturating_add(2);
+        if self.drawer_has_focus() {
+            // The drawer sits right under the terminal pane: its inner origin is
+            // one row (its border) below the pane's outer bottom edge.
+            let (c, r) = self.drawer_dims;
+            let oy = main_h + 1;
+            return self.drawer_parser.as_ref().map(|p| (p, self.nav_width() + 1, oy, c, r));
+        }
         if self.split_active() {
             let (ai_w, ed_w) = split_widths(right_w);
             if self.editor_focused {
@@ -379,11 +561,22 @@ impl App {
         }
     }
 
+    /// [`Self::pane_at`], plus the drawer: everything at or below the terminal
+    /// pane's outer bottom edge, right of the tree, is the drawer while it's open.
+    fn pane_at_point(&self, col: u16, row: u16) -> ClickPane {
+        let top_h = self.term_dims.1.saturating_add(2);
+        if self.drawer.is_some() && col >= self.nav_width() && row >= top_h {
+            return ClickPane::Drawer;
+        }
+        self.pane_at(col)
+    }
+
     /// The pane that currently has focus, in the same terms as [`Self::pane_at`].
     fn active_pane(&self) -> ClickPane {
         match self.focus {
             Focus::Nav => ClickPane::Tree,
             Focus::Diff => ClickPane::Diff,
+            Focus::Term if self.drawer_has_focus() => ClickPane::Drawer,
             Focus::Term if self.split_active() => {
                 if self.editor_focused {
                     ClickPane::TermEditor
@@ -444,11 +637,62 @@ impl App {
         }
         self.rebuild_rows();
     }
+
+    /// Identity of the selected row; see [`RowKey`].
+    fn selected_key(&self) -> Option<RowKey> {
+        self.row_key(self.selected_row()?)
+    }
+
+    fn row_key(&self, row: Row) -> Option<RowKey> {
+        Some(match row {
+            Row::Worktree { wt } => RowKey::Worktree(self.tree.get(wt)?.path.clone()),
+            Row::Session { wt, se } => RowKey::Session(self.tree.get(wt)?.sessions.get(se)?.id),
+            Row::Agent { wt, ag } => {
+                RowKey::Agent(self.tree.get(wt)?.agents.get(ag)?.session_id.clone())
+            }
+        })
+    }
+
+    /// Put the selection back on `key` after the rows were rebuilt. If it's gone
+    /// the selection stays where `rebuild_rows` clamped it.
+    fn reselect(&mut self, key: Option<RowKey>) {
+        let Some(key) = key else {
+            return;
+        };
+        if let Some(i) = self.rows.iter().position(|&r| self.row_key(r).as_ref() == Some(&key)) {
+            self.selected = i;
+        }
+    }
+
+    /// Order `tree` per the current sort mode and rebuild the rows, putting the
+    /// selection back on `key` — taken by the caller *before* `tree` changed,
+    /// since a key read afterwards would name whatever moved into the old slot.
+    fn reorder(&mut self, key: Option<RowKey>) {
+        if self.sort_by_age {
+            sort_by_age(&mut self.tree);
+        } else {
+            let order = &self.daemon_order;
+            self.tree.sort_by_key(|w| {
+                order.iter().position(|p| *p == w.path).unwrap_or(usize::MAX)
+            });
+        }
+        self.rebuild_rows();
+        self.reselect(key);
+    }
+}
+
+/// Newest-created worktree first, by `created_secs`. The root stays on top —
+/// it's the main checkout, not one of the worktrees being compared, and would
+/// otherwise always sink to the bottom as the oldest. Worktrees with no known
+/// creation time go last (`None` is least, so last once reversed). Stable, so
+/// ties keep the daemon's order.
+fn sort_by_age(tree: &mut [WorktreeInfo]) {
+    tree.sort_by_key(|w| (!w.is_root, Reverse(w.created_secs)));
 }
 
 /// Entry point for the default (client) invocation.
 pub async fn run(root: PathBuf) -> Result<()> {
-    let stream = connect_or_spawn(&root).await?;
+    let stream = connect_or_spawn(&root, handshake::OnMismatch::Ask).await?;
     let (mut rd, mut wr) = stream.into_split();
 
     // Outbound requests.
@@ -534,13 +778,23 @@ pub async fn run(root: PathBuf) -> Result<()> {
         seen_worktrees: HashSet::new(),
         show_old: false,
         nav_hidden: false,
+        nav_wide: false,
+        sort_by_age: SORT_BY_AGE_DEFAULT,
+        daemon_order: Vec::new(),
+        screen_cols: 0,
         focus: Focus::Nav,
         attached: None,
         parser: None,
         editor: None,
         editor_parser: None,
         editor_focused: false,
+        drawer: None,
+        drawer_parser: None,
+        drawer_worktree: None,
+        drawer_focused: false,
         term_dims: (80, 24),
+        drawer_dims: (0, 0),
+        right_outer: (82, 26),
         diff: None,
         diff_visible: false,
         comment_editor: None,
@@ -558,9 +812,24 @@ pub async fn run(root: PathBuf) -> Result<()> {
     // session as Enter and an agent chat fires on the first line. With it on,
     // crossterm hands us the block whole (`Msg::Paste`) and we re-wrap it for
     // whichever app is receiving it (`paste_bytes`).
-    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    //
+    // The kitty keyboard flag is what lets us *see* Shift+Enter: in the legacy
+    // encoding the host sends a bare `\r` for it, identical to Enter, and no
+    // amount of care in `keys::encode_key` can recover a modifier that never
+    // arrived. Terminals without the protocol ignore the request.
+    let _ = execute!(
+        std::io::stdout(),
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let result = event_loop(&mut terminal, &mut app, &mut msg_rx).await;
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+    let _ = execute!(
+        std::io::stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     if let Some(msg) = app.exit_message.as_deref() {
         eprintln!("\nasm: {msg}");
@@ -605,8 +874,34 @@ async fn event_loop(
         }
         sync_term_size(app);
         terminal.draw(|f| draw(f, app))?;
+        forward_clipboard(app);
     }
     Ok(())
+}
+
+/// Re-send OSC 52 clipboard writes from the sessions to the host terminal (see
+/// [`TermCallbacks`]). Written straight to stdout: it's not screen content, and
+/// ratatui has no way to emit an arbitrary escape sequence.
+fn forward_clipboard(app: &mut App) {
+    let seqs = take_clipboard(app);
+    if seqs.is_empty() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    for seq in seqs {
+        let _ = std::io::Write::write_all(&mut out, &seq);
+    }
+    let _ = std::io::Write::flush(&mut out);
+}
+
+/// Drain both emulators' queued clipboard writes.
+fn take_clipboard(app: &mut App) -> Vec<Vec<u8>> {
+    let mut seqs = Vec::new();
+    let parsers = [app.parser.as_mut(), app.editor_parser.as_mut(), app.drawer_parser.as_mut()];
+    for p in parsers.into_iter().flatten() {
+        seqs.append(&mut p.callbacks_mut().clipboard);
+    }
+    seqs
 }
 
 fn handle_daemon_event(app: &mut App, ev: Event) {
@@ -629,15 +924,20 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             let current: HashSet<&str> = worktrees.iter().map(|w| w.path.as_str()).collect();
             app.collapsed.retain(|p| current.contains(p.as_str()));
             app.seen_worktrees.retain(|p| current.contains(p.as_str()));
+            // Before the tree is replaced: `selected_key` indexes the old one.
+            let key = app.selected_key();
+            app.daemon_order = worktrees.iter().map(|w| w.path.clone()).collect();
             app.tree = worktrees;
-            app.rebuild_rows();
+            app.reorder(key);
         }
         Event::Attached { id, scrollback } => {
             // Route by id: the editor's secondary stream feeds its own parser.
             let (cols, rows) = editor_view_dims(app, id);
-            let mut parser = vt100::Parser::new(rows.max(1), cols.max(1), 1000);
+            let mut parser = new_term(rows, cols);
             parser.process(&scrollback);
-            if app.editor == Some(id) {
+            if app.drawer == Some(id) {
+                app.drawer_parser = Some(parser);
+            } else if app.editor == Some(id) {
                 app.editor_parser = Some(parser);
             } else {
                 app.parser = Some(parser);
@@ -645,7 +945,11 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             }
         }
         Event::Output { id, data } => {
-            if app.editor == Some(id) {
+            if app.drawer == Some(id) {
+                if let Some(p) = app.drawer_parser.as_mut() {
+                    p.process(&data);
+                }
+            } else if app.editor == Some(id) {
                 if let Some(p) = app.editor_parser.as_mut() {
                     p.process(&data);
                 }
@@ -659,7 +963,7 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             // Auto-open newly created/resumed sessions.
             let (cols, rows) = app.term_dims;
             app.send(Request::Attach { id, cols, rows });
-            app.focus = Focus::Term;
+            app.focus_term();
             app.footer = TERM_HINT.into();
         }
         Event::EditorOpened { id } => {
@@ -668,8 +972,17 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             app.editor_focused = true; // new editor grabs focus within the split
             let (cols, rows) = editor_view_dims(app, id);
             app.send(Request::AttachEditor { id, cols, rows });
-            app.focus = Focus::Term;
+            app.focus_term();
             app.footer = EDITOR_HINT.into();
+        }
+        Event::DrawerOpened { id } => {
+            // Lay out with the drawer in first, so it streams at its real size and
+            // the pane above shrinks to make room.
+            app.drawer = Some(id);
+            relayout(app);
+            focus_pane(app, ClickPane::Drawer);
+            let (cols, rows) = app.drawer_dims;
+            app.send(Request::AttachDrawer { id, cols, rows });
         }
         Event::Diff { worktree, text, skipped_untracked } => {
             // Re-request of the same worktree = refresh: keep the comments,
@@ -686,16 +999,30 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             app.footer = diff_status(app, dropped, skipped_untracked);
         }
         Event::Error { message } => {
-            app.footer = format!("error: {message}");
+            // `d` refuses a worktree with local changes, which is exactly the
+            // state an abandoned agent worktree tends to be in; point at the way
+            // through rather than leave a dead end.
+            app.footer = if message.contains("--force") {
+                format!("error: {message} — D force-removes it")
+            } else {
+                format!("error: {message}")
+            };
             // If a re-attach failed and we have nothing to show, drop to the
             // explorer rather than leaving the user in an empty terminal. Keep the
             // error in the footer — `focus_pane` would overwrite it with the hint.
-            if app.parser.is_none() && app.editor.is_none() && !app.diff_showing() {
+            if app.parser.is_none()
+                && app.editor.is_none()
+                && app.drawer.is_none()
+                && !app.diff_showing()
+            {
                 let error = std::mem::take(&mut app.footer);
                 focus_pane(app, ClickPane::Tree);
                 app.footer = error;
             }
         }
+        // Only ever a reply to the handshake in `connect_or_spawn`, which has
+        // already consumed it by the time this loop runs.
+        Event::Version { .. } => {}
     }
 }
 
@@ -712,6 +1039,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if is_diff_toggle(&key) {
         if app.prompt.is_none() && app.comment_editor.is_none() {
             toggle_diff(app);
+        }
+        return;
+    }
+    if is_drawer_toggle(&key) {
+        if app.prompt.is_none() && app.comment_editor.is_none() {
+            toggle_drawer(app);
         }
         return;
     }
@@ -849,7 +1182,7 @@ fn close_diff(app: &mut App) {
     hide_diff(app);
     app.comment_editor = None;
     if app.attached.is_some() {
-        app.focus = Focus::Term;
+        app.focus_term();
         app.footer = TERM_HINT.into();
     } else {
         // Nothing left on the right — fall back to the tree, revealing it if the
@@ -1271,6 +1604,54 @@ fn diff_status(app: &App, dropped: usize, skipped_untracked: usize) -> String {
     diff_footer(app)
 }
 
+/// `Ctrl+\`: the bottom drawer terminal, a shell in the worktree that slides up
+/// under whatever the right-hand pane shows.
+///
+/// - closed: open it (the daemon reuses the worktree's shell if it has one) and
+///   focus it;
+/// - open but another pane has focus: focus it;
+/// - open and focused: hide it. Only the stream is dropped — the shell keeps
+///   running in the daemon, so the next open finds it exactly as it was.
+fn toggle_drawer(app: &mut App) {
+    if app.drawer.is_some() {
+        if !app.drawer_has_focus() {
+            focus_pane(app, ClickPane::Drawer);
+            return;
+        }
+        app.send(Request::DetachDrawer);
+        app.drawer = None;
+        app.drawer_parser = None;
+        app.drawer_focused = false;
+        relayout(app);
+        // Back to whatever is above; the tree when that's nothing.
+        if app.diff_showing() {
+            focus_pane(app, ClickPane::Diff);
+        } else if app.attached.is_some() || app.editor.is_some() {
+            focus_pane(app, ClickPane::Term);
+        } else {
+            focus_pane(app, ClickPane::Tree);
+        }
+        return;
+    }
+    // Anchor to what you're looking at: the session's worktree from a terminal,
+    // the review's from the diff, else the tree selection.
+    let worktree = match app.focus {
+        Focus::Term if app.attached.is_some() => {
+            app.worktree_of_attached().map(|w| w.path.clone())
+        }
+        Focus::Diff => app.diff.as_ref().map(|d| d.worktree.clone()),
+        _ => None,
+    }
+    .or_else(|| app.selected_worktree().map(|w| w.path.clone()));
+    let Some(worktree) = worktree else {
+        app.footer = "select a worktree first".into();
+        return;
+    };
+    app.drawer_worktree = Some(worktree.clone());
+    app.send(Request::OpenDrawer { worktree });
+    app.footer = "opening terminal…".into();
+}
+
 fn toggle_editor(app: &mut App) {
     // The editor split and the diff both own the right pane; showing one hides
     // the other. The diff is retained, so Ctrl+G returns to the review intact.
@@ -1283,7 +1664,7 @@ fn toggle_editor(app: &mut App) {
         app.editor = None;
         app.editor_parser = None;
         if app.attached.is_some() {
-            app.focus = Focus::Term;
+            app.focus_term();
             app.footer = TERM_HINT.into();
         } else {
             // Same fall-back as `close_diff`: the right pane is now empty, so the
@@ -1442,6 +1823,26 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => hide_nav(app),
         KeyCode::Char(' ') => app.toggle_collapse_selected(),
         KeyCode::Char('z') => app.toggle_collapse_all(),
+        KeyCode::Char('s') => {
+            app.sort_by_age = !app.sort_by_age;
+            let key = app.selected_key();
+            app.reorder(key);
+            app.footer = if app.sort_by_age {
+                "worktrees sorted newest first · s to sort by name".into()
+            } else {
+                "worktrees sorted by name · s for newest first".into()
+            };
+        }
+        KeyCode::Char('e') => {
+            // The PTYs pick up the new width from the `sync_term_size` the event
+            // loop runs after every message.
+            app.nav_wide = !app.nav_wide;
+            app.footer = if app.nav_wide {
+                "tree widened to fit names · e to narrow".into()
+            } else {
+                "tree back to its default width".into()
+            };
+        }
         KeyCode::Char('a') => {
             app.show_old = !app.show_old;
             app.rebuild_rows();
@@ -1492,6 +1893,38 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+        KeyCode::Char('D') => {
+            if let Some(w) = app.selected_worktree() {
+                if w.is_root {
+                    app.footer = "cannot remove the root worktree".into();
+                } else {
+                    let (name, _) = worktree_label(w, &app.root);
+                    let path = w.path.clone();
+                    app.prompt = Some(Prompt {
+                        kind: PromptKind::ForceRemoveWorktree { path },
+                        label: format!(
+                            "Force-remove {name}? Its uncommitted changes are lost. Type yes"
+                        ),
+                        input: String::new(),
+                    });
+                }
+            }
+        }
+        KeyCode::Char('b') => {
+            if let Some(w) = app.selected_worktree() {
+                if w.branch != git::DETACHED_BRANCH || w.rebasing.is_some() {
+                    app.footer = format!("{} is already on a branch", worktree_label(w, &app.root).0);
+                } else {
+                    let (name, _) = worktree_label(w, &app.root);
+                    let worktree = w.path.clone();
+                    app.prompt = Some(Prompt {
+                        kind: PromptKind::NameBranch { worktree },
+                        label: format!("New branch for {name}"),
+                        input: String::new(),
+                    });
+                }
+            }
+        }
         KeyCode::Char('r') => {
             app.send(Request::Refresh);
             app.footer = "refreshing…".into();
@@ -1515,7 +1948,7 @@ fn open_selected(app: &mut App) -> bool {
     if let Some((_, id)) = app.selected_session() {
         let (cols, rows) = app.term_dims;
         app.send(Request::Attach { id, cols, rows });
-        app.focus = Focus::Term;
+        app.focus_term();
         app.footer = TERM_HINT.into();
         true
     } else if let Some((worktree, session_id, tool)) = app.selected_agent() {
@@ -1536,7 +1969,7 @@ fn open_selected(app: &mut App) -> bool {
 /// otherwise open the selected one.
 fn focus_terminal(app: &mut App) {
     if app.attached.is_some() {
-        app.focus = Focus::Term;
+        app.focus_term();
         app.footer = TERM_HINT.into();
     } else {
         open_selected(app);
@@ -1552,7 +1985,8 @@ fn focus_terminal(app: &mut App) {
 /// leave no usable pane at all, just an empty box and no obvious way back. Same
 /// shape as [`toggle_editor`]'s "select a worktree first" bail.
 fn hide_nav(app: &mut App) {
-    if app.attached.is_none() && app.editor.is_none() && !app.diff_showing() {
+    if app.attached.is_none() && app.editor.is_none() && app.drawer.is_none() && !app.diff_showing()
+    {
         app.footer = "open a session first — nothing on the right to hide the tree for".into();
         return;
     }
@@ -1646,7 +2080,42 @@ fn handle_term_key(app: &mut App, key: KeyEvent) {
         focus_pane(app, ClickPane::Tree);
         return;
     }
-    if let Some(bytes) = encode_key(&key) {
+    // Shift+PageUp/PageDown page through the pane's scrollback, as in most
+    // terminals — the keyboard route to history, for when the wheel is taken by
+    // an app that has mouse reporting on.
+    if key.modifiers == KeyModifiers::SHIFT
+        && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+    {
+        let rows = if app.drawer_has_focus() { app.drawer_dims.1 } else { app.term_dims.1 };
+        let page = usize::from(rows.saturating_sub(1).max(1));
+        if let Some(p) = app.focused_parser_mut() {
+            let cur = p.screen().scrollback();
+            let to = if key.code == KeyCode::PageUp {
+                cur + page
+            } else {
+                cur.saturating_sub(page)
+            };
+            p.screen_mut().set_scrollback(to);
+        }
+        return;
+    }
+    // No emulator yet (the `Attached` snapshot is still in flight): encode for
+    // an app with no modes on, as a fresh terminal would.
+    let bytes = match app.focused_parser_mut() {
+        Some(p) => {
+            let bytes =
+                keys::encode_key(&key, &p.callbacks().keys, p.screen().application_cursor());
+            if bytes.is_some() {
+                // Typing into a pane that's scrolled back snaps it to the live
+                // screen, as a real terminal does; otherwise you type blind into
+                // a prompt that is off screen.
+                p.screen_mut().set_scrollback(0);
+            }
+            bytes
+        }
+        None => keys::encode_key(&key, &KeyModes::default(), false),
+    };
+    if let Some(bytes) = bytes {
         send_input(app, &bytes);
     }
 }
@@ -1664,22 +2133,27 @@ fn focus_pane(app: &mut App, pane: ClickPane) {
             app.footer = NAV_HINT.into();
         }
         ClickPane::TermAi => {
-            app.focus = Focus::Term;
+            app.focus_term();
             app.editor_focused = false;
             app.footer = TERM_HINT.into();
         }
         ClickPane::TermEditor => {
-            app.focus = Focus::Term;
+            app.focus_term();
             app.editor_focused = true;
             app.footer = EDITOR_HINT.into();
         }
         ClickPane::Term => {
-            app.focus = Focus::Term;
+            app.focus_term();
             app.footer = if app.editor.is_some() {
                 EDITOR_HINT.into()
             } else {
                 TERM_HINT.into()
             };
+        }
+        ClickPane::Drawer => {
+            app.focus_term();
+            app.drawer_focused = true;
+            app.footer = DRAWER_HINT.into();
         }
         ClickPane::Diff => {
             app.focus = Focus::Diff;
@@ -1698,7 +2172,7 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
     // focus. Clicks within the already-focused pane fall through to normal
     // handling (forward to the app / scroll / etc.).
     if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-        let target = app.pane_at(ev.column);
+        let target = app.pane_at_point(ev.column, ev.row);
         if target != app.active_pane() {
             focus_pane(app, target);
             return;
@@ -1737,39 +2211,54 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
         },
         Focus::Term => {
             // Route to the focused pane (the editor when the split is open).
-            let Some((mode, enc, ox, w, h)) = app.focused_terminal().map(|(p, ox, _oy, c, r)| {
-                let s = p.screen();
-                (s.mouse_protocol_mode(), s.mouse_protocol_encoding(), ox, c, r)
-            }) else {
+            let Some((mode, enc, ox, oy, w, h)) =
+                app.focused_terminal().map(|(p, ox, oy, c, r)| {
+                    let s = p.screen();
+                    (s.mouse_protocol_mode(), s.mouse_protocol_encoding(), ox, oy, c, r)
+                })
+            else {
                 return;
             };
             if mode != vt100::MouseProtocolMode::None {
-                if let Some(bytes) = encode_mouse(&ev, mode, enc, ox, 1, w, h) {
+                if let Some(bytes) = encode_mouse(&ev, mode, enc, ox, oy, w, h) {
                     send_input(app, &bytes);
                 }
-            } else {
-                // No app-level mouse support: scroll the focused pane's scrollback.
-                const STEP: usize = 3;
-                let parser = if app.split_active() && !app.editor_focused {
-                    app.parser.as_mut()
-                } else if app.editor.is_some() {
-                    app.editor_parser.as_mut()
-                } else {
-                    app.parser.as_mut()
-                };
-                if let Some(p) = parser {
-                    let cur = p.screen().scrollback();
-                    match ev.kind {
-                        MouseEventKind::ScrollUp => p.screen_mut().set_scrollback(cur + STEP),
-                        MouseEventKind::ScrollDown => {
-                            p.screen_mut().set_scrollback(cur.saturating_sub(STEP))
-                        }
-                        _ => {}
-                    }
-                }
+            } else if let Some(bytes) = app
+                .focused_parser_mut()
+                .and_then(|p| wheel_without_mouse_mode(p, ev.kind))
+            {
+                send_input(app, &bytes);
             }
         }
     }
+}
+
+/// The wheel over a session whose app did *not* ask for mouse reports.
+///
+/// On the main screen it scrolls the pane's own scrollback (returns `None`). On
+/// the alternate screen there is no scrollback — a pager, or Codex's transcript
+/// view, owns the whole screen — so it becomes arrow keys for the app instead,
+/// which is xterm's "alternate scroll" and what every mainstream terminal does.
+/// Without that the wheel did nothing at all there.
+fn wheel_without_mouse_mode(p: &mut Term, kind: MouseEventKind) -> Option<Vec<u8>> {
+    let up = match kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return None,
+    };
+    let screen = p.screen_mut();
+    if screen.alternate_screen() {
+        let arrow: &[u8] = match (up, screen.application_cursor()) {
+            (true, true) => b"\x1bOA",
+            (true, false) => b"\x1b[A",
+            (false, true) => b"\x1bOB",
+            (false, false) => b"\x1b[B",
+        };
+        return Some(arrow.repeat(WHEEL_STEP));
+    }
+    let cur = screen.scrollback();
+    screen.set_scrollback(if up { cur + WHEEL_STEP } else { cur.saturating_sub(WHEEL_STEP) });
+    None
 }
 
 /// Mouse in the file rail: the wheel moves its cursor, a click on a row opens that
@@ -1989,6 +2478,22 @@ fn submit_prompt(app: &mut App, prompt: Prompt) {
                 app.send(Request::RenameSession { id, name: input });
             }
         }
+        PromptKind::NameBranch { worktree } => {
+            if input.is_empty() {
+                app.footer = "branch name required".into();
+            } else {
+                app.footer = format!("creating branch {input}…");
+                app.send(Request::NameBranch { worktree, branch: input });
+            }
+        }
+        PromptKind::ForceRemoveWorktree { path } => {
+            if input == "yes" {
+                app.footer = format!("force-removing {}…", short_path(&path));
+                app.send(Request::RemoveWorktree { path, force: true });
+            } else {
+                app.footer = "not removed (type yes to confirm)".into();
+            }
+        }
     }
 }
 
@@ -2009,6 +2514,9 @@ fn inner_dims(w: u16, h: u16) -> (u16, u16) {
 /// Inner dims the session `id` renders at, given the current (possibly split)
 /// layout. Used when (re)building a parser on attach.
 fn editor_view_dims(app: &App, id: SessionId) -> (u16, u16) {
+    if app.drawer == Some(id) {
+        return app.drawer_dims;
+    }
     if !app.split_active() {
         return app.term_dims;
     }
@@ -2025,6 +2533,7 @@ fn editor_view_dims(app: &App, id: SessionId) -> (u16, u16) {
 enum ViewKind {
     Primary,
     Editor,
+    Drawer,
 }
 
 /// Resize one view's PTY + local parser to `target` if it differs from what the
@@ -2033,6 +2542,7 @@ fn resize_view(app: &mut App, kind: ViewKind, target: (u16, u16)) {
     let (id, parser) = match kind {
         ViewKind::Primary => (app.attached, &mut app.parser),
         ViewKind::Editor => (app.editor, &mut app.editor_parser),
+        ViewKind::Drawer => (app.drawer, &mut app.drawer_parser),
     };
     let Some(id) = id else {
         return;
@@ -2054,26 +2564,53 @@ fn resize_view(app: &mut App, kind: ViewKind, target: (u16, u16)) {
     app.send(Request::Resize { id, cols, rows });
 }
 
-/// Recompute the terminal pane's inner dimensions from the real terminal size and
-/// resize every visible session's PTY (both panes when the editor split is open).
+/// Re-read the real terminal size and lay the right-hand area out again (see
+/// [`relayout`]).
 fn sync_term_size(app: &mut App) {
     let Ok((cols, rows)) = crossterm::terminal::size() else {
         return;
     };
-    // Mirror the draw layout: 1-line footer, left column, bordered right pane(s).
-    let main_h = rows.saturating_sub(1);
-    let right_w = cols.saturating_sub(app.nav_width());
-    let full = inner_dims(right_w, main_h);
+    // Before `nav_width`, which caps the widened tree against it.
+    app.screen_cols = cols;
+    // Mirror the draw layout: 1-line footer, left column, then the right area.
+    app.right_outer = (cols.saturating_sub(app.nav_width()), rows.saturating_sub(1));
+    relayout(app);
+}
+
+/// Split the right-hand area's outer height into `(pane, drawer)` outer heights.
+/// One helper for `draw` and [`relayout`] both, for the same reason
+/// [`split_widths`] is one. Each side keeps room for a border and a line, on
+/// any screen tall enough (6 rows) to hold both.
+fn drawer_split(main_h: u16) -> (u16, u16) {
+    let drawer = u16::try_from(u32::from(main_h) * u32::from(DRAWER_PCT) / 100).unwrap_or(main_h);
+    let drawer = drawer.clamp(3, main_h.saturating_sub(3).max(3));
+    (main_h.saturating_sub(drawer), drawer)
+}
+
+/// Lay the right-hand area out from `right_outer`: the terminal pane (single,
+/// split, or the diff) and, while open, the drawer under it. Sets `term_dims`
+/// and `drawer_dims` and resizes every visible session's PTY to match.
+fn relayout(app: &mut App) {
+    let (right_w, main_h) = app.right_outer;
+    let (top_h, drawer_h) = if app.drawer.is_some() {
+        drawer_split(main_h)
+    } else {
+        (main_h, 0)
+    };
+    let full = inner_dims(right_w, top_h);
     app.term_dims = full;
+    app.drawer_dims = inner_dims(right_w, drawer_h);
 
     let (ai_target, ed_target) = if app.split_active() {
         let (ai_w, ed_w) = split_widths(right_w);
-        (inner_dims(ai_w, main_h), inner_dims(ed_w, main_h))
+        (inner_dims(ai_w, top_h), inner_dims(ed_w, top_h))
     } else {
         (full, full)
     };
     resize_view(app, ViewKind::Primary, ai_target);
     resize_view(app, ViewKind::Editor, ed_target);
+    let drawer_target = app.drawer_dims;
+    resize_view(app, ViewKind::Drawer, drawer_target);
 
     sync_diff_viewport(app);
 }
@@ -2138,21 +2675,32 @@ fn draw(f: &mut Frame, app: &App) {
     if !app.nav_hidden {
         draw_tree(f, app, cols[0]);
     }
+    // The drawer takes rows off the bottom of the right-hand area; everything
+    // else lays out in what's left above it.
+    let right = if app.drawer.is_some() {
+        let (top_h, _) = drawer_split(cols[1].height);
+        let rows =
+            Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).split(cols[1]);
+        draw_drawer(f, app, rows[1]);
+        rows[0]
+    } else {
+        cols[1]
+    };
     if app.diff_showing() {
         // The file rail takes a column off the diff rather than covering it.
         if app.diff.as_ref().is_some_and(|d| d.nav_open()) {
-            let (rail, body) = diff_split(cols[1]);
+            let (rail, body) = diff_split(right);
             draw_diff(f, app, body);
             draw_file_nav(f, app, rail);
         } else {
-            draw_diff(f, app, cols[1]);
+            draw_diff(f, app, right);
         }
     } else {
-        draw_terminal(f, app, cols[1]);
+        draw_terminal(f, app, right);
     }
     draw_footer(f, app, footer_area);
     // Modal, so it goes last — over whatever the right pane drew.
-    draw_comment_editor(f, app, cols[1]);
+    draw_comment_editor(f, app, right);
 }
 
 /// The reviewable diff: files → hunks → lines, with comments inline. Renders
@@ -2524,18 +3072,18 @@ fn tree_items(app: &App) -> Vec<ListItem<'static>> {
                 } else {
                     None
                 };
-                worktree_item(w, collapsed, count, summary)
+                worktree_item(w, &app.root, collapsed, count, summary)
             }),
             Row::Session { wt, se } => app
                 .tree
                 .get(wt)
                 .and_then(|w| w.sessions.get(se))
-                .map(session_item),
+                .map(|s| session_item(s, app.nav_wide)),
             Row::Agent { wt, ag } => app
                 .tree
                 .get(wt)
                 .and_then(|w| w.agents.get(ag))
-                .map(agent_item),
+                .map(|a| agent_item(a, app.nav_wide)),
         })
         .collect()
 }
@@ -2571,8 +3119,58 @@ fn summary_status(sessions: &[SessionInfo]) -> Option<Status> {
     }
 }
 
+/// What the tree calls a worktree: `(name, hint)`.
+///
+/// A branch worktree is its branch. A detached one has no branch to show, and
+/// `(detached)` on every row is how a dozen agent worktrees became
+/// indistinguishable, so it gets:
+/// - the branch it's rebasing, when a rebase is what detached it;
+/// - otherwise its directory's nickname plus the short SHA, and as a hint what
+///   it's *for*: its agent session's name/title, falling back to the commit
+///   subject (which, for an agent that hasn't committed, is only the base).
+fn worktree_label(w: &WorktreeInfo, root: &str) -> (String, Option<String>) {
+    if w.branch != git::DETACHED_BRANCH {
+        return (w.branch.clone(), None);
+    }
+    if let Some(b) = &w.rebasing {
+        return (format!("{b} (rebasing)"), None);
+    }
+    let nick = worktree_nickname(&w.path, root);
+    let name = if w.head.is_empty() {
+        format!("{nick} (detached)")
+    } else {
+        format!("{nick} @{}", w.head)
+    };
+    let hint = w
+        .sessions
+        .iter()
+        .find(|s| s.agent.is_some())
+        .map(|s| s.name.clone())
+        .or_else(|| w.agents.first().map(|a| a.title.clone()))
+        .or_else(|| (!w.subject.is_empty()).then(|| w.subject.clone()))
+        .filter(|h| !h.trim().is_empty());
+    (name, hint)
+}
+
+/// The path component that tells a worktree apart: its directory name, unless
+/// that's just the repo's own name again — as in Codex's
+/// `~/.codex/worktrees/<id>/<repo>` layout — in which case the parent's.
+fn worktree_nickname(path: &str, root: &str) -> String {
+    let p = Path::new(path);
+    let base = p.file_name().map(|s| s.to_string_lossy().into_owned());
+    let root_base = Path::new(root).file_name().map(|s| s.to_string_lossy().into_owned());
+    match (base, p.parent().and_then(|d| d.file_name())) {
+        (Some(b), Some(parent)) if Some(&b) == root_base.as_ref() => {
+            parent.to_string_lossy().into_owned()
+        }
+        (Some(b), _) => b,
+        (None, _) => path.to_string(),
+    }
+}
+
 fn worktree_item(
     w: &WorktreeInfo,
+    root: &str,
     collapsed: bool,
     count: usize,
     summary: Option<Status>,
@@ -2584,10 +3182,18 @@ fn worktree_item(
     } else {
         String::new()
     };
+    let (name, hint) = worktree_label(w, root);
+    // Detached worktrees are drawn in a different colour: they have no branch,
+    // so anything done there is easy to lose (`b` gives them one).
+    let color = if w.branch == git::DETACHED_BRANCH && w.rebasing.is_none() {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
     let mut spans = vec![
         Span::styled(
-            format!("{icon} {}", w.branch),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            format!("{icon} {name}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(marker, Style::default().fg(Color::DarkGray)),
         Span::styled(badge, Style::default().fg(Color::DarkGray)),
@@ -2599,10 +3205,14 @@ fn worktree_item(
             Style::default().fg(color),
         ));
     }
+    if let Some(hint) = hint {
+        spans.push(Span::styled(format!(" {hint}"), Style::default().fg(Color::DarkGray)));
+    }
     ListItem::new(Line::from(spans))
 }
 
-fn session_item(s: &SessionInfo) -> ListItem<'static> {
+/// `full` (the widened tree) shows the name whole instead of truncating it.
+fn session_item(s: &SessionInfo, full: bool) -> ListItem<'static> {
     let (glyph, color) = status_glyph(s.status);
     let mut spans = vec![
         Span::raw("  "),
@@ -2616,7 +3226,7 @@ fn session_item(s: &SessionInfo) -> ListItem<'static> {
         spans.push(Span::styled(tglyph, Style::default().fg(tcolor)));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::raw(truncate(&s.name, 24)));
+    spans.push(Span::raw(if full { s.name.clone() } else { truncate(&s.name, 24) }));
     ListItem::new(Line::from(spans))
 }
 
@@ -2641,13 +3251,17 @@ fn primary_pane_title(app: &App) -> String {
     }
 }
 
-fn agent_item(a: &AgentInfo) -> ListItem<'static> {
+/// `full` (the widened tree) shows the title whole instead of truncating it.
+fn agent_item(a: &AgentInfo, full: bool) -> ListItem<'static> {
     let (glyph, color) = agent_glyph(a.tool);
     ListItem::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(glyph, Style::default().fg(color)),
         Span::raw(" "),
-        Span::styled(truncate(&a.title, 20), Style::default().fg(Color::Gray)),
+        Span::styled(
+            if full { a.title.clone() } else { truncate(&a.title, 20) },
+            Style::default().fg(Color::Gray),
+        ),
         Span::styled(
             format!(" {}", a.last_active),
             Style::default().fg(Color::DarkGray),
@@ -2655,8 +3269,20 @@ fn agent_item(a: &AgentInfo) -> ListItem<'static> {
     ]))
 }
 
+/// The bottom drawer: one bordered PTY pane, titled with its worktree.
+fn draw_drawer(f: &mut Frame, app: &App, area: Rect) {
+    let title = match app.drawer_worktree.as_deref() {
+        Some(w) => format!(" terminal — {} ", short_path(w)),
+        None => " terminal ".to_string(),
+    };
+    let focused = app.drawer_has_focus();
+    draw_pty(f, area, &title, app.drawer_parser.as_ref(), focused, focused);
+}
+
 fn draw_terminal(f: &mut Frame, app: &App, area: Rect) {
-    let term_focused = app.focus == Focus::Term;
+    // The drawer under this pane is `Focus::Term` too; when it has the keyboard
+    // this pane must not also look (or place its cursor as if) focused.
+    let term_focused = app.focus == Focus::Term && !app.drawer_has_focus();
     if app.split_active() {
         // Highlight + place the cursor in whichever side has focus.
         let (ai_w, _) = split_widths(area.width);
@@ -2688,14 +3314,26 @@ fn draw_pty(
     f: &mut Frame,
     area: Rect,
     title: &str,
-    parser: Option<&vt100::Parser>,
+    parser: Option<&Term>,
     focused: bool,
     place_cursor: bool,
 ) {
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .title(title.to_string())
         .border_style(border_style(focused));
+    // Scrolled back, the pane shows history rather than the live screen; say so,
+    // or output that seems to have stopped reads as a hung session.
+    let back = parser.map(|p| p.screen().scrollback()).unwrap_or(0);
+    if back > 0 {
+        block = block.title(
+            Line::from(Span::styled(
+                format!(" scrolled back {back} · type or Shift+PgDn to return "),
+                Style::default().fg(Color::Yellow),
+            ))
+            .right_aligned(),
+        );
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2703,7 +3341,7 @@ fn draw_pty(
         Some(parser) => {
             let screen = parser.screen();
             f.render_widget(PseudoTerminal::new(screen), inner);
-            if place_cursor {
+            if place_cursor && back == 0 {
                 let (cy, cx) = screen.cursor_position();
                 f.set_cursor_position(Position::new(inner.x + cx, inner.y + cy));
             }
@@ -2770,51 +3408,53 @@ fn short_path(p: &str) -> String {
         .unwrap_or_else(|| p.to_string())
 }
 
-/// Translate a key event into the byte sequence a PTY expects.
-fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let mut out: Vec<u8> = Vec::new();
-    match key.code {
-        KeyCode::Char(c) => {
-            if ctrl {
-                // Control byte for the letter/symbol.
-                let b = (c.to_ascii_uppercase() as u8) & 0x1f;
-                out.push(b);
-            } else {
-                if alt {
-                    out.push(0x1b);
-                }
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
+/// Connect to the daemon, spawning it (detached) if it is not already running.
+/// Connect to this repo's daemon, spawning one from our own executable if none
+/// is running. An already-running daemon is first checked against our build
+/// (see [`handshake`]): one on different code is replaced, silently when it has
+/// no live sessions and otherwise as `on_mismatch` says.
+pub(crate) async fn connect_or_spawn(
+    root: &Path,
+    on_mismatch: handshake::OnMismatch,
+) -> Result<UnixStream> {
+    let sock = paths::socket_path(root);
+    let Ok(mut stream) = UnixStream::connect(&sock).await else {
+        // A daemon spawned from our own executable matches by construction.
+        return spawn_and_connect(root).await;
+    };
+    let theirs = match tokio::time::timeout(handshake::QUERY_TIMEOUT, handshake::query(&mut stream))
+        .await
+    {
+        Ok(Ok(theirs)) => theirs,
+        // No usable answer: carry on unchecked rather than refuse to start.
+        Ok(Err(_)) | Err(_) => return Ok(stream),
+    };
+    let restart = match handshake::verdict(handshake::BUILD_ID, &theirs, on_mismatch) {
+        handshake::Verdict::Keep => false,
+        handshake::Verdict::Restart => true,
+        handshake::Verdict::Ask => handshake::confirm_restart(&theirs, root).await?,
+        handshake::Verdict::Warn => {
+            eprintln!("{}", handshake::mismatch_warning(&theirs));
+            false
         }
-        KeyCode::Enter => out.push(b'\r'),
-        KeyCode::Backspace => out.push(0x7f),
-        KeyCode::Tab => out.push(b'\t'),
-        KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
-        KeyCode::Esc => out.push(0x1b),
-        KeyCode::Left => out.extend_from_slice(b"\x1b[D"),
-        KeyCode::Right => out.extend_from_slice(b"\x1b[C"),
-        KeyCode::Up => out.extend_from_slice(b"\x1b[A"),
-        KeyCode::Down => out.extend_from_slice(b"\x1b[B"),
-        KeyCode::Home => out.extend_from_slice(b"\x1b[H"),
-        KeyCode::End => out.extend_from_slice(b"\x1b[F"),
-        KeyCode::PageUp => out.extend_from_slice(b"\x1b[5~"),
-        KeyCode::PageDown => out.extend_from_slice(b"\x1b[6~"),
-        KeyCode::Delete => out.extend_from_slice(b"\x1b[3~"),
-        KeyCode::Insert => out.extend_from_slice(b"\x1b[2~"),
-        _ => return None,
+    };
+    if !restart {
+        return Ok(stream);
     }
-    Some(out)
+    let pid = match handshake::peer_pid(&stream) {
+        Ok(pid) => pid,
+        Err(e) => {
+            eprintln!("asm: can't restart the daemon ({e:#}); stop it with: pkill -f 'asm daemon'");
+            return Ok(stream);
+        }
+    };
+    drop(stream);
+    handshake::stop_daemon(pid).await?;
+    spawn_and_connect(root).await
 }
 
-/// Connect to the daemon, spawning it (detached) if it is not already running.
-pub(crate) async fn connect_or_spawn(root: &Path) -> Result<UnixStream> {
+async fn spawn_and_connect(root: &Path) -> Result<UnixStream> {
     let sock = paths::socket_path(root);
-    if let Ok(s) = UnixStream::connect(&sock).await {
-        return Ok(s);
-    }
     spawn_daemon(root)?;
     // Poll for the socket to come up.
     for _ in 0..60 {
@@ -2884,6 +3524,10 @@ mod tests {
             path: path.into(),
             branch: path.into(),
             is_root: false,
+            head: String::new(),
+            subject: String::new(),
+            rebasing: None,
+            created_secs: None,
             sessions,
             agents,
         }
@@ -2903,13 +3547,23 @@ mod tests {
             seen_worktrees: HashSet::new(),
             show_old: false,
             nav_hidden: false,
+            nav_wide: false,
+            sort_by_age: SORT_BY_AGE_DEFAULT,
+            daemon_order: Vec::new(),
+            screen_cols: 0,
             focus: Focus::Nav,
             attached: None,
             parser: None,
             editor: None,
             editor_parser: None,
             editor_focused: false,
+            drawer: None,
+            drawer_parser: None,
+            drawer_worktree: None,
+            drawer_focused: false,
             term_dims: (80, 24),
+            drawer_dims: (0, 0),
+            right_outer: (82, 26),
             diff: None,
             diff_visible: false,
             comment_editor: None,
@@ -3143,7 +3797,7 @@ mod tests {
     fn ctrl_h_from_term_returns_to_explorer_without_forwarding() {
         let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
         app.attached = Some(7);
-        app.focus = Focus::Term;
+        app.focus_term();
         handle_key(&mut app, ctrl('h'));
         assert_eq!(app.focus, Focus::Nav);
         assert!(rx.try_recv().is_err()); // nothing forwarded to the PTY
@@ -3175,7 +3829,7 @@ mod tests {
         let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
         app.attached = Some(7);
         app.nav_hidden = true;
-        app.focus = Focus::Term;
+        app.focus_term();
         handle_key(&mut app, ctrl('h'));
         assert!(!app.nav_hidden);
         assert_eq!(app.focus, Focus::Nav);
@@ -3188,7 +3842,7 @@ mod tests {
         app.attached = Some(7);
         assert_eq!(app.pane_at(0), ClickPane::Tree);
         app.nav_hidden = true;
-        app.focus = Focus::Term;
+        app.focus_term();
         assert_eq!(app.pane_at(0), ClickPane::Term);
     }
 
@@ -3199,8 +3853,8 @@ mod tests {
         // origin still 34 columns in.
         let (mut app, _rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
         app.attached = Some(7);
-        app.parser = Some(vt100::Parser::new(24, 80, 0));
-        app.focus = Focus::Term;
+        app.parser = Some(new_term(24, 80));
+        app.focus_term();
         let (_, ox, ..) = app.focused_terminal().expect("a focused terminal");
         assert_eq!(ox, LEFT_WIDTH + 1);
 
@@ -3213,7 +3867,7 @@ mod tests {
     fn ctrl_l_in_term_is_forwarded_to_app() {
         let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
         app.attached = Some(7);
-        app.focus = Focus::Term;
+        app.focus_term();
         handle_key(&mut app, ctrl('l'));
         assert_eq!(app.focus, Focus::Term); // stays in the terminal
         match rx.try_recv() {
@@ -3288,6 +3942,342 @@ mod tests {
         app.toggle_collapse_selected(); // fold /r/main
         assert_eq!(app.rows.len(), 3);
         assert_eq!(tree_items(&app).len(), app.rows.len()); // was 6 before the fix
+    }
+
+    // ---- bottom drawer terminal (`Ctrl+\`) ----
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Request>) -> Vec<Request> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Attached to session 7 in `/r/a`, terminal focused, right area 82×26.
+    fn app_in_session() -> (App, mpsc::UnboundedReceiver<Request>) {
+        let (mut app, rx) = app_with_rx(vec![
+            wt("/r/a", vec![sess(7, "s")], vec![]),
+            wt("/r/b", vec![], vec![]),
+        ]);
+        app.attached = Some(7);
+        app.parser = Some(new_term(24, 80));
+        app.focus_term();
+        (app, rx)
+    }
+
+    /// `app_in_session` with the drawer (session 99) already open and focused.
+    fn app_with_drawer() -> (App, mpsc::UnboundedReceiver<Request>) {
+        let (mut app, mut rx) = app_in_session();
+        handle_key(&mut app, ctrl('\\'));
+        handle_daemon_event(&mut app, Event::DrawerOpened { id: 99 });
+        handle_daemon_event(&mut app, Event::Attached { id: 99, scrollback: Vec::new() });
+        drain(&mut rx);
+        (app, rx)
+    }
+
+    #[test]
+    fn ctrl_backslash_opens_the_drawer_in_the_attached_sessions_worktree() {
+        // Both encodings of the chord: kitty's `Ctrl+\` and legacy's `Ctrl+4`.
+        for key in [ctrl('\\'), ctrl('4')] {
+            let (mut app, mut rx) = app_in_session();
+            app.selected = 2; // the tree points at /r/b; the session is in /r/a
+            handle_key(&mut app, key);
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(sent.as_slice(), [Request::OpenDrawer { worktree }] if worktree == "/r/a"),
+                "{sent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_the_tree_the_drawer_opens_in_the_selected_worktree() {
+        let (mut app, mut rx) = app_in_session();
+        app.focus = Focus::Nav;
+        app.selected = 2; // /r/b
+        handle_key(&mut app, ctrl('\\'));
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Request::OpenDrawer { worktree }] if worktree == "/r/b"),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn an_opened_drawer_takes_the_bottom_rows_streams_at_that_size_and_has_focus() {
+        let (mut app, mut rx) = app_in_session();
+        handle_key(&mut app, ctrl('\\'));
+        drain(&mut rx);
+        handle_daemon_event(&mut app, Event::DrawerOpened { id: 99 });
+        // 26 rows split 16 + 10; each block loses 2 to its border.
+        assert_eq!(app.term_dims, (80, 14));
+        assert_eq!(app.drawer_dims, (80, 8));
+        let sent = drain(&mut rx);
+        assert!(
+            sent.iter().any(|r| matches!(
+                r,
+                Request::AttachDrawer { id: 99, cols: 80, rows: 8 }
+            )),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::Resize { id: 7, cols: 80, rows: 14 })),
+            "the pane above shrinks to make room: {sent:?}"
+        );
+        assert_eq!(app.focused_session_id(), Some(99));
+        assert_eq!(app.active_pane(), ClickPane::Drawer);
+    }
+
+    #[test]
+    fn keys_typed_in_the_drawer_reach_its_shell_not_the_session_above() {
+        let (mut app, mut rx) = app_with_drawer();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Request::Input { id: 99, data }] if data == b"l"),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn output_is_routed_to_the_drawer_by_session_id() {
+        let (mut app, _rx) = app_with_drawer();
+        handle_daemon_event(&mut app, Event::Output { id: 99, data: b"drawer-text".to_vec() });
+        handle_daemon_event(&mut app, Event::Output { id: 7, data: b"agent-text".to_vec() });
+        let screen = |p: &Option<Term>| p.as_ref().map(|p| p.screen().contents()).unwrap_or_default();
+        assert!(screen(&app.drawer_parser).contains("drawer-text"));
+        assert!(!screen(&app.drawer_parser).contains("agent-text"));
+        assert!(screen(&app.parser).contains("agent-text"));
+    }
+
+    #[test]
+    fn ctrl_backslash_in_the_drawer_hides_it_but_leaves_the_shell_running() {
+        let (mut app, mut rx) = app_with_drawer();
+        handle_key(&mut app, ctrl('\\'));
+        let sent = drain(&mut rx);
+        assert!(sent.iter().any(|r| matches!(r, Request::DetachDrawer)), "{sent:?}");
+        assert!(
+            !sent.iter().any(|r| matches!(r, Request::KillSession { .. })),
+            "hiding must not kill the shell: {sent:?}"
+        );
+        assert!(app.drawer.is_none());
+        assert_eq!(app.term_dims, (80, 24), "the pane above gets its rows back");
+        assert_eq!(app.focused_session_id(), Some(7));
+        // Opening again asks the daemon for the worktree's (cached) shell.
+        handle_key(&mut app, ctrl('\\'));
+        assert!(matches!(drain(&mut rx).as_slice(), [Request::OpenDrawer { .. }]));
+    }
+
+    #[test]
+    fn ctrl_backslash_focuses_an_open_drawer_before_it_hides_it() {
+        let (mut app, mut rx) = app_with_drawer();
+        focus_pane(&mut app, ClickPane::Term);
+        assert_eq!(app.focused_session_id(), Some(7));
+        handle_key(&mut app, ctrl('\\'));
+        assert!(drain(&mut rx).is_empty(), "focusing sends nothing");
+        assert!(app.drawer.is_some());
+        assert_eq!(app.focused_session_id(), Some(99));
+    }
+
+    #[test]
+    fn clicks_above_and_below_the_drawer_edge_pick_the_pane() {
+        let (mut app, _rx) = app_with_drawer();
+        // The pane above spans rows 0..16; the drawer starts at row 16.
+        handle_mouse(&mut app, click(LEFT_WIDTH + 5, 15));
+        assert_eq!(app.active_pane(), ClickPane::Term);
+        handle_mouse(&mut app, click(LEFT_WIDTH + 5, 16));
+        assert_eq!(app.active_pane(), ClickPane::Drawer);
+        handle_mouse(&mut app, click(2, 20)); // under the tree, not the drawer
+        assert_eq!(app.active_pane(), ClickPane::Tree);
+    }
+
+    #[test]
+    fn mouse_reports_in_the_drawer_are_relative_to_the_drawer() {
+        let (mut app, mut rx) = app_with_drawer();
+        // The shell asks for SGR mouse reports.
+        handle_daemon_event(&mut app, Event::Output { id: 99, data: b"\x1b[?1000h\x1b[?1006h".to_vec() });
+        // Inner origin: tree + border across, pane (16) + border down.
+        handle_mouse(&mut app, click(LEFT_WIDTH + 1, 17));
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Request::Input { id: 99, data }] if data == b"\x1b[<0;1;1M"),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_drawer_renders_under_the_pane_titled_with_its_worktree() {
+        let (mut app, _rx) = app_with_drawer();
+        app.screen_cols = 116;
+        let screen = render(&app, 116, 27);
+        assert!(screen[16].contains("terminal — a"), "{}", screen.join("\n"));
+        assert!(screen[0].contains(" s "), "the session pane is still drawn above");
+    }
+
+    #[test]
+    fn a_resized_screen_resizes_the_drawers_shell_too() {
+        let (mut app, mut rx) = app_with_drawer();
+        app.right_outer = (102, 36); // what `sync_term_size` sets on a resize
+        relayout(&mut app);
+        // 36 rows split 22 + 14.
+        let sent = drain(&mut rx);
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::Resize { id: 99, cols: 100, rows: 12 })),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::Resize { id: 7, cols: 100, rows: 20 })),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn drawer_split_leaves_both_sides_a_border_and_a_line() {
+        assert_eq!(drawer_split(26), (16, 10));
+        assert_eq!(drawer_split(6), (3, 3));
+    }
+
+    // ---- sort by worktree age (`s`) ----
+
+    fn born(mut w: WorktreeInfo, secs: u64) -> WorktreeInfo {
+        w.created_secs = Some(secs);
+        w
+    }
+
+    fn order(app: &App) -> Vec<&str> {
+        app.tree.iter().map(|w| w.path.as_str()).collect()
+    }
+
+    /// Delivered by a tree push in the daemon's (name) order: `/r/a` created at
+    /// 100, `/r/b` at 300 (newest), `/r/c` at 200.
+    fn three_worktrees() -> App {
+        let mut app = app_with(Vec::new());
+        handle_daemon_event(
+            &mut app,
+            tree_ev(vec![
+                born(wt("/r/a", vec![sess(1, "a")], vec![]), 100),
+                born(wt("/r/b", vec![], vec![agent("x")]), 300),
+                born(wt("/r/c", vec![], vec![]), 200),
+            ]),
+        );
+        app
+    }
+
+    #[test]
+    fn worktrees_start_newest_first_and_s_toggles_the_daemons_name_order() {
+        let mut app = three_worktrees();
+        assert_eq!(order(&app), ["/r/b", "/r/c", "/r/a"]);
+        press(&mut app, 's');
+        assert_eq!(order(&app), ["/r/a", "/r/b", "/r/c"]);
+        press(&mut app, 's');
+        assert_eq!(order(&app), ["/r/b", "/r/c", "/r/a"]);
+    }
+
+    #[test]
+    fn sorting_by_age_keeps_the_root_on_top_and_unknown_ages_last() {
+        let mut root = born(wt("/r", vec![], vec![]), 1);
+        root.is_root = true;
+        let mut tree = vec![
+            wt("/r/unknown", vec![], vec![]),
+            born(wt("/r/old", vec![], vec![]), 10),
+            root,
+            born(wt("/r/new", vec![], vec![]), 20),
+        ];
+        sort_by_age(&mut tree);
+        let paths: Vec<&str> = tree.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(paths, ["/r", "/r/new", "/r/old", "/r/unknown"]);
+    }
+
+    #[test]
+    fn the_selection_follows_its_worktree_when_sorting() {
+        let mut app = three_worktrees();
+        app.selected = 2; // /r/a (all folded), which moves to first place
+        assert_eq!(app.selected_key(), Some(RowKey::Worktree("/r/a".into())));
+        press(&mut app, 's');
+        assert_eq!(app.selected_key(), Some(RowKey::Worktree("/r/a".into())));
+        press(&mut app, 's');
+        assert_eq!(app.selected_key(), Some(RowKey::Worktree("/r/a".into())));
+    }
+
+    #[test]
+    fn a_tree_push_is_resorted_and_keeps_the_selected_session() {
+        let mut app = three_worktrees();
+        app.collapsed.clear();
+        app.rebuild_rows(); // b, x, c, a, s1 — session 1 is row 4
+        let at = app
+            .rows
+            .iter()
+            .position(|&r| app.row_key(r) == Some(RowKey::Session(1)))
+            .expect("session 1 shown");
+        app.selected = at;
+        // A new worktree /r/d (newest of all) arrives: d, b, c, a now — session 1
+        // moves to row 5, so a selection kept by index would miss it.
+        handle_daemon_event(
+            &mut app,
+            tree_ev(vec![
+                born(wt("/r/a", vec![sess(1, "a")], vec![]), 100),
+                born(wt("/r/b", vec![], vec![agent("x")]), 300),
+                born(wt("/r/c", vec![], vec![]), 200),
+                born(wt("/r/d", vec![], vec![]), 400),
+            ]),
+        );
+        assert_eq!(order(&app), ["/r/d", "/r/b", "/r/c", "/r/a"]);
+        assert_eq!(app.selected_key(), Some(RowKey::Session(1)));
+    }
+
+    // ---- widened tree (`e`) ----
+
+    const LONG_NAME: &str = "a-session-name-far-too-long-for-the-default-column";
+
+    #[test]
+    fn e_widens_the_tree_to_show_a_long_name_whole_and_e_again_narrows_it() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, LONG_NAME)], vec![])]);
+        app.screen_cols = 200;
+        assert!(
+            !render(&app, 200, 8).join("\n").contains(LONG_NAME),
+            "default width should truncate it"
+        );
+
+        press(&mut app, 'e');
+        // Row is "  ○ " + the name; +2 for the border.
+        let fit = u16::try_from(4 + LONG_NAME.len() + 2).expect("fits u16");
+        assert_eq!(app.nav_width(), fit);
+        assert!(render(&app, 200, 8).join("\n").contains(LONG_NAME));
+
+        press(&mut app, 'e');
+        assert_eq!(app.nav_width(), LEFT_WIDTH);
+    }
+
+    #[test]
+    fn the_widened_tree_shows_full_agent_titles() {
+        let mut long = agent("x");
+        long.title = LONG_NAME.into();
+        let mut app = app_with(vec![wt("/r/a", vec![], vec![long])]);
+        app.screen_cols = 200;
+        press(&mut app, 'e');
+        assert!(render(&app, 200, 8).join("\n").contains(LONG_NAME));
+    }
+
+    #[test]
+    fn the_widened_tree_is_capped_at_two_thirds_of_the_screen() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, LONG_NAME)], vec![])]);
+        app.screen_cols = 60;
+        press(&mut app, 'e');
+        assert_eq!(app.nav_width(), 39); // 60 * 66 / 100
+    }
+
+    #[test]
+    fn widening_a_tree_of_short_names_keeps_the_default_width() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
+        app.screen_cols = 200;
+        press(&mut app, 'e');
+        assert_eq!(app.nav_width(), LEFT_WIDTH);
+    }
+
+    #[test]
+    fn a_click_inside_the_widened_tree_still_lands_on_the_tree() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, LONG_NAME)], vec![])]);
+        app.screen_cols = 200;
+        press(&mut app, 'e');
+        // Past the default width but inside the widened column.
+        assert_eq!(app.pane_at(LEFT_WIDTH + 5), ClickPane::Tree);
     }
 
     #[test]
@@ -3418,7 +4408,7 @@ mod tests {
         ]);
         app.selected = 0;
         app.attached = Some(2);
-        app.focus = Focus::Term;
+        app.focus_term();
         handle_key(&mut app, ctrl(']'));
         match rx.try_recv() {
             Ok(Request::OpenEditor { worktree, .. }) => assert_eq!(worktree, "/r/b"),
@@ -3454,8 +4444,8 @@ mod tests {
         let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
         app.attached = Some(1);
         app.editor = Some(99);
-        app.editor_parser = Some(vt100::Parser::new(24, 80, 0));
-        app.focus = Focus::Term;
+        app.editor_parser = Some(new_term(24, 80));
+        app.focus_term();
         handle_key(&mut app, ctrl(']')); // hide
         assert!(app.editor.is_none());
         assert!(app.editor_parser.is_none());
@@ -3470,7 +4460,7 @@ mod tests {
     fn toggle_chord_is_never_forwarded_to_the_pty() {
         let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(7, "s")], vec![])]);
         app.attached = Some(7);
-        app.focus = Focus::Term;
+        app.focus_term();
         handle_key(&mut app, ctrl(']'));
         // It toggled the editor, but must never have sent Input to the PTY.
         let mut saw_input = false;
@@ -3501,7 +4491,7 @@ mod tests {
         let mut app = app_with(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
         app.attached = Some(1);
         app.editor = Some(99);
-        app.parser = Some(vt100::Parser::new(24, 80, 0)); // AI (primary) parser
+        app.parser = Some(new_term(24, 80)); // AI (primary) parser
         // Editor's Attached must build the editor parser, routed by id.
         handle_daemon_event(
             &mut app,
@@ -3525,7 +4515,7 @@ mod tests {
     fn clicking_the_tree_focuses_the_explorer() {
         let mut app = app_with(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
         app.attached = Some(1);
-        app.focus = Focus::Term;
+        app.focus_term();
         handle_mouse(&mut app, click(2, 3)); // col 2 < LEFT_WIDTH → tree
         assert_eq!(app.focus, Focus::Nav);
     }
@@ -3547,7 +4537,7 @@ mod tests {
         app.attached = Some(1);
         app.editor = Some(99);
         app.editor_focused = true;
-        app.focus = Focus::Term;
+        app.focus_term();
         handle_mouse(&mut app, click(40, 3)); // AI side
         assert!(!app.editor_focused);
         assert_eq!(app.focused_session_id(), Some(1)); // keystrokes now go to AI
@@ -3560,7 +4550,7 @@ mod tests {
     fn clicking_within_the_focused_pane_does_not_change_focus() {
         let mut app = app_with(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
         app.attached = Some(1);
-        app.focus = Focus::Term; // single terminal, already focused
+        app.focus_term(); // single terminal, already focused
         handle_mouse(&mut app, click(LEFT_WIDTH + 5, 3));
         assert_eq!(app.focus, Focus::Term); // no-op focus-wise, click falls through
     }
@@ -3635,7 +4625,7 @@ diff --git a/src/a.rs b/src/a.rs
         let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "x")], vec![])]);
         app.attached = Some(1);
         app.editor = Some(99);
-        app.editor_parser = Some(vt100::Parser::new(24, 80, 0));
+        app.editor_parser = Some(new_term(24, 80));
         handle_key(&mut app, ctrl('g'));
         assert!(app.editor.is_none(), "editor stream dropped");
         assert!(matches!(rx.try_recv(), Ok(Request::DetachEditor)));
@@ -3977,7 +4967,7 @@ diff --git a/src/a.rs b/src/a.rs
     /// attach snapshot — including the bracketed-paste mode the agent had on.
     fn app_pasting() -> (App, mpsc::UnboundedReceiver<Request>) {
         let (mut app, rx) = app_with_rx(vec![wt("/r/a", vec![claude_sess(1, "claude")], vec![])]);
-        app.focus = Focus::Term;
+        app.focus_term();
         handle_daemon_event(
             &mut app,
             Event::Attached { id: 1, scrollback: b"\x1b[?2004h> ".to_vec() },
@@ -4011,7 +5001,7 @@ diff --git a/src/a.rs b/src/a.rs
         // vi and friends never turn the mode on; the block still has to arrive,
         // just unwrapped — and still without the newline that would submit it.
         let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "vi")], vec![])]);
-        app.focus = Focus::Term;
+        app.focus_term();
         handle_daemon_event(&mut app, Event::Attached { id: 1, scrollback: b"~ ".to_vec() });
         handle_paste(&mut app, "a\nb\n");
         assert_eq!(next_input(&mut rx), "a\nb");
@@ -4308,8 +5298,8 @@ diff --git a/src/a.rs b/src/a.rs
     fn a_hidden_nav_gives_its_columns_to_the_terminal_pane() {
         let (mut app, _rx) = app_with_rx(vec![wt("/r/mybranch", vec![sess(7, "s")], vec![])]);
         app.attached = Some(7);
-        app.parser = Some(vt100::Parser::new(24, 80, 0));
-        app.focus = Focus::Term;
+        app.parser = Some(new_term(24, 80));
+        app.focus_term();
         app.collapsed.clear();
 
         // Shown: two bordered blocks on the top row, and the branch is on screen.
@@ -4744,5 +5734,310 @@ diff --git a/src/b.rs b/src/b.rs
         }
         // The only request a comment-less review can produce here is none at all.
         assert!(rx.try_recv().is_err(), "diff keys must not reach the daemon");
+    }
+
+    /// Every row of scrollback, oldest first, as plain text.
+    fn scrollback_text(p: &mut vt100::Parser) -> Vec<String> {
+        let depth = {
+            p.screen_mut().set_scrollback(usize::MAX);
+            p.screen().scrollback()
+        };
+        let cols = p.screen().size().1;
+        let mut out = Vec::new();
+        for off in (1..=depth).rev() {
+            p.screen_mut().set_scrollback(off);
+            out.extend(p.screen().rows(0, cols).next());
+        }
+        p.screen_mut().set_scrollback(0);
+        out
+    }
+
+    #[test]
+    fn history_scrolled_out_of_a_top_anchored_region_reaches_scrollback() {
+        // Codex's inline UI keeps its composer pinned at the bottom and prints
+        // history by setting a scroll region over the rows above it
+        // (`ESC[1;Nr`) and scrolling that. Lines pushed off the region's top are
+        // the conversation; if they don't land in scrollback, the wheel has
+        // nothing to scroll back to.
+        let mut p = vt100::Parser::new(6, 20, 100);
+        p.process(b"\x1b[1;4r\x1b[4;1H");
+        for i in 0..8 {
+            p.process(format!("\r\nline {i}").as_bytes());
+        }
+        p.process(b"\x1b[r");
+        let back = scrollback_text(&mut p);
+        assert!(back.iter().any(|l| l == "line 0"), "scrollback: {back:?}");
+        assert!(back.iter().any(|l| l == "line 3"), "scrollback: {back:?}");
+        // The rows still inside the region are on screen, not duplicated back.
+        assert!(!back.iter().any(|l| l == "line 4"), "scrollback: {back:?}");
+    }
+
+    #[test]
+    fn a_region_below_the_top_row_still_keeps_its_rows_out_of_scrollback() {
+        // A status line pinned at the top with a region under it (vim, tmux)
+        // scrolls text that is *not* terminal history; saving those rows would
+        // fill scrollback with fragments of an editor buffer.
+        let mut p = vt100::Parser::new(6, 20, 100);
+        p.process(b"\x1b[2;6r\x1b[6;1H");
+        for i in 0..8 {
+            p.process(format!("\r\nbuf {i}").as_bytes());
+        }
+        assert!(scrollback_text(&mut p).is_empty());
+    }
+
+    fn app_attached_to(snapshot: &[u8]) -> (App, mpsc::UnboundedReceiver<Request>) {
+        let (mut app, rx) = app_with_rx(vec![wt("/r/a", vec![claude_sess(1, "claude")], vec![])]);
+        app.focus_term();
+        handle_daemon_event(&mut app, Event::Attached { id: 1, scrollback: snapshot.to_vec() });
+        (app, rx)
+    }
+
+    fn numbered_lines(n: usize) -> Vec<u8> {
+        (0..n).map(|i| format!("line {i}\r\n")).collect::<String>().into_bytes()
+    }
+
+    fn shift_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    }
+
+    fn scrolled_back(app: &App) -> usize {
+        app.parser.as_ref().map(|p| p.screen().scrollback()).unwrap_or(0)
+    }
+
+    #[test]
+    fn shift_enter_reaches_a_kitty_app_as_a_newline_rather_than_a_submit() {
+        // Claude Code pushes kitty flags at startup and reads `CSI 13;2u` as
+        // "insert newline". A bare `\r` — all asm used to send — submits.
+        let (mut app, mut rx) = app_attached_to(b"\x1b[>5u> ");
+        handle_key(&mut app, shift_enter());
+        assert_eq!(next_input(&mut rx), "\x1b[13;2u");
+    }
+
+    #[test]
+    fn shift_enter_follows_a_keyboard_mode_the_app_turns_on_later() {
+        let (mut app, mut rx) = app_attached_to(b"> ");
+        handle_daemon_event(&mut app, Event::Output { id: 1, data: b"\x1b[>1u".to_vec() });
+        handle_key(&mut app, shift_enter());
+        assert_eq!(next_input(&mut rx), "\x1b[13;2u");
+    }
+
+    #[test]
+    fn shift_enter_without_a_keyboard_mode_is_still_not_a_bare_enter() {
+        let (mut app, mut rx) = app_attached_to(b"> ");
+        handle_key(&mut app, shift_enter());
+        assert_eq!(next_input(&mut rx), "\x1b\r");
+    }
+
+    #[test]
+    fn arrows_follow_the_apps_application_cursor_mode() {
+        let (mut app, mut rx) = app_attached_to(b"\x1b[?1h");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(next_input(&mut rx), "\x1bOA");
+    }
+
+    #[test]
+    fn typing_while_scrolled_back_returns_to_the_live_screen() {
+        // A real terminal snaps to the bottom on input; staying scrolled back
+        // means typing blind into a prompt that is off screen.
+        let (mut app, mut rx) = app_attached_to(&numbered_lines(60));
+        if let Some(p) = app.parser.as_mut() {
+            p.screen_mut().set_scrollback(10);
+        }
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(scrolled_back(&app), 0);
+        assert_eq!(next_input(&mut rx), "a");
+    }
+
+    #[test]
+    fn shift_page_keys_scroll_the_pane_without_reaching_the_app() {
+        let (mut app, mut rx) = app_attached_to(&numbered_lines(200));
+        handle_key(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        let page = scrolled_back(&app);
+        assert!(page > 0, "Shift+PageUp did not scroll back");
+        handle_key(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert!(scrolled_back(&app) > page);
+        handle_key(&mut app, KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT));
+        assert_eq!(scrolled_back(&app), page);
+        assert!(rx.try_recv().is_err(), "scrolling keys must not reach the app");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_back_through_a_main_screen_app() {
+        let (mut app, mut rx) = app_attached_to(&numbered_lines(60));
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 40, 5));
+        assert_eq!(scrolled_back(&app), 3);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_wheel_over_a_full_screen_app_without_mouse_support_sends_arrows() {
+        // What every mainstream terminal does ("alternate scroll"): a pager or
+        // Codex's transcript view has no scrollback to show, so the wheel would
+        // otherwise do nothing at all.
+        let (mut app, mut rx) = app_attached_to(b"\x1b[?1049hpager");
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 40, 5));
+        assert_eq!(next_input(&mut rx), "\x1b[A\x1b[A\x1b[A");
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 40, 5));
+        assert_eq!(next_input(&mut rx), "\x1b[B\x1b[B\x1b[B");
+    }
+
+    #[test]
+    fn alternate_scroll_arrows_respect_application_cursor_mode() {
+        let (mut app, mut rx) = app_attached_to(b"\x1b[?1049h\x1b[?1h");
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 40, 5));
+        assert_eq!(next_input(&mut rx), "\x1bOA\x1bOA\x1bOA");
+    }
+
+    #[test]
+    fn a_scrolled_back_pane_says_so_in_its_border() {
+        let (mut app, _rx) = app_attached_to(&numbered_lines(60));
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 40, 5));
+        let shown = render(&app, 120, 30).join("\n");
+        assert!(shown.contains("scrolled"), "no scroll indicator:\n{shown}");
+    }
+
+    #[test]
+    fn an_apps_clipboard_write_is_passed_on_to_the_host_terminal() {
+        // OSC 52 is an app asking its terminal to set the system clipboard
+        // (Claude Code's copy does this). asm's emulator is that terminal; if it
+        // doesn't relay the request, the copy silently goes nowhere.
+        let (mut app, _rx) = app_attached_to(b"> ");
+        handle_daemon_event(
+            &mut app,
+            Event::Output { id: 1, data: b"\x1b]52;c;aGVsbG8=\x07".to_vec() },
+        );
+        assert_eq!(take_clipboard(&mut app), vec![b"\x1b]52;c;aGVsbG8=\x07".to_vec()]);
+        // Relayed once, not on every redraw.
+        assert!(take_clipboard(&mut app).is_empty());
+    }
+
+    fn detached(path: &str, head: &str, subject: &str) -> WorktreeInfo {
+        WorktreeInfo {
+            branch: git::DETACHED_BRANCH.into(),
+            head: head.into(),
+            subject: subject.into(),
+            ..wt(path, vec![], vec![])
+        }
+    }
+
+    const KS_ROOT: &str = "/Users/me/ks/keysavvy";
+
+    #[test]
+    fn a_codex_worktree_is_named_after_its_id_directory_not_the_repo() {
+        // Codex lays worktrees out as `~/.codex/worktrees/<id>/<repo>`, so the
+        // basename is the repo's name on every one of them.
+        let w = detached("/Users/me/.codex/worktrees/13d6/keysavvy", "0864a77", "");
+        assert_eq!(worktree_label(&w, KS_ROOT).0, "13d6 @0864a77");
+        let w = detached("/tmp/pr-6993-copy", "abfa0d9", "");
+        assert_eq!(worktree_label(&w, KS_ROOT).0, "pr-6993-copy @abfa0d9");
+    }
+
+    #[test]
+    fn a_detached_worktree_is_hinted_by_its_agent_before_its_commit() {
+        let mut w = detached("/w/13d6/keysavvy", "0864a77", "Merge main");
+        assert_eq!(worktree_label(&w, KS_ROOT).1.as_deref(), Some("Merge main"));
+        w.agents = vec![AgentInfo { title: "fix buyer null check".into(), ..agent("a") }];
+        assert_eq!(worktree_label(&w, KS_ROOT).1.as_deref(), Some("fix buyer null check"));
+        w.sessions = vec![agent_sess(3, "payout-refactor", AgentTool::Codex)];
+        assert_eq!(worktree_label(&w, KS_ROOT).1.as_deref(), Some("payout-refactor"));
+        // A plain shell says nothing about what the worktree is for.
+        w.sessions = vec![sess(4, "shell")];
+        assert_eq!(worktree_label(&w, KS_ROOT).1.as_deref(), Some("fix buyer null check"));
+    }
+
+    #[test]
+    fn a_detached_worktree_with_nothing_to_go_on_gets_no_hint() {
+        let w = detached("/w/x", "0864a77", "");
+        assert_eq!(worktree_label(&w, KS_ROOT), ("x @0864a77".to_string(), None));
+        let w = detached("/w/x", "", "");
+        assert_eq!(worktree_label(&w, KS_ROOT).0, "x (detached)");
+    }
+
+    #[test]
+    fn a_rebase_in_progress_shows_the_branch_being_rebased() {
+        let mut w = detached("/w/x", "0864a77", "wip");
+        w.rebasing = Some("feat/payouts".into());
+        assert_eq!(worktree_label(&w, KS_ROOT), ("feat/payouts (rebasing)".to_string(), None));
+    }
+
+    #[test]
+    fn a_branch_worktree_is_just_its_branch() {
+        let w = WorktreeInfo { branch: "dev/x".into(), ..wt("/w/x", vec![], vec![]) };
+        assert_eq!(worktree_label(&w, KS_ROOT), ("dev/x".to_string(), None));
+    }
+
+    #[test]
+    fn the_tree_draws_a_detached_worktree_by_its_label() {
+        let mut app = app_with(vec![detached("/w/13d6/keysavvy", "0864a77", "fix it")]);
+        app.root = KS_ROOT.into();
+        let shown = render(&app, 120, 20).join("\n");
+        assert!(shown.contains("13d6 @0864a77 fix it"), "tree:\n{shown}");
+        assert!(!shown.contains("(detached)"), "tree:\n{shown}");
+    }
+
+    #[test]
+    fn b_names_a_detached_worktrees_head_as_a_branch() {
+        let (mut app, mut rx) = app_with_rx(vec![detached("/w/x", "0864a77", "")]);
+        press(&mut app, 'b');
+        typed(&mut app, "dev/keep-this");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match rx.try_recv() {
+            Ok(Request::NameBranch { worktree, branch }) => {
+                assert_eq!(worktree, "/w/x");
+                assert_eq!(branch, "dev/keep-this");
+            }
+            other => panic!("expected NameBranch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn b_on_a_worktree_that_has_a_branch_changes_nothing() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/w/x", vec![], vec![])]);
+        press(&mut app, 'b');
+        assert!(app.prompt.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn force_removing_a_worktree_needs_a_typed_yes() {
+        let (mut app, mut rx) = app_with_rx(vec![detached("/w/x", "0864a77", "")]);
+        press(&mut app, 'D');
+        typed(&mut app, "y");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(rx.try_recv().is_err(), "anything but yes must not remove");
+
+        press(&mut app, 'D');
+        typed(&mut app, "yes");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match rx.try_recv() {
+            Ok(Request::RemoveWorktree { path, force }) => {
+                assert_eq!(path, "/w/x");
+                assert!(force);
+            }
+            other => panic!("expected a forced RemoveWorktree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_root_worktree_cannot_be_force_removed() {
+        let mut root = wt("/r", vec![], vec![]);
+        root.is_root = true;
+        let (mut app, _rx) = app_with_rx(vec![root]);
+        press(&mut app, 'D');
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn a_refused_remove_points_at_the_force_key() {
+        let mut app = app_with(vec![]);
+        app.parser = Some(new_term(24, 80));
+        handle_daemon_event(
+            &mut app,
+            Event::Error {
+                message: "'/w/x' contains modified or untracked files, use --force to delete it"
+                    .into(),
+            },
+        );
+        assert!(app.footer.contains("D force-removes"), "footer: {}", app.footer);
     }
 }

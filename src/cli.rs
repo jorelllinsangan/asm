@@ -25,6 +25,7 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncWriteExt;
 
 use crate::client::{agent_command, connect_or_spawn, cute_name};
+use crate::handshake::OnMismatch;
 use crate::ipc::{Frame, read_frame, write_frame};
 use crate::paths;
 use crate::protocol::{AgentTool, Event, Request, SessionId, WorktreeInfo};
@@ -91,7 +92,7 @@ fn session_finished(worktrees: &[WorktreeInfo], id: SessionId) -> bool {
 /// rendering for free — the daemon keeps its own emulator/status parser
 /// regardless of who is attached, so this stays a dumb pipe.
 pub async fn attach(root: PathBuf, id: SessionId) -> Result<()> {
-    let stream = connect_or_spawn(&root).await?;
+    let stream = connect_or_spawn(&root, OnMismatch::Warn).await?;
     let (mut rd, mut wr) = stream.into_split();
 
     let _raw = RawGuard::enter();
@@ -187,7 +188,7 @@ pub async fn attach(root: PathBuf, id: SessionId) -> Result<()> {
 /// A front-end drives its sidebar straight off this stream — all protocol
 /// decoding stays here in Rust, leaving the front-end to only render.
 pub async fn tree(root: PathBuf, watch: bool) -> Result<()> {
-    let stream = connect_or_spawn(&root).await?;
+    let stream = connect_or_spawn(&root, OnMismatch::Warn).await?;
     let (mut rd, mut wr) = stream.into_split();
     write_frame(&mut wr, &Request::Hello).await?;
 
@@ -242,7 +243,7 @@ async fn request_until<T>(
     req: Request,
     mut pick: impl FnMut(&Event) -> Option<T>,
 ) -> Result<T> {
-    let stream = connect_or_spawn(root).await?;
+    let stream = connect_or_spawn(root, OnMismatch::Warn).await?;
     let (mut rd, mut wr) = stream.into_split();
     write_frame(&mut wr, &req).await?;
 

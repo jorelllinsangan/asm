@@ -14,3 +14,11 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "macros", "time", "process", "signal"] }
 tui-term = "0.3.4"
 vt100 = "0.16.2"
+
+# vt100 is vendored with one behavioural fix (see vendor/vt100/PATCHES.md): rows
+# scrolled off the top of a scroll region anchored at the top of the screen go
+# to scrollback, as in xterm. Codex's inline UI writes its whole history that
+# way, so without the fix none of it can be scrolled back to. tui-term shares
+# the dependency, so the patch has to be crate-wide rather than a local fork.
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
