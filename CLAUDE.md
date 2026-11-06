@@ -74,8 +74,12 @@ cargo build --release
 pgrep -fl 'asm daemon'    # confirm what's running (and spot stale daemons by start time)
 ```
 
-`pkill -f 'asm daemon'` still works as a manual reset, but it matches *every*
-repo's daemon — including one hosting the session you're working from.
+For a manual reset of *this* repo's daemon use `asm --kill-daemon` (asks first
+if it has live sessions; `--force` skips that, and is required when stdin isn't a
+terminal). It finds the PID from the socket's peer credentials, so it never
+touches another repo's daemon and never spawns one. `pkill -f 'asm daemon'` still
+works, but it matches *every* repo's daemon — including one hosting the session
+you're working from.
 
 Spawn/env changes (e.g. `shell_argv`) apply only to **newly created** sessions;
 existing sessions keep the shell they were born with.

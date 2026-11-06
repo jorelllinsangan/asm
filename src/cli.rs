@@ -346,3 +346,106 @@ pub async fn new_worktree(root: &Path, branch: String) -> Result<()> {
 pub async fn rm_worktree(root: &Path, path: String, force: bool) -> Result<()> {
     request_until(root, Request::RemoveWorktree { path, force }, on_tree).await
 }
+
+/// What `asm --kill-daemon` does once it knows how many live sessions the
+/// daemon would take down with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillPlan {
+    /// Nothing would be lost, or `--force` was given: stop it.
+    Stop,
+    /// Live sessions and someone at a terminal: ask first.
+    Ask,
+    /// Live sessions, no terminal to ask on and no `--force`: refuse. A script
+    /// must opt in to ending sessions; it never does so by default.
+    Refuse,
+}
+
+/// `live` is `None` when the daemon didn't answer the build query, so its
+/// session count is unknown — treated as "might have some".
+fn kill_plan(live: Option<usize>, force: bool, interactive: bool) -> KillPlan {
+    if force || live == Some(0) {
+        KillPlan::Stop
+    } else if interactive {
+        KillPlan::Ask
+    } else {
+        KillPlan::Refuse
+    }
+}
+
+/// `asm --kill-daemon [--force]`: stop this repo's daemon. Never spawns one —
+/// with nothing listening on the socket there is nothing to stop. Its sessions
+/// end with it (agent transcripts stay on disk, resumable).
+pub async fn kill_daemon(root: &Path, force: bool) -> Result<()> {
+    use std::io::IsTerminal as _;
+    use tokio::net::UnixStream;
+
+    let sock = paths::socket_path(root);
+    let Ok(mut stream) = UnixStream::connect(&sock).await else {
+        println!("no asm daemon running for {}", root.display());
+        return Ok(());
+    };
+    let live = match tokio::time::timeout(
+        crate::handshake::QUERY_TIMEOUT,
+        crate::handshake::query(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(theirs)) => Some(theirs.live),
+        Ok(Err(_)) | Err(_) => None,
+    };
+    let pid = crate::handshake::peer_pid(&stream)?;
+    let sessions = match live {
+        Some(n) => format!("{n} live session(s)"),
+        None => "an unknown number of live sessions".to_string(),
+    };
+    match kill_plan(live, force, std::io::stdin().is_terminal()) {
+        KillPlan::Stop => {}
+        KillPlan::Ask => {
+            let prompt = format!(
+                "asm: the daemon for {} (pid {pid}) has {sessions}; stopping it ends them. \
+                 Agent transcripts stay on disk and can be resumed.\nStop it? [y/N] ",
+                root.display(),
+            );
+            if !crate::handshake::confirm(prompt).await? {
+                println!("left the daemon running");
+                return Ok(());
+            }
+        }
+        KillPlan::Refuse => bail!(
+            "the daemon (pid {pid}) has {sessions}; pass --force to stop it anyway"
+        ),
+    }
+    drop(stream);
+    crate::handshake::stop_daemon(pid).await?;
+    println!("stopped the asm daemon for {} (pid {pid}; ended {sessions})", root.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_daemon_with_no_live_sessions_is_stopped_without_asking() {
+        assert_eq!(kill_plan(Some(0), false, true), KillPlan::Stop);
+        assert_eq!(kill_plan(Some(0), false, false), KillPlan::Stop);
+    }
+
+    #[test]
+    fn live_sessions_are_asked_about_at_a_terminal_and_refused_in_a_script() {
+        assert_eq!(kill_plan(Some(2), false, true), KillPlan::Ask);
+        assert_eq!(kill_plan(Some(2), false, false), KillPlan::Refuse);
+    }
+
+    #[test]
+    fn force_stops_it_whatever_is_running() {
+        assert_eq!(kill_plan(Some(2), true, false), KillPlan::Stop);
+        assert_eq!(kill_plan(None, true, false), KillPlan::Stop);
+    }
+
+    #[test]
+    fn an_unknown_session_count_is_treated_as_possibly_live() {
+        assert_eq!(kill_plan(None, false, true), KillPlan::Ask);
+        assert_eq!(kill_plan(None, false, false), KillPlan::Refuse);
+    }
+}

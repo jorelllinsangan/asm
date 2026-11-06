@@ -47,6 +47,11 @@ fn main() -> Result<()> {
             println!("asm {} {}", env!("CARGO_PKG_VERSION"), handshake::BUILD_LABEL);
             Ok(())
         }
+        Some("--kill-daemon") | Some("kill-daemon") => {
+            let root = resolve_root()?;
+            let force = args[2..].iter().any(|a| a == "--force" || a == "-f");
+            runtime()?.block_on(cli::kill_daemon(&root, force))
+        }
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -149,7 +154,9 @@ fn print_help() {
          asm            launch the TUI (spawns the daemon if needed)\n  \
          asm daemon     run the background server in the foreground\n  \
          asm --help     show this help\n  \
-         asm --version  show the build (compared against a running daemon's on connect)\n\n\
+         asm --version  show the build (compared against a running daemon's on connect)\n  \
+         asm --kill-daemon [--force]  stop this repo's daemon (ends its sessions; asks first\n  \
+                        if any are live, or needs --force when not at a terminal)\n\n\
          HEADLESS (for front-ends like the neovim plugin; each spawns the daemon if needed):\n  \
          asm tree [--watch]                         tree snapshot(s) as newline-delimited JSON\n  \
          asm attach <id>                            raw byte pipe to a live session's PTY\n  \

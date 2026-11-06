@@ -323,6 +323,7 @@ Neovim plugin) build on. Each spawns the daemon if needed:
 asm tree [--watch]                       # tree as newline-delimited JSON (stream with --watch)
 asm attach <id>                          # raw byte pipe to a live session's PTY
 asm socket-path                          # this repo's daemon socket path
+asm --kill-daemon [--force]              # stop this repo's daemon (ends its sessions)
 asm new-session <wt> <shell|claude|opencode|codex> [name]   # spawn; prints new id
 asm resume <wt> <claude|opencode|codex> <session-id>        # resume on-disk agent; prints new id
 asm kill <id> · asm rename <id> <name> · asm refresh
@@ -350,6 +351,8 @@ their own: on a mismatch they warn on stderr and use the running daemon. Launch
 `asm` to restart it. As a manual reset:
 
 ```
+asm --kill-daemon         # stops this repo's daemon (asks first if sessions are live)
+asm --kill-daemon --force # same, without asking (needed from scripts)
 pkill -f 'asm daemon'     # stops every repo's daemon (ends live sessions)
 ```
 

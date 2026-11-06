@@ -169,10 +169,6 @@ pub async fn stop_daemon(pid: i32) -> Result<()> {
 /// Ask on the terminal whether to restart a mismatched daemon. Answers "no"
 /// without asking when stdin isn't a terminal, since nobody is there to answer.
 pub async fn confirm_restart(theirs: &DaemonBuild, root: &Path) -> Result<bool> {
-    use std::io::IsTerminal as _;
-    if !std::io::stdin().is_terminal() {
-        return Ok(false);
-    }
     let prompt = format!(
         "asm: the daemon for {} is running a different build ({}; this binary is {}).\n\
          Restarting it ends {} live session(s). Agent transcripts stay on disk and can be resumed.\n\
@@ -182,6 +178,16 @@ pub async fn confirm_restart(theirs: &DaemonBuild, root: &Path) -> Result<bool> 
         BUILD_LABEL,
         theirs.live,
     );
+    confirm(prompt).await
+}
+
+/// Print `prompt` on stderr and read a yes/no answer from stdin. "No" without
+/// asking when stdin isn't a terminal, since nobody is there to answer.
+pub async fn confirm(prompt: String) -> Result<bool> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
     let answer = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
         use std::io::Write as _;
         let mut err = std::io::stderr();
