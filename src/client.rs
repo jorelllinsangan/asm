@@ -3215,6 +3215,7 @@ fn draw(f: &mut Frame, app: &App) {
     // Modal, so it goes last — over whatever the right pane drew.
     draw_comment_editor(f, app, right);
     draw_board(f, app, main);
+    draw_pick(f, app, main);
     if app.floating() {
         let r = float_rect(main);
         f.render_widget(Clear, r);
@@ -4634,6 +4635,16 @@ struct Board {
     /// has the keyboard. Hiding it (`Ctrl+Q`) only stops drawing it; the session
     /// stays attached, so closing the board leaves it in the right-hand pane.
     float: bool,
+    /// `Enter` on a card with more than one session: which one to open.
+    pick: Option<SessionPick>,
+}
+
+/// The board's session picker, over one card's worktree. Keyed by path, not
+/// tree index, since a tree push can reorder the worktrees under it.
+struct SessionPick {
+    path: String,
+    /// Index into [`pick_hits`].
+    selected: usize,
 }
 
 /// What the board shows: the lanes on screen, each with its cards as indices
@@ -4737,6 +4748,10 @@ fn board_selected(app: &App) -> Option<usize> {
 }
 
 fn handle_board_key(app: &mut App, key: KeyEvent) {
+    if app.board.as_ref().is_some_and(|b| b.pick.is_some()) {
+        handle_pick_key(app, key);
+        return;
+    }
     let all = app.board.as_ref().is_some_and(|b| b.all);
     let lane_count = board_lanes(app, all).lanes.len();
     let selected = board_selected(app);
@@ -4767,7 +4782,15 @@ fn handle_board_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             if let Some(i) = selected {
-                float_newest(app, i);
+                if pick_hits(app, i).len() > 1 {
+                    let path = app.tree[i].path.clone();
+                    if let Some(b) = app.board.as_mut() {
+                        b.pick = Some(SessionPick { path, selected: 0 });
+                    }
+                    app.footer = PICK_HINT.into();
+                } else {
+                    float_newest(app, i);
+                }
             }
         }
         // Start a session in the card's worktree: the tree's own flow (name
@@ -4799,13 +4822,20 @@ fn float_newest(app: &mut App, wt: usize) {
         return;
     };
     let live = w.sessions.iter().any(|s| s.status != Status::Exited);
+    float_open(app, live, |app| open_newest(app, wt));
+}
+
+/// Float a session over the board, opened by `open` (which reports whether it
+/// opened anything). `live` is whether it attaches an existing session, as
+/// opposed to resuming a past one.
+fn float_open(app: &mut App, live: bool, open: impl FnOnce(&mut App) -> bool) {
     // Float first, so the session is attached at the float's size.
     if let Some(b) = app.board.as_mut() {
         b.float = true;
     }
     relayout(app);
     let previous = app.attached;
-    if !open_newest(app, wt) {
+    if !open(app) {
         if let Some(b) = app.board.as_mut() {
             b.float = false;
         }
@@ -4820,6 +4850,110 @@ fn float_newest(app: &mut App, wt: usize) {
     }
     app.focus_term();
     app.footer = if live { FLOAT_HINT.into() } else { "resuming session…".into() };
+}
+
+const PICK_HINT: &str = "PICK A SESSION · j/k move · Enter open · Esc back to the board";
+
+/// What the picker offers for a worktree: its live sessions, newest first,
+/// then its past ones (newest first, as the daemon sends them) to resume.
+fn pick_hits(app: &App, wt: usize) -> Vec<Hit> {
+    let Some(w) = app.tree.get(wt) else {
+        return Vec::new();
+    };
+    let mut live: Vec<usize> = (0..w.sessions.len())
+        .filter(|&i| w.sessions[i].status != Status::Exited)
+        .collect();
+    live.sort_by_key(|&i| std::cmp::Reverse(w.sessions[i].id));
+    live.into_iter()
+        .map(|i| Hit::Session(wt, i))
+        .chain((0..w.agents.len()).map(|i| Hit::Agent(wt, i)))
+        .collect()
+}
+
+/// The picker's worktree (by its path) and what it offers right now.
+fn pick_state(app: &App) -> Option<(usize, usize, Vec<Hit>)> {
+    let pick = app.board.as_ref()?.pick.as_ref()?;
+    let wt = app.tree.iter().position(|w| w.path == pick.path)?;
+    let hits = pick_hits(app, wt);
+    let selected = pick.selected.min(hits.len().saturating_sub(1));
+    Some((wt, selected, hits))
+}
+
+fn close_pick(app: &mut App) {
+    if let Some(b) = app.board.as_mut() {
+        b.pick = None;
+    }
+    app.footer = BOARD_HINT.into();
+}
+
+fn handle_pick_key(app: &mut App, key: KeyEvent) {
+    let Some((_, selected, hits)) = pick_state(app) else {
+        // Its worktree went away under it.
+        close_pick(app);
+        return;
+    };
+    let last = hits.len().saturating_sub(1);
+    let set = |app: &mut App, i: usize| {
+        if let Some(p) = app.board.as_mut().and_then(|b| b.pick.as_mut()) {
+            p.selected = i;
+        }
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => close_pick(app),
+        KeyCode::Char('j') | KeyCode::Down => set(app, (selected + 1).min(last)),
+        KeyCode::Char('k') | KeyCode::Up => set(app, selected.saturating_sub(1)),
+        KeyCode::Enter => {
+            close_pick(app);
+            if let Some(&hit) = hits.get(selected) {
+                let live = matches!(hit, Hit::Session(..));
+                float_open(app, live, |app| {
+                    open_hit(app, hit);
+                    true
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn draw_pick(f: &mut Frame, app: &App, area: Rect) {
+    let Some((wt, selected, hits)) = pick_state(app) else {
+        return;
+    };
+    let popup = centered_rect(area, 70, 60);
+    f.render_widget(Clear, popup);
+    let name = worktree_display(&app.tree[wt], &app.root).0;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {name} · {} sessions ", hits.len()))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let width = usize::from(inner.width);
+    let mut lines = Vec::new();
+    let mut pick_line = 0;
+    let mut last_kind = None;
+    for (i, &hit) in hits.iter().enumerate() {
+        let kind = match hit {
+            Hit::Session(..) => "LIVE SESSIONS",
+            _ => "PAST SESSIONS · Enter resumes",
+        };
+        if last_kind != Some(kind) {
+            lines.push(Line::from(Span::styled(
+                kind,
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+            )));
+            last_kind = Some(kind);
+        }
+        let mut line = hit_line(app, hit, width);
+        if i == selected {
+            pick_line = lines.len();
+            line = line.patch_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        lines.push(line);
+    }
+    let skip = (pick_line + 1).saturating_sub(usize::from(inner.height));
+    f.render_widget(Paragraph::new(lines).scroll((skip as u16, 0)), inner);
 }
 
 /// A session started from the board floats over it once created: float now,
@@ -5664,6 +5798,38 @@ mod tests {
         relayout(&mut app);
         open_board(&mut app);
         (app, rx)
+    }
+
+    #[test]
+    fn enter_on_a_card_with_several_sessions_asks_which_to_open() {
+        let (mut app, mut rx) =
+            app_with_rx(vec![wt("/r/a", vec![running(7, "older"), running(8, "newer")], vec![])]);
+        app.screen_cols = 120;
+        app.right_outer = (120 - LEFT_WIDTH, 40);
+        relayout(&mut app);
+        open_board(&mut app);
+        drain(&mut rx);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        let (_, selected, hits) = pick_state(&app).expect("a picker, not a float");
+        assert!(!app.floating());
+        assert_eq!(hits, vec![Hit::Session(0, 1), Hit::Session(0, 0)], "newest first");
+        assert_eq!(selected, 0);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(pick_state(&app).is_none() && app.board.is_some(), "Esc backs out to the board");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(pick_state(&app).is_none());
+        assert!(app.floating(), "the pick floats over the board");
+        let dims = { let r = app.float_area(); inner_dims(r.width, r.height) };
+        let sent = drain(&mut rx);
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::Attach { id: 7, cols, rows } if (*cols, *rows) == dims)),
+            "opened the picked (older) session at the float's size: {sent:?}"
+        );
     }
 
     #[test]
