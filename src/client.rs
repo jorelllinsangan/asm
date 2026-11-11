@@ -473,7 +473,7 @@ impl App {
         self.footer = if w.is_root {
             format!("{name} is the root; it always stays")
         } else if self.working.join(&path) {
-            format!("working on {name}")
+            format!("working on {name} · P parks it")
         } else {
             format!("already working on {name}")
         };
@@ -2184,6 +2184,7 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => hide_nav(app),
         KeyCode::Char(' ') => app.toggle_collapse_selected(),
         KeyCode::Char('z') => app.toggle_collapse_all(),
+        KeyCode::Tab => next_needing_you(app),
         KeyCode::Char('p') => {
             if let Some(i) = app.selected_row().and_then(row_worktree) {
                 app.work_on(i);
@@ -2320,6 +2321,25 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// `Tab`: move to the next session that needs you, after the selection and
+/// wrapping around. Its worktree is unfolded so the row can be selected.
+fn next_needing_you(app: &mut App) {
+    let waiting: Vec<SessionId> =
+        app.inbox().iter().map(|&(wt, se)| app.tree[wt].sessions[se].id).collect();
+    if waiting.is_empty() {
+        app.footer = "nothing needs you".into();
+        return;
+    }
+    let current = match app.selected_row() {
+        Some(Row::Session { wt, se } | Row::Inbox { wt, se }) => Some(app.tree[wt].sessions[se].id),
+        _ => None,
+    };
+    let next = current
+        .and_then(|id| waiting.iter().position(|w| *w == id))
+        .map_or(0, |i| (i + 1) % waiting.len());
+    app.reveal(RowKey::Session(waiting[next]));
 }
 
 /// Open the selected session (attach) or agent (resume). Returns false when the
@@ -3657,6 +3677,7 @@ fn draw_finder(f: &mut Frame, app: &App, area: Rect) {
 const KEY_SHEET: &[(&str, &[(&str, &str)])] = &[
     ("SESSIONS", &[
         ("Enter", "open, or resume a past one"),
+        ("Tab", "next session that needs you"),
         ("c C o", "new claude · codex · opencode"),
         ("n", "new shell"),
         ("R", "rename"),
@@ -4178,10 +4199,14 @@ fn agent_line(a: &AgentInfo, depth: usize, width: Option<usize>) -> Line<'static
 fn draw_tree(f: &mut Frame, app: &App, area: Rect) {
     let items = tree_items(app, Some(usize::from(area.width.saturating_sub(2))));
 
-    let title = format!(" {} ", short_path(&app.root));
+    let mut title = vec![Span::raw(format!(" {} ", short_path(&app.root)))];
+    let waiting = app.inbox().len();
+    if waiting > 0 {
+        title.push(Span::styled(format!("· {waiting} need you (Tab) "), Style::default().fg(Color::Yellow)));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
+        .title(Line::from(title))
         .border_style(border_style(app.focus == Focus::Nav));
     let list = List::new(items)
         .block(block)
