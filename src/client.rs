@@ -2085,11 +2085,9 @@ fn toggle_editor(app: &mut App) {
         app.footer = "select a worktree first".into();
         return;
     };
-    app.send(Request::OpenEditor {
-        worktree,
-        command: resolve_editor_command(),
-    });
-    app.footer = "opening editor…".into();
+    let (command, warning) = resolve_editor_command(&app.root);
+    app.send(Request::OpenEditor { worktree, command });
+    app.footer = warning.unwrap_or_else(|| "opening editor…".into());
 }
 
 /// The session a review may be pasted into: the one you're attached to, so long
@@ -2179,18 +2177,50 @@ fn submit_review(app: &mut App) {
     };
 }
 
-/// Which editor binary to launch: `$ASM_EDITOR` → `$EDITOR` → `vi`.
-fn resolve_editor_command() -> String {
-    pick_editor(
+/// Which editor to launch: `$ASM_EDITOR` → the repo's `.asm.json` → `$EDITOR`
+/// → `vi`. Read on every `Ctrl+]`, so an edit to the file applies to the next
+/// editor opened, no relaunch. A broken file falls through to `$EDITOR` and
+/// comes back as a footer warning rather than failing the open.
+fn resolve_editor_command(root: &str) -> (String, Option<String>) {
+    let (repo, warning) = match repo_editor(Path::new(root)) {
+        Ok(e) => (e, None),
+        Err(e) => (None, Some(format!("{REPO_CONFIG}: {e} — ignored it"))),
+    };
+    let command = pick_editor(
         std::env::var("ASM_EDITOR").ok().as_deref(),
+        repo.as_deref(),
         std::env::var("EDITOR").ok().as_deref(),
-    )
+    );
+    (command, warning)
 }
 
-/// Editor precedence, factored out for testing: `ASM_EDITOR` → `EDITOR` → `vi`,
-/// treating an unset or blank/whitespace value as absent.
-fn pick_editor(asm_editor: Option<&str>, editor: Option<&str>) -> String {
-    [asm_editor, editor]
+/// Per-repo settings, in the root worktree so every worktree of the repo (and
+/// so every one the daemon serves) shares them. JSON rather than TOML only
+/// because `serde_json` is already a dependency and a new crate changes the
+/// daemon's build id. Today it holds one key: `{"editor": "nvim"}`.
+const REPO_CONFIG: &str = ".asm.json";
+
+/// The `editor` in the repo's [`REPO_CONFIG`]: `None` with no file or no key,
+/// an error for a file that's there but unusable.
+fn repo_editor(root: &Path) -> Result<Option<String>, String> {
+    let text = match std::fs::read_to_string(root.join(REPO_CONFIG)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let config: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    match config.get("editor") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err("\"editor\" must be a string".into()),
+    }
+}
+
+/// Editor precedence, factored out for testing: `ASM_EDITOR` → the repo's
+/// config → `EDITOR` → `vi`, treating an unset or blank/whitespace value as
+/// absent.
+fn pick_editor(asm_editor: Option<&str>, repo: Option<&str>, editor: Option<&str>) -> String {
+    [asm_editor, repo, editor]
         .into_iter()
         .flatten()
         .find(|v| !v.trim().is_empty())
@@ -6526,11 +6556,30 @@ mod tests {
 
     #[test]
     fn pick_editor_precedence_and_blank_handling() {
-        assert_eq!(pick_editor(Some("nvim"), Some("hx")), "nvim"); // ASM_EDITOR wins
-        assert_eq!(pick_editor(None, Some("hx")), "hx"); // falls back to EDITOR
-        assert_eq!(pick_editor(Some("  "), Some("hx")), "hx"); // blank ASM_EDITOR skipped
-        assert_eq!(pick_editor(Some(""), None), "vi"); // final fallback
-        assert_eq!(pick_editor(None, None), "vi");
+        assert_eq!(pick_editor(Some("nvim"), Some("zed"), Some("hx")), "nvim"); // ASM_EDITOR wins
+        assert_eq!(pick_editor(None, Some("zed"), Some("hx")), "zed"); // then the repo's file
+        assert_eq!(pick_editor(None, None, Some("hx")), "hx"); // falls back to EDITOR
+        assert_eq!(pick_editor(Some("  "), Some(" "), Some("hx")), "hx"); // blanks skipped
+        assert_eq!(pick_editor(Some(""), None, None), "vi"); // final fallback
+        assert_eq!(pick_editor(None, None, None), "vi");
+    }
+
+    #[test]
+    fn the_repo_config_names_the_editor_and_reports_a_broken_file() {
+        let dir = std::env::temp_dir().join(format!("asm-repo-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(REPO_CONFIG);
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(repo_editor(&dir), Ok(None), "no file");
+        std::fs::write(&file, r#"{"editor": "nvim -c 'Neotree'"}"#).unwrap();
+        assert_eq!(repo_editor(&dir), Ok(Some("nvim -c 'Neotree'".into())));
+        std::fs::write(&file, "{}").unwrap();
+        assert_eq!(repo_editor(&dir), Ok(None), "no key");
+        std::fs::write(&file, r#"{"editor": 3}"#).unwrap();
+        assert!(repo_editor(&dir).is_err(), "wrong type");
+        std::fs::write(&file, "editor = nvim").unwrap();
+        assert!(repo_editor(&dir).is_err(), "not JSON");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

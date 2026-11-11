@@ -252,7 +252,8 @@ The catch: a client connection historically streamed **one** session
 `DetachEditor`, reusing `attach()` / `forward_output()`. Both tasks push to the
 same socket; the client routes by the `id` on every `Attached`/`Output` event
 (`app.editor` vs `app.attached`, each with its own `vt100::Parser`). Editor
-command is resolved **client-side** (`$ASM_EDITOR` → `$EDITOR` → `vi`) and passed
+command is resolved **client-side** (`$ASM_EDITOR` → `<root>/.asm.json`'s
+`editor` → `$EDITOR` → `vi`; `resolve_editor_command`) and passed
 in `OpenEditor`, since the daemon's env is frozen at spawn time. A `:q`'d editor
 becomes an exited ghost (no session reaper) — `open_editor` detects and respawns
 it. Split geometry lives in one helper (`split_widths`) used by both
@@ -517,5 +518,7 @@ mirroring the shell `n` flow; a blank name falls back to `cute_name()`
   agree on the same socket key).
 - `ASM_OPENCODE_DB` — path to the OpenCode SQLite DB.
 - `ASM_CODEX_SESSIONS` — root of Codex rollout transcripts (default `~/.codex/sessions`).
-- `ASM_EDITOR` — editor for the `Ctrl+]` split view (falls back to `$EDITOR`,
-  then `vi`); resolved client-side.
+- `ASM_EDITOR` — editor for the `Ctrl+]` split view (falls back to the root
+  worktree's `.asm.json` `{"editor": …}`, then `$EDITOR`, then `vi`); resolved
+  client-side. `.asm.json` is JSON, not TOML, only because a new crate would
+  change the daemon's build id.

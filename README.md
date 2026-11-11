@@ -125,12 +125,22 @@ intercepted by asm before any input reaches the editor, it always works even
 though the editor (vim/helix/…) otherwise captures every key — so you can hop
 back to the AI session without quitting your editor.
 
-The editor is chosen from `$ASM_EDITOR`, then `$EDITOR`, falling back to `vi`,
-and opens in the worktree of the session you're viewing. There is one editor per
-worktree, spawned on first use; it never shows up as a session in the tree.
+The editor is chosen from `$ASM_EDITOR`, then the repo's `.asm.json`, then
+`$EDITOR`, falling back to `vi`, and opens in the worktree of the session you're
+viewing. There is one editor per worktree, spawned on first use; it never shows
+up as a session in the tree.
 
 ```
 ASM_EDITOR=nvim asm
+```
+
+`.asm.json` lives in the repo's root worktree (the main checkout), so it applies
+to every worktree of the repo. It's read each time you press `Ctrl+]`, so an
+edit applies to the next editor opened. It's your preference, so you'll likely
+want it gitignored:
+
+```json
+{ "editor": "nvim" }
 ```
 
 ### Terminal drawer
