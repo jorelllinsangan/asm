@@ -3969,11 +3969,11 @@ fn dim() -> Style {
 
 fn group_title(g: Group) -> (&'static str, &'static str) {
     match g {
-        Group::NeedsYou => ("NEEDS YOU", "finished since you last looked"),
-        Group::Working => ("WORKING", "P parks"),
-        Group::Parked => ("PARKED", "p brings one back"),
-        Group::Merged => ("MERGED", "PR merged"),
-        Group::Tools => ("TOOL CHECKOUTS", "codex · opencode"),
+        Group::NeedsYou => ("Needs you", "finished since you last looked"),
+        Group::Working => ("Working", "P parks"),
+        Group::Parked => ("Parked", "p brings one back"),
+        Group::Merged => ("Merged", "PR merged"),
+        Group::Tools => ("Tool checkouts", "codex · opencode"),
     }
 }
 
@@ -4571,13 +4571,12 @@ struct BoardLanes {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Lane {
     NoPr,
-    Draft,
-    /// Open and not a draft, whatever its review says: the card says that.
+    /// Open, draft or not, whatever its review says: the card says that.
     InReview,
     Merged,
 }
 
-const LANES: [Lane; 4] = [Lane::NoPr, Lane::Draft, Lane::InReview, Lane::Merged];
+const LANES: [Lane; 3] = [Lane::NoPr, Lane::InReview, Lane::Merged];
 
 const BOARD_HINT: &str =
     "BOARD · h/l lane · j/k card · Enter open newest session · p/P work on/park · O PR · i hidden · g back";
@@ -4585,7 +4584,6 @@ const BOARD_HINT: &str =
 fn lane_title(lane: Lane) -> &'static str {
     match lane {
         Lane::NoPr => "No PR",
-        Lane::Draft => "Draft",
         Lane::InReview => "In review",
         Lane::Merged => "Merged",
     }
@@ -4596,8 +4594,7 @@ fn lane_of(w: &WorktreeInfo) -> Lane {
         None => Lane::NoPr,
         Some(pr) => match pr.state {
             PrState::Merged => Lane::Merged,
-            PrState::Draft => Lane::Draft,
-            PrState::Open => Lane::InReview,
+            PrState::Draft | PrState::Open => Lane::InReview,
         },
     }
 }
@@ -5482,8 +5479,7 @@ mod tests {
             lanes,
             [
                 (Lane::NoPr, vec!["/r/none"]),
-                (Lane::Draft, vec!["/r/draft"]),
-                (Lane::InReview, vec!["/r/open"]),
+                (Lane::InReview, vec!["/r/draft", "/r/open"]),
             ]
         );
         assert_eq!(shown.merged, 1, "the merged lane is hidden and counted");
