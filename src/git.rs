@@ -229,6 +229,27 @@ pub fn commit_subjects(repo: &Path, shas: &[&str]) -> HashMap<String, String> {
     out
 }
 
+/// Commit time (seconds since the epoch) of each commit in `shas`, keyed by
+/// full SHA, in one `git` process. Unknown SHAs are simply absent.
+pub fn commit_times(repo: &Path, shas: &[&str]) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    if shas.is_empty() {
+        return out;
+    }
+    let mut args =
+        vec!["log", "--no-walk=unsorted", "--ignore-missing", "--no-color", "--format=%H%x09%ct"];
+    args.extend_from_slice(shas);
+    let raw = run(&args, repo).unwrap_or_default();
+    for line in raw.lines() {
+        if let Some((sha, secs)) = line.split_once('\t') {
+            if let Ok(secs) = secs.trim().parse() {
+                out.insert(sha.to_string(), secs);
+            }
+        }
+    }
+    out
+}
+
 /// The branch a worktree is partway through rebasing, if any.
 ///
 /// Git detaches HEAD for the duration of a rebase, so the worktree lists as
@@ -396,6 +417,31 @@ fn copy_one(src: &Path, dst: &Path) -> std::io::Result<()> {
 pub fn prune_worktrees(root: &Path) -> Result<()> {
     run(&["worktree", "prune"], root)?;
     Ok(())
+}
+
+/// Whether `worktree` holds uncommitted work: staged, unstaged, or untracked
+/// files (ignored files don't count). An error reads as dirty, so a worktree
+/// git can't inspect is never offered for cleanup.
+pub fn has_uncommitted_work(worktree: &Path) -> bool {
+    run(&["status", "--porcelain"], worktree).map_or(true, |out| !out.trim().is_empty())
+}
+
+/// Commit time of `worktree`'s HEAD, in seconds since the epoch.
+pub fn head_commit_secs(worktree: &Path) -> Option<u64> {
+    run(&["log", "-1", "--format=%ct"], worktree)
+        .ok()
+        .and_then(|out| out.trim().parse().ok())
+}
+
+/// Whether commit `a` is an ancestor of commit `b`. False when either is
+/// unknown to the repo (e.g. a PR head that was never fetched).
+pub fn is_ancestor(cwd: &Path, a: &str, b: &str) -> bool {
+    Command::new("git")
+        .args(["merge-base", "--is-ancestor", a, b])
+        .current_dir(cwd)
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 pub fn remove_worktree(root: &Path, path: &Path, force: bool) -> Result<()> {

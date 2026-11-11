@@ -69,6 +69,9 @@ pub enum Request {
     /// Ask for the reviewable diff of `worktree` (see [`crate::git::review_diff`]).
     /// Daemon replies [`Event::Diff`].
     Diff { worktree: String },
+    /// Ask which worktrees look safe to clean up (see [`crate::stale`]).
+    /// Daemon replies [`Event::StaleWorktrees`]; nothing is removed.
+    FindStaleWorktrees { idle_days: u64 },
     /// Forward bytes to the session's PTY.
     Input { id: SessionId, data: Vec<u8> },
     Resize { id: SessionId, cols: u16, rows: u16 },
@@ -106,6 +109,12 @@ pub enum Event {
         skipped_untracked: usize,
     },
     Error { message: String },
+    /// Reply to [`Request::FindStaleWorktrees`]: the candidates, plus a note on
+    /// what couldn't be checked or was held back.
+    StaleWorktrees {
+        worktrees: Vec<StaleWorktree>,
+        note: String,
+    },
     /// Reply to [`Request::Version`]. `build` is compared against the client's
     /// own build id; `label` is only for showing a human which build is running;
     /// `live` counts sessions that a restart would end (editors included).
@@ -137,6 +146,13 @@ pub struct WorktreeInfo {
     /// record a birthtime, or from an older daemon.
     #[serde(default)]
     pub created_secs: Option<u64>,
+    /// Latest sign of activity in seconds since the epoch: the HEAD commit, the
+    /// directory's creation, live session output, the newest agent transcript.
+    #[serde(default)]
+    pub last_active_secs: Option<u64>,
+    /// The pull request for this worktree's branch, if `gh` knows one.
+    #[serde(default)]
+    pub pr: Option<PrBadge>,
     /// Live PTY sessions asm is running in this worktree.
     pub sessions: Vec<SessionInfo>,
     /// Existing (on-disk, not currently live) Claude Code sessions for this
@@ -154,6 +170,34 @@ pub struct SessionInfo {
     /// Drives the tool glyph shown in the tree.
     #[serde(default)]
     pub agent: Option<AgentTool>,
+    /// Produced output since the user last looked at it.
+    #[serde(default)]
+    pub unread: bool,
+    /// Seconds since the session last produced output.
+    #[serde(default)]
+    pub idle_secs: u64,
+}
+
+/// A worktree's pull request, as the tree shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrBadge {
+    pub number: u64,
+    pub state: PrState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrState {
+    Open,
+    Draft,
+    Merged,
+}
+
+/// A worktree `X` offers to remove, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleWorktree {
+    pub path: String,
+    pub branch: String,
+    pub reason: String,
 }
 
 /// Which agent CLI a discovered session belongs to.

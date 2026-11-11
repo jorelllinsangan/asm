@@ -10,7 +10,8 @@ use crate::git;
 use crate::handshake;
 use crate::paths;
 use crate::protocol::{
-    AgentInfo, AgentTool, Event, Request, SessionId, SessionInfo, Status, WorktreeInfo,
+    AgentInfo, AgentTool, Event, PrBadge, PrState, Request, SessionId, SessionInfo,
+    StaleWorktree, Status, WorktreeInfo,
 };
 
 use anyhow::{Context, Result};
@@ -42,10 +43,11 @@ const NAV_WIDE_MAX_PCT: u16 = 66;
 /// const so the test `App` starts the way the real one does.
 const SORT_BY_AGE_DEFAULT: bool = true;
 /// Claude sessions inactive longer than this are hidden until toggled on.
-const OLD_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
+/// A worktree active within this long is Recent; quieter ones are Idle.
+const RECENT_SECS: u64 = 7 * 24 * 60 * 60;
 
 const NAV_HINT: &str =
-    "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · d/D rm worktree · x kill · s sort · e widen · Ctrl+H hide tree · Ctrl+] editor · Ctrl+\\ terminal · Ctrl+G diff · q quit";
+    "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · d/D rm worktree · X clean up worktrees · x kill · s sort · e widen · Ctrl+H hide tree · Ctrl+] editor · Ctrl+\\ terminal · Ctrl+G diff · q quit";
 const TERM_HINT: &str =
     "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor · Ctrl+\\ terminal · Ctrl+G diff";
 const DRAWER_HINT: &str =
@@ -169,11 +171,39 @@ enum ClickPane {
     Diff,
 }
 
+/// The tree's sections, in display order. Every worktree is in exactly one
+/// (see [`group_of`]); `NeedsYou` is the exception, an inbox of *sessions*
+/// gathered from all of them (see [`needs_you`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Group {
+    NeedsYou,
+    /// Worktrees with a live session.
+    Active,
+    /// Active within [`RECENT_SECS`] (and the root, always).
+    Recent,
+    Idle,
+    /// Its pull request was merged.
+    Merged,
+    /// Detached scratch checkouts made by Codex or OpenCode.
+    Tools,
+}
+
+/// Worktree sections in display order (the inbox goes above them).
+const WORKTREE_GROUPS: [Group; 5] =
+    [Group::Active, Group::Recent, Group::Idle, Group::Merged, Group::Tools];
+
 /// A flattened, selectable tree row.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Row {
+    /// A section header; `Enter`/`Space` folds it.
+    Group(Group),
+    /// A session in the Needs-you inbox. The same session also has its own
+    /// `Session` row under its worktree.
+    Inbox { wt: usize, se: usize },
     Worktree { wt: usize },
     Session { wt: usize, se: usize },
+    /// "↺ N earlier": the folded list of a worktree's past agent sessions.
+    History { wt: usize },
     Agent { wt: usize, ag: usize },
 }
 
@@ -182,8 +212,11 @@ enum Row {
 /// reordered; this is what lets the selection follow its item instead.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum RowKey {
+    Group(Group),
+    Inbox(SessionId),
     Worktree(String),
     Session(SessionId),
+    History(String),
     Agent(String),
 }
 
@@ -197,15 +230,36 @@ enum PromptKind {
     RenameSession { id: SessionId },
     /// Put a branch on a detached worktree's HEAD; the input is the branch name.
     NameBranch { worktree: String },
-    /// `git worktree remove --force`; the input must be `yes`, because this
-    /// throws away whatever uncommitted work the worktree holds.
-    ForceRemoveWorktree { path: String },
+    /// `git worktree remove` (`d`), confirmed with `y`/`yes`; git itself still
+    /// refuses a worktree with uncommitted work. With `force` (`D`) the input
+    /// must be the full `yes`, because that throws the uncommitted work away.
+    RemoveWorktree { path: String, force: bool },
+    /// `X`: remove every worktree the daemon found stale (listed in a popup
+    /// while this is open), confirmed with `y`/`yes`. Never forced.
+    PruneWorktrees { worktrees: Vec<StaleWorktree> },
 }
 
 struct Prompt {
     kind: PromptKind,
     label: String,
     input: String,
+}
+
+/// The `/` finder: one query over every worktree, live session and past
+/// session, so a long tree is a few keystrokes deep rather than a scroll.
+#[derive(Default)]
+struct Finder {
+    query: String,
+    /// Index into [`finder_hits`] for the current query.
+    selected: usize,
+}
+
+/// One finder result, by index into `App::tree`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Hit {
+    Worktree(usize),
+    Session(usize, usize),
+    Agent(usize, usize),
 }
 
 /// The multi-line editor for one review comment, shown as a modal over the diff.
@@ -290,8 +344,18 @@ struct App {
     /// Worktree paths we've already applied the default (collapsed) state to,
     /// so a refresh never re-collapses one the user has since expanded.
     seen_worktrees: HashSet<String>,
-    /// When false, Claude sessions older than [`OLD_THRESHOLD_SECS`] are hidden.
-    show_old: bool,
+    /// Sections folded to their header. Idle, Merged and Tools start folded.
+    folded_groups: HashSet<Group>,
+    /// Worktree paths whose past sessions ("↺ N earlier") are unfolded.
+    history_open: HashSet<String>,
+    /// `a`: every worktree's past sessions unfolded at once.
+    show_history: bool,
+    /// The home directory, for spotting Codex/OpenCode checkouts by path.
+    home: Option<String>,
+    /// The `/` finder, while open.
+    finder: Option<Finder>,
+    /// The `?` key sheet, while open.
+    help: bool,
     /// When true the tree column is given zero width and the right-hand pane
     /// takes the whole screen. Purely a view state — the tree's contents and
     /// fold state are untouched, so revealing it restores exactly what was there.
@@ -356,24 +420,78 @@ impl App {
         let _ = self.net_tx.send(req);
     }
 
-    /// Whether an on-disk Claude session is shown given the current age filter.
-    fn agent_visible(&self, a: &AgentInfo) -> bool {
-        self.show_old || a.age_secs <= OLD_THRESHOLD_SECS
+    /// The Needs-you inbox: sessions waiting on you, in tree order.
+    fn inbox(&self) -> Vec<(usize, usize)> {
+        self.tree
+            .iter()
+            .enumerate()
+            .flat_map(|(wt, w)| {
+                w.sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| needs_you(s))
+                    .map(move |(se, _)| (wt, se))
+            })
+            .collect()
+    }
+
+    /// Each non-empty worktree section with its members' indices into `tree`,
+    /// in display order (members keep the tree's own order).
+    fn sections(&self) -> Vec<(Group, Vec<usize>)> {
+        let now = now_secs();
+        WORKTREE_GROUPS
+            .iter()
+            .map(|&g| {
+                let members = (0..self.tree.len())
+                    .filter(|&i| group_of(&self.tree[i], self.home.as_deref(), now) == g)
+                    .collect::<Vec<_>>();
+                (g, members)
+            })
+            .filter(|(_, m)| !m.is_empty())
+            .collect()
+    }
+
+    fn history_shown(&self, w: &WorktreeInfo) -> bool {
+        self.show_history || self.history_open.contains(&w.path)
+    }
+
+    /// Whether section headers are drawn: only when there is more than one
+    /// section (or an inbox) to tell apart, so a small repo reads as the plain
+    /// list it always was. Rows under a header are indented one level.
+    fn headers_shown(&self) -> bool {
+        !self.inbox().is_empty() || self.sections().len() > 1
     }
 
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
-        for (wt, w) in self.tree.iter().enumerate() {
-            rows.push(Row::Worktree { wt });
-            if self.collapsed.contains(&w.path) {
-                continue;
+        let inbox = self.inbox();
+        let sections = self.sections();
+        let headers = self.headers_shown();
+        if !inbox.is_empty() {
+            rows.push(Row::Group(Group::NeedsYou));
+            if !self.folded_groups.contains(&Group::NeedsYou) {
+                rows.extend(inbox.iter().map(|&(wt, se)| Row::Inbox { wt, se }));
             }
-            for (se, _) in w.sessions.iter().enumerate() {
-                rows.push(Row::Session { wt, se });
+        }
+        for (group, members) in sections {
+            if headers {
+                rows.push(Row::Group(group));
+                if self.folded_groups.contains(&group) {
+                    continue;
+                }
             }
-            for (ag, a) in w.agents.iter().enumerate() {
-                if self.agent_visible(a) {
-                    rows.push(Row::Agent { wt, ag });
+            for wt in members {
+                let w = &self.tree[wt];
+                rows.push(Row::Worktree { wt });
+                if self.collapsed.contains(&w.path) {
+                    continue;
+                }
+                rows.extend((0..w.sessions.len()).map(|se| Row::Session { wt, se }));
+                if !w.agents.is_empty() {
+                    rows.push(Row::History { wt });
+                    if self.history_shown(w) {
+                        rows.extend((0..w.agents.len()).map(|ag| Row::Agent { wt, ag }));
+                    }
                 }
             }
         }
@@ -388,16 +506,13 @@ impl App {
     }
 
     /// The worktree relevant to the current selection (its own, or its parent).
+    /// A section header has none.
     fn selected_worktree(&self) -> Option<&WorktreeInfo> {
-        match self.selected_row()? {
-            Row::Worktree { wt } | Row::Session { wt, .. } | Row::Agent { wt, .. } => {
-                self.tree.get(wt)
-            }
-        }
+        self.tree.get(row_worktree(self.selected_row()?)?)
     }
 
     fn selected_session(&self) -> Option<(&WorktreeInfo, SessionId)> {
-        if let Row::Session { wt, se } = self.selected_row()? {
+        if let Row::Session { wt, se } | Row::Inbox { wt, se } = self.selected_row()? {
             let w = self.tree.get(wt)?;
             let s = w.sessions.get(se)?;
             return Some((w, s.id));
@@ -496,7 +611,7 @@ impl App {
         }
         // Fit is measured from the same items `draw_tree` renders, so the column
         // can't end up a cell short of what it has to show.
-        let widest = tree_items(self).iter().map(ListItem::width).max().unwrap_or(0);
+        let widest = tree_items(self, None).iter().map(ListItem::width).max().unwrap_or(0);
         let fit = u16::try_from(widest).unwrap_or(u16::MAX).saturating_add(2);
         // In u32: a u16 product overflows on a terminal ~1000 columns wide.
         let cap = u32::from(self.screen_cols) * u32::from(NAV_WIDE_MAX_PCT) / 100;
@@ -598,14 +713,37 @@ impl App {
         None
     }
 
-    /// Fold/unfold the worktree of the current selection (its parent when a
-    /// child row is selected), then land the cursor on that worktree's header.
+    /// Fold/unfold what the selection belongs to: a section from its header,
+    /// past sessions from their "↺" row (or one of them), else the worktree
+    /// (its parent when a session is selected), landing the cursor back on
+    /// what was toggled.
     fn toggle_collapse_selected(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
         };
         let wt = match row {
-            Row::Worktree { wt } | Row::Session { wt, .. } | Row::Agent { wt, .. } => wt,
+            Row::Group(g) => {
+                if !self.folded_groups.remove(&g) {
+                    self.folded_groups.insert(g);
+                }
+                self.rebuild_rows();
+                self.reselect(Some(RowKey::Group(g)));
+                return;
+            }
+            Row::History { wt } | Row::Agent { wt, .. } => {
+                let Some(path) = self.tree.get(wt).map(|w| w.path.clone()) else {
+                    return;
+                };
+                if !self.history_open.remove(&path) {
+                    self.history_open.insert(path.clone());
+                }
+                self.rebuild_rows();
+                self.reselect(Some(RowKey::History(path)));
+                return;
+            }
+            // The inbox isn't under a worktree; there's nothing to fold.
+            Row::Inbox { .. } => return,
+            Row::Worktree { wt } | Row::Session { wt, .. } => wt,
         };
         let Some(w) = self.tree.get(wt) else {
             return;
@@ -645,12 +783,46 @@ impl App {
 
     fn row_key(&self, row: Row) -> Option<RowKey> {
         Some(match row {
+            Row::Group(g) => RowKey::Group(g),
+            Row::Inbox { wt, se } => RowKey::Inbox(self.tree.get(wt)?.sessions.get(se)?.id),
             Row::Worktree { wt } => RowKey::Worktree(self.tree.get(wt)?.path.clone()),
             Row::Session { wt, se } => RowKey::Session(self.tree.get(wt)?.sessions.get(se)?.id),
+            Row::History { wt } => RowKey::History(self.tree.get(wt)?.path.clone()),
             Row::Agent { wt, ag } => {
                 RowKey::Agent(self.tree.get(wt)?.agents.get(ag)?.session_id.clone())
             }
         })
+    }
+
+    /// Make `key`'s row visible (unfolding its section, worktree and past
+    /// sessions as needed) and select it. The finder's jumps land here.
+    fn reveal(&mut self, key: RowKey) {
+        let wt = match &key {
+            RowKey::Worktree(p) | RowKey::History(p) => {
+                self.tree.iter().position(|w| &w.path == p)
+            }
+            RowKey::Session(id) | RowKey::Inbox(id) => {
+                self.tree.iter().position(|w| w.sessions.iter().any(|s| s.id == *id))
+            }
+            RowKey::Agent(id) => {
+                self.tree.iter().position(|w| w.agents.iter().any(|a| &a.session_id == id))
+            }
+            RowKey::Group(_) => None,
+        };
+        if let Some(wt) = wt {
+            let w = &self.tree[wt];
+            let group = group_of(w, self.home.as_deref(), now_secs());
+            let path = w.path.clone();
+            self.folded_groups.remove(&group);
+            if !matches!(key, RowKey::Worktree(_)) {
+                self.collapsed.remove(&path);
+            }
+            if matches!(key, RowKey::Agent(_)) {
+                self.history_open.insert(path);
+            }
+        }
+        self.rebuild_rows();
+        self.reselect(Some(key));
     }
 
     /// Put the selection back on `key` after the rows were rebuilt. If it's gone
@@ -688,6 +860,72 @@ impl App {
 /// ties keep the daemon's order.
 fn sort_by_age(tree: &mut [WorktreeInfo]) {
     tree.sort_by_key(|w| (!w.is_root, Reverse(w.created_secs)));
+}
+
+fn default_folded_groups() -> HashSet<Group> {
+    [Group::Idle, Group::Merged, Group::Tools].into_iter().collect()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The worktree a row belongs to; none for a section header.
+fn row_worktree(row: Row) -> Option<usize> {
+    match row {
+        Row::Group(_) => None,
+        Row::Inbox { wt, .. }
+        | Row::Worktree { wt }
+        | Row::Session { wt, .. }
+        | Row::History { wt }
+        | Row::Agent { wt, .. } => Some(wt),
+    }
+}
+
+/// A session that finished something you haven't looked at, or rang for you.
+fn needs_you(s: &SessionInfo) -> bool {
+    s.status == Status::Waiting || s.unread
+}
+
+/// Which section a worktree sits in. A live session puts it in Active whatever
+/// else is true; the root is never folded away; a merged PR or a tool's scratch
+/// checkout outranks age; past that, activity in the last [`RECENT_SECS`]
+/// decides, and a worktree with no known activity counts as recent rather than
+/// be hidden on a guess.
+fn group_of(w: &WorktreeInfo, home: Option<&str>, now: u64) -> Group {
+    if w.sessions.iter().any(|s| s.status != Status::Exited) {
+        return Group::Active;
+    }
+    if w.is_root {
+        return Group::Recent;
+    }
+    if w.pr.is_some_and(|p| p.state == PrState::Merged) {
+        return Group::Merged;
+    }
+    if is_tool_checkout(w, home) {
+        return Group::Tools;
+    }
+    match w.last_active_secs {
+        Some(t) if now.saturating_sub(t) > RECENT_SECS => Group::Idle,
+        _ => Group::Recent,
+    }
+}
+
+/// A detached checkout Codex or OpenCode made for itself. One you put a branch
+/// on (`b`) is yours now, so it isn't one. Claude Code's own worktrees live in
+/// `<repo>/.claude/worktrees/` on real branches and are never matched.
+fn is_tool_checkout(w: &WorktreeInfo, home: Option<&str>) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
+    let tool_dirs = [
+        format!("{home}/.codex/worktrees/"),
+        format!("{home}/.local/share/opencode/worktree/"),
+    ];
+    w.branch == git::DETACHED_BRANCH && tool_dirs.iter().any(|d| w.path.starts_with(d.as_str()))
 }
 
 /// Entry point for the default (client) invocation.
@@ -776,7 +1014,12 @@ pub async fn run(root: PathBuf) -> Result<()> {
         selected: 0,
         collapsed: HashSet::new(),
         seen_worktrees: HashSet::new(),
-        show_old: false,
+        folded_groups: default_folded_groups(),
+        history_open: HashSet::new(),
+        show_history: false,
+        home: dirs::home_dir().map(|h| h.display().to_string()),
+        finder: None,
+        help: false,
         nav_hidden: false,
         nav_wide: false,
         sort_by_age: SORT_BY_AGE_DEFAULT,
@@ -1020,6 +1263,20 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
                 app.footer = error;
             }
         }
+        Event::StaleWorktrees { worktrees, note } => {
+            let note = if note.is_empty() { String::new() } else { format!(" ({note})") };
+            if worktrees.is_empty() {
+                app.footer = format!("no stale worktrees{note}");
+            } else {
+                let n = worktrees.len();
+                let them = if n == 1 { "this worktree".to_string() } else { format!("these {n} worktrees") };
+                app.prompt = Some(Prompt {
+                    kind: PromptKind::PruneWorktrees { worktrees },
+                    label: format!("Remove {them}? Branches are kept{note}. (y/N)"),
+                    input: String::new(),
+                });
+            }
+        }
         // Only ever a reply to the handshake in `connect_or_spawn`, which has
         // already consumed it by the time this loop runs.
         Event::Version { .. } => {}
@@ -1030,20 +1287,24 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // The editor toggle is reserved globally: intercept it before any focus
     // dispatch so it works from every mode and is never forwarded to a PTY. When
     // a prompt is open it's swallowed (so it neither toggles nor types a `]`).
+    let modal = app.prompt.is_some()
+        || app.comment_editor.is_some()
+        || app.finder.is_some()
+        || app.help;
     if is_editor_toggle(&key) {
-        if app.prompt.is_none() && app.comment_editor.is_none() {
+        if !modal {
             toggle_editor(app);
         }
         return;
     }
     if is_diff_toggle(&key) {
-        if app.prompt.is_none() && app.comment_editor.is_none() {
+        if !modal {
             toggle_diff(app);
         }
         return;
     }
     if is_drawer_toggle(&key) {
-        if app.prompt.is_none() && app.comment_editor.is_none() {
+        if !modal {
             toggle_drawer(app);
         }
         return;
@@ -1055,6 +1316,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
     if app.prompt.is_some() {
         handle_prompt_key(app, key);
+        return;
+    }
+    // The key sheet is read-only: any key closes it.
+    if app.help {
+        app.help = false;
+        return;
+    }
+    if app.finder.is_some() {
+        handle_finder_key(app, key);
         return;
     }
     match app.focus {
@@ -1080,6 +1350,14 @@ fn handle_paste(app: &mut App, text: &str) {
     }
     if let Some(prompt) = app.prompt.as_mut() {
         prompt.input.push_str(first_line(text));
+        return;
+    }
+    if let Some(finder) = app.finder.as_mut() {
+        finder.query.push_str(first_line(text));
+        finder.selected = 0;
+        return;
+    }
+    if app.help {
         return;
     }
     match app.focus {
@@ -1844,14 +2122,18 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Char('a') => {
-            app.show_old = !app.show_old;
+            let key = app.selected_key();
+            app.show_history = !app.show_history;
             app.rebuild_rows();
-            app.footer = if app.show_old {
-                "showing sessions older than 3d".into()
+            app.reselect(key);
+            app.footer = if app.show_history {
+                "showing every worktree's past sessions · a to fold them".into()
             } else {
-                "hiding sessions older than 3d".into()
+                "past sessions folded · a to show them all".into()
             };
         }
+        KeyCode::Char('/') => app.finder = Some(Finder::default()),
+        KeyCode::Char('?') => app.help = true,
         KeyCode::Char('n') => {
             if let Some(w) = app.selected_worktree() {
                 let worktree = w.path.clone();
@@ -1881,30 +2163,26 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
                 app.send(Request::KillSession { id });
             }
         }
-        KeyCode::Char('d') => {
-            if let Some(w) = app.selected_worktree() {
-                if w.is_root {
-                    app.footer = "cannot remove the root worktree".into();
-                } else {
-                    app.send(Request::RemoveWorktree {
-                        path: w.path.clone(),
-                        force: false,
-                    });
-                }
-            }
+        KeyCode::Char('X') => {
+            app.footer = "looking for stale worktrees…".into();
+            app.send(Request::FindStaleWorktrees { idle_days: stale_days() });
         }
-        KeyCode::Char('D') => {
+        KeyCode::Char(c @ ('d' | 'D')) => {
             if let Some(w) = app.selected_worktree() {
                 if w.is_root {
                     app.footer = "cannot remove the root worktree".into();
                 } else {
                     let (name, _) = worktree_label(w, &app.root);
                     let path = w.path.clone();
+                    let force = c == 'D';
+                    let label = if force {
+                        format!("Force-remove {name}? Its uncommitted changes are lost. Type yes")
+                    } else {
+                        format!("Remove worktree {name}? (y/N)")
+                    };
                     app.prompt = Some(Prompt {
-                        kind: PromptKind::ForceRemoveWorktree { path },
-                        label: format!(
-                            "Force-remove {name}? Its uncommitted changes are lost. Type yes"
-                        ),
+                        kind: PromptKind::RemoveWorktree { path, force },
+                        label,
                         input: String::new(),
                     });
                 }
@@ -2167,6 +2445,11 @@ fn focus_pane(app: &mut App, pane: ClickPane) {
 /// the app when it has enabled mouse reporting; otherwise the wheel scrolls the
 /// local emulator's scrollback.
 fn handle_mouse(app: &mut App, ev: MouseEvent) {
+    // The finder and the key sheet are keyboard overlays; a click under them
+    // would act on panes the user can't see.
+    if app.finder.is_some() || app.help {
+        return;
+    }
     // Click-to-focus: a left press in a pane other than the active one switches
     // focus to it and is consumed (not forwarded), so the first click just moves
     // focus. Clicks within the already-focused pane fall through to normal
@@ -2486,12 +2769,32 @@ fn submit_prompt(app: &mut App, prompt: Prompt) {
                 app.send(Request::NameBranch { worktree, branch: input });
             }
         }
-        PromptKind::ForceRemoveWorktree { path } => {
+        PromptKind::RemoveWorktree { path, force: true } => {
             if input == "yes" {
                 app.footer = format!("force-removing {}…", short_path(&path));
                 app.send(Request::RemoveWorktree { path, force: true });
             } else {
                 app.footer = "not removed (type yes to confirm)".into();
+            }
+        }
+        PromptKind::RemoveWorktree { path, force: false } => {
+            if is_yes(&input) {
+                app.footer = format!("removing {}…", short_path(&path));
+                app.send(Request::RemoveWorktree { path, force: false });
+            } else {
+                app.footer = "not removed".into();
+            }
+        }
+        PromptKind::PruneWorktrees { worktrees } => {
+            if is_yes(&input) {
+                app.footer = format!("removing {} worktree(s)…", worktrees.len());
+                // Plain removes: one that picked up changes since the scan is
+                // refused by git, and its error lands in the footer.
+                for w in worktrees {
+                    app.send(Request::RemoveWorktree { path: w.path, force: false });
+                }
+            } else {
+                app.footer = "nothing removed".into();
             }
         }
     }
@@ -2701,6 +3004,9 @@ fn draw(f: &mut Frame, app: &App) {
     draw_footer(f, app, footer_area);
     // Modal, so it goes last — over whatever the right pane drew.
     draw_comment_editor(f, app, right);
+    draw_prune_list(f, app, main);
+    draw_finder(f, app, main);
+    draw_help(f, app, main);
 }
 
 /// The reviewable diff: files → hunks → lines, with comments inline. Renders
@@ -3043,6 +3349,321 @@ fn draw_comment_editor(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+/// Every finder result for `query`, grouped worktrees, then live sessions, then
+/// past sessions, each in tree order. A row matches when every word of the
+/// query appears (any case) in its name or its worktree's.
+fn finder_hits(app: &App, query: &str) -> Vec<Hit> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let matches = |hay: &str| {
+        let hay = hay.to_lowercase();
+        words.iter().all(|w| hay.contains(w.as_str()))
+    };
+    let mut hits = Vec::new();
+    for (wt, w) in app.tree.iter().enumerate() {
+        if matches(&format!("{} {}", w.branch, worktree_label(w, &app.root).0)) {
+            hits.push(Hit::Worktree(wt));
+        }
+    }
+    for (wt, w) in app.tree.iter().enumerate() {
+        for (se, s) in w.sessions.iter().enumerate() {
+            if matches(&format!("{} {}", s.name, w.branch)) {
+                hits.push(Hit::Session(wt, se));
+            }
+        }
+    }
+    for (wt, w) in app.tree.iter().enumerate() {
+        for (ag, a) in w.agents.iter().enumerate() {
+            if matches(&format!("{} {}", a.title, w.branch)) {
+                hits.push(Hit::Agent(wt, ag));
+            }
+        }
+    }
+    hits
+}
+
+fn handle_finder_key(app: &mut App, key: KeyEvent) {
+    let Some(query) = app.finder.as_ref().map(|f| f.query.clone()) else {
+        return;
+    };
+    let hits = finder_hits(app, &query);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let Some(finder) = app.finder.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => app.finder = None,
+        KeyCode::Enter => {
+            let hit = hits.get(finder.selected).copied();
+            app.finder = None;
+            if let Some(hit) = hit {
+                open_hit(app, hit);
+            }
+        }
+        KeyCode::Up => finder.selected = finder.selected.saturating_sub(1),
+        KeyCode::Char('p' | 'k') if ctrl => finder.selected = finder.selected.saturating_sub(1),
+        KeyCode::Down => finder.selected = (finder.selected + 1).min(hits.len().saturating_sub(1)),
+        KeyCode::Char('n' | 'j') if ctrl => {
+            finder.selected = (finder.selected + 1).min(hits.len().saturating_sub(1));
+        }
+        KeyCode::Backspace => {
+            finder.query.pop();
+            finder.selected = 0;
+        }
+        KeyCode::Char(c) if !ctrl => {
+            finder.query.push(c);
+            finder.selected = 0;
+        }
+        _ => {}
+    }
+}
+
+/// Act on a finder pick: a worktree is revealed and selected in the tree, a
+/// live session is opened, a past one resumed. All of them leave the tree
+/// selection on the pick, so closing the terminal lands back on it.
+fn open_hit(app: &mut App, hit: Hit) {
+    match hit {
+        Hit::Worktree(wt) => {
+            let path = app.tree[wt].path.clone();
+            app.reveal(RowKey::Worktree(path));
+            focus_pane(app, ClickPane::Tree);
+        }
+        Hit::Session(wt, se) => {
+            let id = app.tree[wt].sessions[se].id;
+            app.reveal(RowKey::Session(id));
+            open_selected(app);
+        }
+        Hit::Agent(wt, ag) => {
+            let id = app.tree[wt].agents[ag].session_id.clone();
+            app.reveal(RowKey::Agent(id));
+            open_selected(app);
+        }
+    }
+}
+
+fn hit_line(app: &App, hit: Hit, width: usize) -> Line<'static> {
+    let now = now_secs();
+    match hit {
+        Hit::Worktree(wt) => {
+            worktree_line(&app.tree[wt], &app.root, true, now, 0, Some(width))
+        }
+        Hit::Session(wt, se) => {
+            let w = &app.tree[wt];
+            inbox_line(w, &w.sessions[se], &app.root, 1, Some(width))
+        }
+        Hit::Agent(wt, ag) => {
+            let w = &app.tree[wt];
+            let a = &w.agents[ag];
+            let (glyph, color) = agent_glyph(a.tool);
+            fit(TreeLine {
+                left: vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                    Span::styled(worktree_display(w, &app.root).0, Style::default().fg(Color::Cyan)),
+                    Span::styled(" › ", dim()),
+                    Span::styled(a.title.clone(), Style::default().fg(Color::Gray)),
+                ],
+                right: vec![vec![Span::styled(ago(a.age_secs), dim())]],
+                width: Some(width),
+            })
+        }
+    }
+}
+
+fn draw_finder(f: &mut Frame, app: &App, area: Rect) {
+    let Some(finder) = app.finder.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(area, 80, 70);
+    f.render_widget(Clear, popup);
+    let hits = finder_hits(app, &finder.query);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" find · {} matches ", hits.len()))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let width = usize::from(inner.width);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("/ ", Style::default().fg(Color::Yellow)),
+            Span::raw(finder.query.clone()),
+            Span::styled("▏", Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(""),
+    ];
+    // Results with a header before each kind; remember where the pick lands.
+    let mut pick_line = 0;
+    let mut last_kind = None;
+    for (i, &hit) in hits.iter().enumerate() {
+        let kind = match hit {
+            Hit::Worktree(_) => "WORKTREES",
+            Hit::Session(..) => "LIVE SESSIONS",
+            Hit::Agent(..) => "PAST SESSIONS · Enter resumes",
+        };
+        if last_kind != Some(kind) {
+            lines.push(Line::from(Span::styled(
+                kind,
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+            )));
+            last_kind = Some(kind);
+        }
+        let mut line = hit_line(app, hit, width);
+        if i == finder.selected {
+            pick_line = lines.len();
+            line = line.patch_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        lines.push(line);
+    }
+    if hits.is_empty() {
+        lines.push(Line::from(Span::styled("no matches", dim())));
+    }
+    // Keep the query pinned and scroll the results so the pick stays in view.
+    let height = usize::from(inner.height);
+    let skip = (pick_line + 1).saturating_sub(height).min(lines.len().saturating_sub(2));
+    let shown: Vec<Line> = lines
+        .iter()
+        .take(2)
+        .cloned()
+        .chain(lines.iter().skip(2 + skip).cloned())
+        .collect();
+    f.render_widget(Paragraph::new(shown), inner);
+}
+
+/// The `?` sheet: every tree binding, grouped. `/` and `?` themselves are the
+/// only keys the footer always names; everything else is found here.
+const KEY_SHEET: &[(&str, &[(&str, &str)])] = &[
+    ("SESSIONS", &[
+        ("Enter", "open, or resume a past one"),
+        ("c C o", "new claude · codex · opencode"),
+        ("n", "new shell"),
+        ("R", "rename"),
+        ("x", "kill"),
+    ]),
+    ("WORKTREES", &[
+        ("w", "new worktree"),
+        ("b", "name the branch (detached only)"),
+        ("d D", "remove · force-remove"),
+        ("X", "clean up merged and idle"),
+        ("r", "refresh"),
+    ]),
+    ("FIND AND VIEW", &[
+        ("/", "find a worktree, session or past session"),
+        ("Space z", "fold this · fold all"),
+        ("a", "show every worktree's past sessions"),
+        ("s e", "sort by age or name · widen the tree"),
+        ("?", "this sheet"),
+    ]),
+    ("PANES", &[
+        ("Ctrl+L", "into the terminal"),
+        ("Ctrl+H", "back to the tree · again hides it"),
+        ("Ctrl+]", "editor beside the session"),
+        ("Ctrl+\\", "shell drawer at the bottom"),
+        ("Ctrl+G", "review the diff"),
+    ]),
+];
+
+fn draw_help(f: &mut Frame, app: &App, area: Rect) {
+    if !app.help {
+        return;
+    }
+    let popup = centered_rect(area, 80, 80);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" keys · any key closes ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    for (half, groups) in KEY_SHEET.chunks(2).enumerate() {
+        let mut lines = Vec::new();
+        for (title, keys) in groups {
+            lines.push(Line::from(Span::styled(
+                *title,
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+            )));
+            for (k, what) in *keys {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {k:<8}"),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(*what),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+        if let Some(col) = cols.get(half) {
+            f.render_widget(Paragraph::new(lines), *col);
+        }
+    }
+}
+
+/// `y` or `yes`, any case: the answer that confirms a removal prompt.
+fn is_yes(input: &str) -> bool {
+    input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes")
+}
+
+/// Default for `X`'s idle rule when `$ASM_STALE_DAYS` isn't set.
+const STALE_DAYS_DEFAULT: u64 = 14;
+
+/// Days without activity before `X` calls a worktree stale: `$ASM_STALE_DAYS`,
+/// else [`STALE_DAYS_DEFAULT`]. `0` leaves only merged PRs. Read client-side
+/// because the daemon's env is frozen when it spawns.
+fn stale_days() -> u64 {
+    std::env::var("ASM_STALE_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(STALE_DAYS_DEFAULT)
+}
+
+/// The list `X` is asking about, shown over the main area while its prompt is
+/// open, so the confirmation in the footer names exactly what goes.
+fn draw_prune_list(f: &mut Frame, app: &App, area: Rect) {
+    let Some(Prompt { kind: PromptKind::PruneWorktrees { worktrees }, .. }) = app.prompt.as_ref()
+    else {
+        return;
+    };
+    // Borders plus one row per worktree, capped to the area.
+    let h = (worktrees.len() as u16).saturating_add(2).min(area.height);
+    let w = (area.width * 80 / 100).max(1);
+    let popup = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" stale worktrees — y removes, anything else keeps ")
+        .border_style(border_style(true));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let dim = Style::default().fg(Color::DarkGray);
+    // The full path, not its last component: tools keep worktrees at paths
+    // like `~/.codex/worktrees/<id>/<repo>`, whose last component is the repo's
+    // own name, and that reads as the root itself being up for deletion.
+    let home = dirs::home_dir().map(|h| h.display().to_string());
+    let lines: Vec<Line> = worktrees
+        .iter()
+        .map(|w| {
+            let path = match home.as_deref().and_then(|h| w.path.strip_prefix(h)) {
+                Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+                _ => w.path.clone(),
+            };
+            Line::from(vec![
+                Span::raw(w.branch.clone()),
+                Span::styled(format!("  {}  ", w.reason), dim),
+                Span::styled(path, Style::default().fg(Color::Cyan)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// A rect `pct_x`/`pct_y` percent of `area`, centred within it.
 fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
     let w = (area.width * pct_x / 100).max(1).min(area.width);
@@ -3057,39 +3678,344 @@ fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 
 /// Build the tree's list items straight from `app.rows`, so the drawn list and
 /// the selection index stay in lockstep — collapsed worktrees have no child rows.
-fn tree_items(app: &App) -> Vec<ListItem<'static>> {
+/// The tree's items, one per `app.rows` entry (the invariant `rendered_items_
+/// match_rows_when_folded` pins). `width` is the list's inner width, so each
+/// row's meta (counts, PR, age) sits flush right and the name gives way first;
+/// `None` measures natural widths, for sizing the widened tree.
+fn tree_items(app: &App, width: Option<usize>) -> Vec<ListItem<'static>> {
+    let now = now_secs();
+    let inbox_len = app.inbox().len();
+    let sections = app.sections();
+    let members = |g: Group| sections.iter().find(|(s, _)| *s == g).map_or(0, |(_, m)| m.len());
+    // Under a section header everything moves in one level.
+    let base = if app.headers_shown() { 1 } else { 0 };
     app.rows
         .iter()
-        .filter_map(|row| match *row {
-            Row::Worktree { wt } => app.tree.get(wt).map(|w| {
-                let count =
-                    w.sessions.len() + w.agents.iter().filter(|a| app.agent_visible(a)).count();
-                let collapsed = app.collapsed.contains(&w.path);
-                // When folded, surface the most important child status so a
-                // session awaiting a response is still visible.
-                let summary = if collapsed {
-                    summary_status(&w.sessions)
-                } else {
-                    None
-                };
-                worktree_item(w, &app.root, collapsed, count, summary)
-            }),
-            Row::Session { wt, se } => app
-                .tree
-                .get(wt)
-                .and_then(|w| w.sessions.get(se))
-                .map(|s| session_item(s, app.nav_wide)),
-            Row::Agent { wt, ag } => app
-                .tree
-                .get(wt)
-                .and_then(|w| w.agents.get(ag))
-                .map(|a| agent_item(a, app.nav_wide)),
+        .map(|row| {
+            let line = match *row {
+                Row::Group(g) => {
+                    let count = if g == Group::NeedsYou { inbox_len } else { members(g) };
+                    group_line(g, count, app.folded_groups.contains(&g), width)
+                }
+                Row::Inbox { wt, se } => {
+                    let w = &app.tree[wt];
+                    inbox_line(w, &w.sessions[se], &app.root, 1, width)
+                }
+                Row::Worktree { wt } => {
+                    let w = &app.tree[wt];
+                    let collapsed = app.collapsed.contains(&w.path);
+                    worktree_line(w, &app.root, collapsed, now, base, width)
+                }
+                Row::Session { wt, se } => {
+                    session_line(&app.tree[wt].sessions[se], base + 1, width)
+                }
+                Row::History { wt } => {
+                    let w = &app.tree[wt];
+                    history_line(w.agents.len(), app.history_shown(w), base + 1)
+                }
+                Row::Agent { wt, ag } => agent_line(&app.tree[wt].agents[ag], base + 2, width),
+            };
+            ListItem::new(line)
         })
         .collect()
 }
 
+/// Narrowest the left side of a row is squeezed to before its right-hand meta
+/// starts giving way.
+const MIN_LEFT: usize = 12;
+
+/// A row in two parts: `left` (its name, which shrinks from the end when space
+/// is short) and `right` (meta segments, least important first, flush right).
+struct TreeLine {
+    left: Vec<Span<'static>>,
+    right: Vec<Vec<Span<'static>>>,
+    width: Option<usize>,
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+fn join_segments(segments: Vec<Vec<Span<'static>>>) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for (i, seg) in segments.into_iter().enumerate() {
+        if i > 0 {
+            out.push(Span::raw(" "));
+        }
+        out.extend(seg);
+    }
+    out
+}
+
+/// Lay a [`TreeLine`] into `width` cells: drop right-hand segments (least
+/// important first) only while the left side would be squeezed under
+/// [`MIN_LEFT`], then shorten the left side from its end, then pad so the
+/// meta lands on the right edge. Without a width, the parts are just joined.
+fn fit(line: TreeLine) -> Line<'static> {
+    let TreeLine { mut left, mut right, width } = line;
+    let Some(width) = width else {
+        let r = join_segments(right);
+        if !r.is_empty() {
+            left.push(Span::raw("  "));
+            left.extend(r);
+        }
+        return Line::from(left);
+    };
+    let lw = spans_width(&left);
+    loop {
+        let rw = spans_width(&join_segments(right.clone()));
+        let room = width.saturating_sub(if rw > 0 { rw + 1 } else { 0 });
+        if lw <= room || room >= MIN_LEFT || right.is_empty() {
+            break;
+        }
+        right.remove(0);
+    }
+    let r = join_segments(right);
+    let rw = spans_width(&r);
+    let room = width.saturating_sub(if rw > 0 { rw + 1 } else { 0 });
+    shrink(&mut left, room);
+    if rw > 0 {
+        let pad = width.saturating_sub(spans_width(&left) + rw);
+        left.push(Span::raw(" ".repeat(pad)));
+        left.extend(r);
+    }
+    Line::from(left)
+}
+
+/// Shorten `spans` to `room` cells from the end, sparing the first (the
+/// indent/glyph). A span cut below two cells goes entirely.
+fn shrink(spans: &mut Vec<Span<'static>>, room: usize) {
+    let mut over = spans_width(spans).saturating_sub(room);
+    let mut i = spans.len();
+    while over > 0 && i > 1 {
+        i -= 1;
+        let w = spans[i].width();
+        if w <= over + 1 {
+            spans.remove(i);
+            over = over.saturating_sub(w);
+        } else {
+            let keep = w - over;
+            let text = truncate(&spans[i].content, keep);
+            spans[i] = Span::styled(text, spans[i].style);
+            over = 0;
+        }
+    }
+}
+
+/// How long ago, compactly: `now`, `4m`, `2h`, `3d`, `5w`.
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => "now".into(),
+        60..3_600 => format!("{}m", secs / 60),
+        3_600..86_400 => format!("{}h", secs / 3_600),
+        86_400..1_209_600 => format!("{}d", secs / 86_400),
+        _ => format!("{}w", secs / 604_800),
+    }
+}
+
+fn dim() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn group_title(g: Group) -> (&'static str, &'static str) {
+    match g {
+        Group::NeedsYou => ("NEEDS YOU", "finished since you last looked"),
+        Group::Active => ("ACTIVE", "sessions running"),
+        Group::Recent => ("RECENT", "this week"),
+        Group::Idle => ("IDLE", "quiet 7d+"),
+        Group::Merged => ("MERGED", "PR merged"),
+        Group::Tools => ("TOOL CHECKOUTS", "codex · opencode"),
+    }
+}
+
+fn group_line(g: Group, count: usize, folded: bool, width: Option<usize>) -> Line<'static> {
+    let (name, desc) = group_title(g);
+    let color = if g == Group::NeedsYou { Color::Yellow } else { Color::Gray };
+    let icon = if folded { "▸ " } else { "▾ " };
+    let right = if g == Group::Merged { vec![vec![Span::styled("X cleans up", dim())]] } else { vec![] };
+    fit(TreeLine {
+        left: vec![
+            Span::styled(icon, dim()),
+            Span::styled(name, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {count}"), dim()),
+            Span::styled(format!(" · {desc}"), dim()),
+        ],
+        right,
+        width,
+    })
+}
+
+/// A branch split into the part that tells it apart and its prefix:
+/// `dev/payoff-cards` -> (`payoff-cards`, `dev`). The prefix is dimmed and
+/// trimmed first, since every branch shares one of a handful.
+fn branch_parts(branch: &str) -> (String, Option<String>) {
+    match branch.split_once('/') {
+        Some((prefix, rest)) if !prefix.is_empty() && !rest.is_empty() => {
+            (rest.to_string(), Some(prefix.to_string()))
+        }
+        _ => (branch.to_string(), None),
+    }
+}
+
+/// The tree's name for a worktree, and a dim hint beside it: a branch's prefix,
+/// `root`, or what a detached checkout is for (see [`worktree_label`]).
+fn worktree_display(w: &WorktreeInfo, root: &str) -> (String, Option<String>) {
+    let (label, hint) = worktree_label(w, root);
+    if w.branch == git::DETACHED_BRANCH {
+        return (label, hint);
+    }
+    let (name, prefix) = branch_parts(&label);
+    let tag = if w.is_root { Some("root".to_string()) } else { prefix };
+    (name, tag)
+}
+
+/// Counts of a worktree's live sessions by what they need: `◐` waiting on you,
+/// `●` running, `○` idle.
+fn session_counts(sessions: &[SessionInfo]) -> Vec<Span<'static>> {
+    let waiting = sessions.iter().filter(|s| needs_you(s)).count();
+    // Running and unread exclude each other (unread needs the output to have
+    // stopped), so only idle sessions can also be counted as needing you.
+    let running = sessions.iter().filter(|s| s.status == Status::Running).count();
+    let idle = sessions.iter().filter(|s| !needs_you(s) && s.status == Status::Idle).count();
+    let mut out = Vec::new();
+    for (n, glyph, color) in
+        [(waiting, "◐", Color::Yellow), (running, "●", Color::Green), (idle, "○", Color::DarkGray)]
+    {
+        if n > 0 {
+            if !out.is_empty() {
+                out.push(Span::raw(" "));
+            }
+            out.push(Span::styled(format!("{glyph}{n}"), Style::default().fg(color)));
+        }
+    }
+    out
+}
+
+fn pr_span(pr: PrBadge) -> Span<'static> {
+    match pr.state {
+        PrState::Open => Span::styled(format!("#{}", pr.number), Style::default().fg(Color::Blue)),
+        PrState::Draft => Span::styled(format!("#{}", pr.number), dim()),
+        PrState::Merged => {
+            Span::styled(format!("✓#{}", pr.number), Style::default().fg(Color::Magenta))
+        }
+    }
+}
+
+/// Leading spaces for a row `depth` levels into the tree.
+fn indent(depth: usize) -> String {
+    "  ".repeat(depth)
+}
+
+fn worktree_line(
+    w: &WorktreeInfo,
+    root: &str,
+    collapsed: bool,
+    now: u64,
+    depth: usize,
+    width: Option<usize>,
+) -> Line<'static> {
+    let icon = format!("{}{}", indent(depth), if collapsed { "▸ " } else { "▾ " });
+    let (name, tag) = worktree_display(w, root);
+    // Detached worktrees are drawn in a different colour: they have no branch,
+    // so anything done there is easy to lose (`b` gives them one).
+    let color = if w.branch == git::DETACHED_BRANCH && w.rebasing.is_none() {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    let mut left = vec![
+        Span::styled(icon, Style::default().fg(color)),
+        Span::styled(name, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+    ];
+    if let Some(tag) = tag {
+        left.push(Span::styled(format!(" {tag}"), dim()));
+    }
+    let mut right = Vec::new();
+    if !w.agents.is_empty() {
+        right.push(vec![Span::styled(format!("↺{}", w.agents.len()), dim())]);
+    }
+    if let Some(pr) = w.pr {
+        right.push(vec![pr_span(pr)]);
+    }
+    let counts = session_counts(&w.sessions);
+    if !counts.is_empty() {
+        right.push(counts);
+    }
+    if let Some(t) = w.last_active_secs {
+        right.push(vec![Span::styled(ago(now.saturating_sub(t)), dim())]);
+    }
+    fit(TreeLine { left, right, width })
+}
+
+/// A session's status glyph, with "needs you" (waiting or unread) shown as `◐`.
+fn session_glyph(s: &SessionInfo) -> (&'static str, Color) {
+    if needs_you(s) { ("◐", Color::Yellow) } else { status_glyph(s.status) }
+}
+
+fn session_age(s: &SessionInfo) -> String {
+    if s.status == Status::Running { "now".into() } else { ago(s.idle_secs) }
+}
+
+fn session_line(s: &SessionInfo, depth: usize, width: Option<usize>) -> Line<'static> {
+    let (glyph, color) = session_glyph(s);
+    let mut left = vec![
+        Span::raw(indent(depth)),
+        Span::styled(glyph, Style::default().fg(color)),
+        Span::raw(" "),
+    ];
+    // Live agent sessions carry their tool glyph (✻ Claude / ◆ OpenCode / ◈
+    // Codex) so the tree shows which agent is running; a plain shell shows none.
+    if let Some(tool) = s.agent {
+        let (tglyph, tcolor) = agent_glyph(tool);
+        left.push(Span::styled(format!("{tglyph} "), Style::default().fg(tcolor)));
+    }
+    left.push(Span::raw(s.name.clone()));
+    fit(TreeLine { left, right: vec![vec![Span::styled(session_age(s), dim())]], width })
+}
+
+fn inbox_line(
+    w: &WorktreeInfo,
+    s: &SessionInfo,
+    root: &str,
+    depth: usize,
+    width: Option<usize>,
+) -> Line<'static> {
+    let (glyph, color) = session_glyph(s);
+    let (wt_name, _) = worktree_display(w, root);
+    fit(TreeLine {
+        left: vec![
+            Span::raw(indent(depth)),
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::styled(wt_name, Style::default().fg(Color::Cyan)),
+            Span::styled(" › ", dim()),
+            Span::raw(s.name.clone()),
+        ],
+        right: vec![vec![Span::styled(session_age(s), Style::default().fg(Color::Yellow))]],
+        width,
+    })
+}
+
+fn history_line(count: usize, open: bool, depth: usize) -> Line<'static> {
+    let icon = if open { "▾" } else { "▸" };
+    let noun = if count == 1 { "earlier session" } else { "earlier sessions" };
+    Line::from(vec![Span::raw(indent(depth)), Span::styled(format!("↺ {count} {noun} {icon}"), dim())])
+}
+
+fn agent_line(a: &AgentInfo, depth: usize, width: Option<usize>) -> Line<'static> {
+    let (glyph, color) = agent_glyph(a.tool);
+    fit(TreeLine {
+        left: vec![
+            Span::raw(indent(depth)),
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::styled(a.title.clone(), Style::default().fg(Color::Gray)),
+        ],
+        right: vec![vec![Span::styled(ago(a.age_secs), dim())]],
+        width,
+    })
+}
+
 fn draw_tree(f: &mut Frame, app: &App, area: Rect) {
-    let items = tree_items(app);
+    let items = tree_items(app, Some(usize::from(area.width.saturating_sub(2))));
 
     let title = format!(" {} ", short_path(&app.root));
     let block = Block::default()
@@ -3105,18 +4031,6 @@ fn draw_tree(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.selected));
     }
     f.render_stateful_widget(list, area, &mut state);
-}
-
-/// Highest-priority status among a worktree's sessions (Waiting outranks
-/// Running); `None` if nothing is notable. Used for the folded-header summary.
-fn summary_status(sessions: &[SessionInfo]) -> Option<Status> {
-    if sessions.iter().any(|s| s.status == Status::Waiting) {
-        Some(Status::Waiting)
-    } else if sessions.iter().any(|s| s.status == Status::Running) {
-        Some(Status::Running)
-    } else {
-        None
-    }
 }
 
 /// What the tree calls a worktree: `(name, hint)`.
@@ -3168,68 +4082,6 @@ fn worktree_nickname(path: &str, root: &str) -> String {
     }
 }
 
-fn worktree_item(
-    w: &WorktreeInfo,
-    root: &str,
-    collapsed: bool,
-    count: usize,
-    summary: Option<Status>,
-) -> ListItem<'static> {
-    let icon = if collapsed { "▸" } else { "▾" };
-    let marker = if w.is_root { " (root)" } else { "" };
-    let badge = if collapsed && count > 0 {
-        format!("  {count}")
-    } else {
-        String::new()
-    };
-    let (name, hint) = worktree_label(w, root);
-    // Detached worktrees are drawn in a different colour: they have no branch,
-    // so anything done there is easy to lose (`b` gives them one).
-    let color = if w.branch == git::DETACHED_BRANCH && w.rebasing.is_none() {
-        Color::Yellow
-    } else {
-        Color::Cyan
-    };
-    let mut spans = vec![
-        Span::styled(
-            format!("{icon} {name}"),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(marker, Style::default().fg(Color::DarkGray)),
-        Span::styled(badge, Style::default().fg(Color::DarkGray)),
-    ];
-    if let Some(status) = summary {
-        let (glyph, color) = status_glyph(status);
-        spans.push(Span::styled(
-            format!(" {glyph}"),
-            Style::default().fg(color),
-        ));
-    }
-    if let Some(hint) = hint {
-        spans.push(Span::styled(format!(" {hint}"), Style::default().fg(Color::DarkGray)));
-    }
-    ListItem::new(Line::from(spans))
-}
-
-/// `full` (the widened tree) shows the name whole instead of truncating it.
-fn session_item(s: &SessionInfo, full: bool) -> ListItem<'static> {
-    let (glyph, color) = status_glyph(s.status);
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(glyph, Style::default().fg(color)),
-        Span::raw(" "),
-    ];
-    // Live agent sessions carry their tool glyph (✻ Claude / ◆ OpenCode) so the
-    // tree shows which agent is running; a plain shell shows none.
-    if let Some(tool) = s.agent {
-        let (tglyph, tcolor) = agent_glyph(tool);
-        spans.push(Span::styled(tglyph, Style::default().fg(tcolor)));
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::raw(if full { s.name.clone() } else { truncate(&s.name, 24) }));
-    ListItem::new(Line::from(spans))
-}
-
 fn agent_glyph(tool: AgentTool) -> (&'static str, Color) {
     match tool {
         AgentTool::Claude => ("✻", Color::Magenta),
@@ -3242,31 +4094,23 @@ fn agent_glyph(tool: AgentTool) -> (&'static str, Color) {
 /// session: `Claude - <name>` for an agent, the bare name for a plain shell,
 /// and ` terminal ` when nothing is attached.
 fn primary_pane_title(app: &App) -> String {
-    match app.attached_session() {
-        Some(s) => match s.agent {
-            Some(tool) => format!(" {} - {} ", agent_label(tool), truncate(&s.name, 30)),
-            None => format!(" {} ", truncate(&s.name, 30)),
-        },
-        None => " terminal ".to_string(),
+    let Some(s) = app.attached_session() else {
+        return " terminal ".to_string();
+    };
+    let name = match s.agent {
+        Some(tool) => format!("{} - {}", agent_label(tool), truncate(&s.name, 30)),
+        None => truncate(&s.name, 30),
+    };
+    let state = match s.status {
+        Status::Running => "running",
+        Status::Waiting => "waiting",
+        Status::Idle => "idle",
+        Status::Exited => "exited",
+    };
+    match app.worktree_of_attached() {
+        Some(w) => format!(" {name} · {} · {state} ", worktree_display(w, &app.root).0),
+        None => format!(" {name} · {state} "),
     }
-}
-
-/// `full` (the widened tree) shows the title whole instead of truncating it.
-fn agent_item(a: &AgentInfo, full: bool) -> ListItem<'static> {
-    let (glyph, color) = agent_glyph(a.tool);
-    ListItem::new(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(glyph, Style::default().fg(color)),
-        Span::raw(" "),
-        Span::styled(
-            if full { a.title.clone() } else { truncate(&a.title, 20) },
-            Style::default().fg(Color::Gray),
-        ),
-        Span::styled(
-            format!(" {}", a.last_active),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]))
 }
 
 /// The bottom drawer: one bordered PTY pane, titled with its worktree.
@@ -3366,6 +4210,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
             Span::styled("  (Enter=ok Esc=cancel)", Style::default().fg(Color::DarkGray)),
         ])
+    } else if app.finder.is_some() {
+        Line::from(Span::styled(FINDER_HINT, Style::default().fg(Color::Gray)))
+    } else if app.focus == Focus::Nav && app.footer == NAV_HINT {
+        Line::from(Span::styled(nav_hint(app), Style::default().fg(Color::Gray)))
     } else {
         Line::from(Span::styled(
             app.footer.clone(),
@@ -3373,6 +4221,28 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+const FINDER_HINT: &str = "FIND · type to filter · ↑/↓ move · Enter open · Esc close";
+
+/// The tree's footer: only the keys that apply to the selected row, then where
+/// to find the rest. Replaces one line of every binding, which a narrow
+/// terminal cut off after a handful.
+fn nav_hint(app: &App) -> String {
+    let tail = "/ find · ? keys";
+    let keys = match app.selected_row() {
+        None => "w new worktree · q quit",
+        Some(Row::Group(_)) => "Enter fold · j/k move",
+        Some(Row::Worktree { .. }) => {
+            "Enter expand · c claude · C codex · n shell · w worktree · d remove · X clean up"
+        }
+        Some(Row::Session { .. } | Row::Inbox { .. }) => {
+            "Enter open · R rename · x kill · Ctrl+G diff · Ctrl+] editor"
+        }
+        Some(Row::History { .. }) => "Enter show past sessions · a show all",
+        Some(Row::Agent { .. }) => "Enter resume · a fold past sessions",
+    };
+    format!("{keys} · {tail}")
 }
 
 fn status_glyph(status: Status) -> (&'static str, Color) {
@@ -3505,10 +4375,15 @@ mod tests {
             command: String::new(),
             status,
             agent: None,
+            unread: false,
+            idle_secs: 0,
         }
     }
     fn agent(id: &str) -> AgentInfo {
         agent_aged(id, 0)
+    }
+    fn agent_titled(id: &str, title: &str) -> AgentInfo {
+        AgentInfo { title: title.into(), ..agent(id) }
     }
     fn agent_aged(id: &str, age_secs: u64) -> AgentInfo {
         AgentInfo {
@@ -3528,6 +4403,8 @@ mod tests {
             subject: String::new(),
             rebasing: None,
             created_secs: None,
+            last_active_secs: None,
+            pr: None,
             sessions,
             agents,
         }
@@ -3545,7 +4422,12 @@ mod tests {
             selected: 0,
             collapsed: HashSet::new(),
             seen_worktrees: HashSet::new(),
-            show_old: false,
+            folded_groups: default_folded_groups(),
+            history_open: HashSet::new(),
+            show_history: false,
+            home: Some("/home/me".into()),
+            finder: None,
+            help: false,
             nav_hidden: false,
             nav_wide: false,
             sort_by_age: SORT_BY_AGE_DEFAULT,
@@ -3584,6 +4466,8 @@ mod tests {
             command: String::new(),
             status: Status::Idle,
             agent: Some(tool),
+            unread: false,
+            idle_secs: 0,
         }
     }
 
@@ -3602,15 +4486,15 @@ mod tests {
         // Nothing attached → the generic terminal label.
         assert_eq!(primary_pane_title(&app), " terminal ");
 
-        // Agent session → "<Provider> - <name>".
+        // Agent session → "<Provider> - <name>", then its worktree and state.
         app.attached = Some(1);
-        assert_eq!(primary_pane_title(&app), " Claude - Research XYZ ");
+        assert_eq!(primary_pane_title(&app), " Claude - Research XYZ · /r/wt · idle ");
         app.attached = Some(2);
-        assert_eq!(primary_pane_title(&app), " OpenCode - Refactor ");
+        assert_eq!(primary_pane_title(&app), " OpenCode - Refactor · /r/wt · idle ");
 
         // Plain shell → the bare session name (no provider prefix).
         app.attached = Some(3);
-        assert_eq!(primary_pane_title(&app), " playful-wolf ");
+        assert_eq!(primary_pane_title(&app), " playful-wolf · /r/wt · idle ");
     }
 
     #[test]
@@ -3690,15 +4574,20 @@ mod tests {
         assert_eq!(app.rows.len(), 2);
     }
 
+    fn counts_text(sessions: &[SessionInfo]) -> String {
+        session_counts(sessions).iter().map(|s| s.content.to_string()).collect()
+    }
+
     #[test]
-    fn folded_header_summary_prioritizes_waiting() {
-        let waiting = sess_status(2, "b", Status::Waiting);
-        assert_eq!(
-            summary_status(&[running(1, "a"), waiting]),
-            Some(Status::Waiting) // waiting outranks running
-        );
-        assert_eq!(summary_status(&[running(1, "a")]), Some(Status::Running));
-        assert_eq!(summary_status(&[sess(1, "a")]), None); // idle only -> no marker
+    fn a_worktree_row_counts_its_sessions_by_what_they_need() {
+        let mut unread = sess(4, "d");
+        unread.unread = true;
+        let sessions =
+            [running(1, "a"), sess_status(2, "b", Status::Waiting), sess(3, "c"), unread];
+        // Waiting and unread both need you; each session is counted once.
+        assert_eq!(counts_text(&sessions), "◐2 ●1 ○1");
+        assert_eq!(counts_text(&[sess(1, "a")]), "○1");
+        assert_eq!(counts_text(&[sess_status(1, "a", Status::Exited)]), "");
     }
 
     #[test]
@@ -3733,39 +4622,44 @@ mod tests {
         assert_eq!(app.rows.len(), 3); // a: header+child, b: header
     }
 
-    #[test]
-    fn old_agents_hidden_until_toggled() {
-        let day = 24 * 60 * 60;
-        let mut app = app_with(vec![wt(
-            "/r/a",
-            vec![],
-            vec![agent_aged("fresh", 2 * day), agent_aged("stale", 5 * day)],
-        )]);
-        // header + fresh agent; the 5d-old one is hidden
-        assert_eq!(app.rows.len(), 2);
-        let visible: Vec<_> = app
-            .rows
+    fn agent_ids(app: &App) -> Vec<String> {
+        app.rows
             .iter()
             .filter_map(|r| match r {
-                Row::Agent { ag, .. } => Some(app.tree[0].agents[*ag].session_id.clone()),
+                Row::Agent { wt, ag } => Some(app.tree[*wt].agents[*ag].session_id.clone()),
                 _ => None,
             })
-            .collect();
-        assert_eq!(visible, vec!["fresh".to_string()]);
-
-        app.show_old = true;
-        app.rebuild_rows();
-        assert_eq!(app.rows.len(), 3); // both agents now visible
+            .collect()
     }
 
     #[test]
-    fn old_agent_exactly_at_threshold_is_visible() {
-        let mut app = app_with(vec![wt(
-            "/r/a",
-            vec![],
-            vec![agent_aged("edge", OLD_THRESHOLD_SECS)],
-        )]);
-        assert_eq!(app.rows.len(), 2); // boundary is inclusive → shown
+    fn past_sessions_fold_under_one_row_that_enter_opens() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, "live")], vec![agent("old1"), agent("old2")])]);
+        // header, the live session, then one "↺ 2 earlier" row: no past rows.
+        assert!(matches!(app.rows.as_slice(), [Row::Worktree { .. }, Row::Session { .. }, Row::History { .. }]));
+        assert!(agent_ids(&app).is_empty());
+
+        app.selected = 2;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(agent_ids(&app), ["old1", "old2"]);
+        assert!(matches!(app.selected_row(), Some(Row::History { .. })), "cursor stays on the ↺ row");
+
+        // Space from one of the past rows folds them back.
+        app.selected = 3;
+        press(&mut app, ' ');
+        assert!(agent_ids(&app).is_empty());
+    }
+
+    #[test]
+    fn a_shows_every_worktrees_past_sessions_at_once() {
+        let mut app = app_with(vec![
+            wt("/r/a", vec![], vec![agent("a1")]),
+            wt("/r/b", vec![], vec![agent("b1")]),
+        ]);
+        press(&mut app, 'a');
+        assert_eq!(agent_ids(&app), ["a1", "b1"]);
+        press(&mut app, 'a');
+        assert!(agent_ids(&app).is_empty());
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -3937,11 +4831,245 @@ mod tests {
             wt("/r/main", vec![sess(1, "a"), sess(2, "b")], vec![agent("x")]),
             wt("/r/feat", vec![sess(3, "c")], vec![]),
         ]);
-        assert_eq!(tree_items(&app).len(), app.rows.len());
+        assert_eq!(tree_items(&app, None).len(), app.rows.len());
+        assert_eq!(tree_items(&app, Some(30)).len(), app.rows.len());
         app.selected = 0;
         app.toggle_collapse_selected(); // fold /r/main
         assert_eq!(app.rows.len(), 3);
-        assert_eq!(tree_items(&app).len(), app.rows.len()); // was 6 before the fix
+        assert_eq!(tree_items(&app, Some(30)).len(), app.rows.len()); // was 6 before the fix
+    }
+
+    // ---- sections, inbox, finder, footer ----
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    fn active_at(mut w: WorktreeInfo, secs_ago: u64) -> WorktreeInfo {
+        w.last_active_secs = Some(now_secs() - secs_ago);
+        w
+    }
+
+    fn groups_shown(app: &App) -> Vec<Group> {
+        app.rows.iter().filter_map(|r| if let Row::Group(g) = r { Some(*g) } else { None }).collect()
+    }
+
+    fn worktrees_shown(app: &App) -> Vec<String> {
+        app.rows
+            .iter()
+            .filter_map(|r| if let Row::Worktree { wt } = r { Some(app.tree[*wt].path.clone()) } else { None })
+            .collect()
+    }
+
+    #[test]
+    fn worktrees_fall_into_sections_by_state() {
+        let home = Some("/home/me");
+        let now = now_secs();
+        let mut root = active_at(wt("/r/main", vec![], vec![]), 90 * DAY);
+        root.is_root = true;
+        assert_eq!(group_of(&root, home, now), Group::Recent, "the root is never folded away");
+
+        let live = active_at(wt("/r/live", vec![sess(1, "s")], vec![]), 90 * DAY);
+        assert_eq!(group_of(&live, home, now), Group::Active, "a live session beats age");
+        let ghost = active_at(wt("/r/ghost", vec![sess_status(1, "s", Status::Exited)], vec![]), 90 * DAY);
+        assert_eq!(group_of(&ghost, home, now), Group::Idle, "an exited session isn't live");
+
+        let mut merged = active_at(wt("/r/merged", vec![], vec![]), 0);
+        merged.pr = Some(PrBadge { number: 7, state: PrState::Merged });
+        assert_eq!(group_of(&merged, home, now), Group::Merged);
+        let mut open = merged.clone();
+        open.pr = Some(PrBadge { number: 8, state: PrState::Open });
+        assert_eq!(group_of(&open, home, now), Group::Recent);
+
+        let mut codex = active_at(wt("/home/me/.codex/worktrees/a9f0/repo", vec![], vec![]), 0);
+        codex.branch = git::DETACHED_BRANCH.into();
+        assert_eq!(group_of(&codex, home, now), Group::Tools);
+        let mut named = codex.clone();
+        named.branch = "dev/mine".into();
+        assert_eq!(group_of(&named, home, now), Group::Recent, "a branch makes it yours");
+
+        assert_eq!(group_of(&active_at(wt("/r/w", vec![], vec![]), 6 * DAY), home, now), Group::Recent);
+        assert_eq!(group_of(&active_at(wt("/r/w", vec![], vec![]), 8 * DAY), home, now), Group::Idle);
+        assert_eq!(group_of(&wt("/r/w", vec![], vec![]), home, now), Group::Recent, "unknown age stays visible");
+    }
+
+    #[test]
+    fn idle_merged_and_tool_sections_start_folded_and_enter_unfolds_them() {
+        let mut app = app_with(vec![
+            active_at(wt("/r/new", vec![], vec![]), DAY),
+            active_at(wt("/r/old", vec![], vec![]), 30 * DAY),
+        ]);
+        assert_eq!(groups_shown(&app), [Group::Recent, Group::Idle]);
+        assert_eq!(worktrees_shown(&app), ["/r/new"], "Idle is folded to its header");
+
+        app.reselect(Some(RowKey::Group(Group::Idle)));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(worktrees_shown(&app), ["/r/new", "/r/old"]);
+        assert_eq!(app.selected_key(), Some(RowKey::Group(Group::Idle)));
+    }
+
+    #[test]
+    fn rows_under_a_section_header_are_nested_inside_it() {
+        let mut app = app_with(vec![
+            wt("/r/live", vec![sess(1, "agent")], vec![agent("p")]),
+            active_at(wt("/r/new", vec![], vec![]), DAY),
+        ]);
+        app.collapsed.clear();
+        app.history_open.insert("/r/live".into());
+        app.rebuild_rows();
+        let screen = render(&app, 80, 12);
+        let line = |needle: &str| {
+            screen.iter().find(|l| l.contains(needle)).cloned().unwrap_or_else(|| panic!("{needle} not drawn:\n{}", screen.join("\n")))
+        };
+        // Indentation: blank cells between the tree's left border and the row.
+        let depth = |needle: &str| line(needle).chars().skip(1).take_while(|c| *c == ' ').count();
+        let header = depth("ACTIVE");
+        let worktree = depth("/r/live");
+        let session = depth("agent");
+        let history = depth("earlier");
+        let past = depth("✻");
+        assert!(worktree > header, "worktree not nested under its section:\n{}", screen.join("\n"));
+        assert!(session > worktree, "session not nested under its worktree:\n{}", screen.join("\n"));
+        assert!(history > worktree, "↺ row not nested under its worktree:\n{}", screen.join("\n"));
+        assert!(past > history, "past session not nested under ↺:\n{}", screen.join("\n"));
+        assert_eq!(depth("RECENT"), header, "sections line up with each other");
+        assert_eq!(history, session, "↺ sits beside the live sessions");
+    }
+
+    #[test]
+    fn a_single_section_draws_no_header() {
+        let app = app_with(vec![wt("/r/a", vec![], vec![]), wt("/r/b", vec![], vec![])]);
+        assert!(groups_shown(&app).is_empty());
+    }
+
+    #[test]
+    fn sessions_waiting_or_unread_are_gathered_at_the_top() {
+        let mut unread = sess(2, "finished");
+        unread.unread = true;
+        let mut app = app_with(vec![
+            wt("/r/a", vec![sess(1, "quiet"), unread], vec![]),
+            wt("/r/b", vec![sess_status(3, "asks", Status::Waiting)], vec![]),
+        ]);
+        assert!(matches!(app.rows[0], Row::Group(Group::NeedsYou)));
+        let inbox: Vec<SessionId> = app
+            .rows
+            .iter()
+            .filter_map(|r| if let Row::Inbox { wt, se } = r { Some(app.tree[*wt].sessions[*se].id) } else { None })
+            .collect();
+        assert_eq!(inbox, [2, 3]);
+
+        // Enter on an inbox row opens that session.
+        let (mut app2, mut rx) = app_with_rx(app.tree.clone());
+        app2.selected = 1;
+        handle_key(&mut app2, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(rx.try_recv(), Ok(Request::Attach { id: 2, .. })));
+        app.selected = 1;
+        assert_eq!(app.selected_session().map(|(_, id)| id), Some(2), "x and R act on it too");
+    }
+
+    #[test]
+    fn a_row_puts_its_meta_flush_right_and_gives_way_from_the_name() {
+        let mut w = active_at(wt("/r/x", vec![running(1, "a")], vec![agent("p")]), 3 * DAY);
+        w.branch = "dev/payoff-quote-record-dialog".into();
+        w.pr = Some(PrBadge { number: 8301, state: PrState::Open });
+        let text = |width| {
+            let line = worktree_line(&w, "/r", true, now_secs(), 0, Some(width));
+            line.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+        };
+        let wide = text(60);
+        assert_eq!(wide.chars().count(), 60);
+        assert!(wide.starts_with("▸ payoff-quote-record-dialog dev"), "{wide:?}");
+        assert!(wide.ends_with("↺1 #8301 ●1 3d"), "{wide:?}");
+
+        // Narrow: the prefix and then the name shorten; the age and counts stay.
+        let narrow = text(30);
+        assert_eq!(narrow.chars().count(), 30, "{narrow:?}");
+        assert!(narrow.ends_with("●1 3d"), "{narrow:?}");
+        assert!(narrow.contains('…'), "{narrow:?}");
+    }
+
+    #[test]
+    fn the_finder_matches_every_word_across_worktrees_and_sessions() {
+        let mut a = wt("/r/a", vec![sess(1, "Semantic search")], vec![agent_titled("p1", "payoff totals")]);
+        a.branch = "dev/payoff-cards".into();
+        let mut b = wt("/r/b", vec![], vec![]);
+        b.branch = "dev/vehicle-payoffs".into();
+        let app = app_with(vec![a, b]);
+        assert_eq!(
+            finder_hits(&app, "payoff"),
+            [Hit::Worktree(0), Hit::Worktree(1), Hit::Session(0, 0), Hit::Agent(0, 0)],
+            "worktrees, then live, then past; a session matches on its worktree's branch too"
+        );
+        assert_eq!(finder_hits(&app, "PAYOFF vehicle"), [Hit::Worktree(1)]);
+        assert_eq!(finder_hits(&app, "semantic"), [Hit::Session(0, 0)]);
+        assert!(finder_hits(&app, "nothing like it").is_empty());
+    }
+
+    #[test]
+    fn picking_a_past_session_in_the_finder_resumes_it_and_reveals_it() {
+        let mut idle = active_at(wt("/r/old", vec![], vec![agent_titled("p1", "payoff totals")]), 30 * DAY);
+        idle.branch = "dev/old".into();
+        let (mut app, mut rx) = app_with_rx(vec![active_at(wt("/r/new", vec![], vec![]), DAY), idle]);
+        assert!(agent_ids(&app).is_empty(), "folded inside a folded section");
+
+        press(&mut app, '/');
+        typed(&mut app, "totals");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.finder.is_none());
+        assert!(matches!(rx.try_recv(), Ok(Request::ResumeAgent { session_id, .. }) if session_id == "p1"));
+        assert_eq!(app.selected_key(), Some(RowKey::Agent("p1".into())));
+    }
+
+    #[test]
+    fn the_finder_takes_typing_paste_and_arrows_and_esc_closes_it() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "one"), sess(2, "two")], vec![])]);
+        press(&mut app, '/');
+        handle_paste(&mut app, "o\nignored");
+        assert_eq!(app.finder.as_ref().map(|f| f.query.as_str()), Some("o"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.finder.as_ref().map(|f| f.selected), Some(1));
+        // A tree key typed into the finder is text, not a command.
+        press(&mut app, 'x');
+        assert!(rx.try_recv().is_err(), "x must not kill a session while finding");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.finder.is_none());
+    }
+
+    #[test]
+    fn the_tree_footer_names_only_the_keys_for_the_selected_row() {
+        let mut app = app_with(vec![wt("/r/a", vec![sess(1, "s")], vec![agent("p")])]);
+        app.collapsed.clear();
+        app.rebuild_rows();
+        app.footer = NAV_HINT.into();
+        app.selected = 0;
+        let on_worktree = nav_hint(&app);
+        assert!(on_worktree.contains("c claude") && !on_worktree.contains("R rename"), "{on_worktree}");
+        app.selected = 1;
+        let on_session = nav_hint(&app);
+        assert!(on_session.contains("R rename") && !on_session.contains("c claude"), "{on_session}");
+        for hint in [on_worktree, on_session] {
+            assert!(hint.ends_with("/ find · ? keys"), "{hint}");
+        }
+        let screen = render(&app, 120, 10).join("\n");
+        assert!(screen.contains("R rename"), "the footer shows the row's keys:\n{screen}");
+    }
+
+    #[test]
+    fn question_mark_opens_the_key_sheet_and_any_key_closes_it() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/r/a", vec![sess(1, "s")], vec![])]);
+        press(&mut app, '?');
+        let screen = render(&app, 120, 30).join("\n");
+        assert!(screen.contains("WORKTREES") && screen.contains("clean up merged and idle"), "{screen}");
+        press(&mut app, 'x');
+        assert!(!app.help);
+        assert!(rx.try_recv().is_err(), "the closing key does nothing else");
+    }
+
+    #[test]
+    fn the_pane_title_names_the_session_its_worktree_and_state() {
+        let mut w = wt("/r/wt", vec![agent_sess(1, "Deals Comms Tab", AgentTool::Claude)], vec![]);
+        w.branch = "dev/deals-comms-tab".into();
+        let mut app = app_with(vec![w]);
+        app.attached = Some(1);
+        assert_eq!(primary_pane_title(&app), " Claude - Deals Comms Tab · deals-comms-tab · idle ");
     }
 
     // ---- bottom drawer terminal (`Ctrl+\`) ----
@@ -3991,7 +5119,7 @@ mod tests {
     fn from_the_tree_the_drawer_opens_in_the_selected_worktree() {
         let (mut app, mut rx) = app_in_session();
         app.focus = Focus::Nav;
-        app.selected = 2; // /r/b
+        app.reselect(Some(RowKey::Worktree("/r/b".into())));
         handle_key(&mut app, ctrl('\\'));
         let sent = drain(&mut rx);
         assert!(
@@ -4188,7 +5316,7 @@ mod tests {
     #[test]
     fn the_selection_follows_its_worktree_when_sorting() {
         let mut app = three_worktrees();
-        app.selected = 2; // /r/a (all folded), which moves to first place
+        app.reselect(Some(RowKey::Worktree("/r/a".into())));
         assert_eq!(app.selected_key(), Some(RowKey::Worktree("/r/a".into())));
         press(&mut app, 's');
         assert_eq!(app.selected_key(), Some(RowKey::Worktree("/r/a".into())));
@@ -4236,8 +5364,8 @@ mod tests {
         );
 
         press(&mut app, 'e');
-        // Row is "  ○ " + the name; +2 for the border.
-        let fit = u16::try_from(4 + LONG_NAME.len() + 2).expect("fits u16");
+        // Row is "  ○ " + the name + "  now" (its age); +2 for the border.
+        let fit = u16::try_from(4 + LONG_NAME.len() + 5 + 2).expect("fits u16");
         assert_eq!(app.nav_width(), fit);
         assert!(render(&app, 200, 8).join("\n").contains(LONG_NAME));
 
@@ -4251,6 +5379,7 @@ mod tests {
         long.title = LONG_NAME.into();
         let mut app = app_with(vec![wt("/r/a", vec![], vec![long])]);
         app.screen_cols = 200;
+        press(&mut app, 'a'); // past sessions are folded by default
         press(&mut app, 'e');
         assert!(render(&app, 200, 8).join("\n").contains(LONG_NAME));
     }
@@ -5319,8 +6448,9 @@ diff --git a/src/a.rs b/src/a.rs
         // Hidden: one block spanning the full width, and no trace of the tree.
         app.nav_hidden = true;
         let hidden = render(&app, 120, 10);
+        // The pane title names the worktree too, so look for the tree's own row.
         assert!(
-            !hidden.join("\n").contains("mybranch"),
+            !hidden.join("\n").contains("▾ /r/mybranch"),
             "tree still drawn while hidden:\n{}",
             hidden.join("\n")
         );
@@ -5996,6 +7126,155 @@ diff --git a/src/b.rs b/src/b.rs
         press(&mut app, 'b');
         assert!(app.prompt.is_none());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn removing_a_worktree_asks_first() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/w/x", vec![], vec![])]);
+        press(&mut app, 'd');
+        assert!(rx.try_recv().is_err(), "d alone must not remove");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(rx.try_recv().is_err(), "an empty answer is no");
+
+        press(&mut app, 'd');
+        typed(&mut app, "n");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(rx.try_recv().is_err(), "n is no");
+
+        press(&mut app, 'd');
+        typed(&mut app, "y");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match rx.try_recv() {
+            Ok(Request::RemoveWorktree { path, force }) => {
+                assert_eq!(path, "/w/x");
+                assert!(!force, "d must never force");
+            }
+            other => panic!("expected a RemoveWorktree, got {other:?}"),
+        }
+    }
+
+    fn stale(path: &str, branch: &str, reason: &str) -> StaleWorktree {
+        StaleWorktree {
+            path: path.into(),
+            branch: branch.into(),
+            reason: reason.into(),
+        }
+    }
+
+    fn enter(app: &mut App) {
+        handle_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn x_upper_asks_the_daemon_for_stale_worktrees_and_removes_nothing() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/w/x", vec![], vec![])]);
+        press(&mut app, 'X');
+        match rx.try_recv() {
+            Ok(Request::FindStaleWorktrees { idle_days }) => assert_eq!(idle_days, stale_days()),
+            other => panic!("expected FindStaleWorktrees, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "X must only ask, never remove");
+    }
+
+    #[test]
+    fn confirming_the_stale_list_removes_each_worktree_without_force() {
+        let (mut app, mut rx) = app_with_rx(vec![wt("/w/x", vec![], vec![])]);
+        handle_daemon_event(
+            &mut app,
+            Event::StaleWorktrees {
+                worktrees: vec![
+                    stale("/w/a", "dev/a", "PR #1 merged"),
+                    stale("/w/b", "dev/b", "idle 30d"),
+                ],
+                note: String::new(),
+            },
+        );
+        assert!(rx.try_recv().is_err(), "the list alone must not remove anything");
+        typed(&mut app, "y");
+        enter(&mut app);
+        let mut removed = Vec::new();
+        while let Ok(req) = rx.try_recv() {
+            match req {
+                Request::RemoveWorktree { path, force } => {
+                    assert!(!force, "cleanup must never force");
+                    removed.push(path);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(removed, ["/w/a", "/w/b"]);
+    }
+
+    #[test]
+    fn declining_the_stale_list_removes_nothing() {
+        for answer in ["", "n", "no", "yess"] {
+            let (mut app, mut rx) = app_with_rx(vec![wt("/w/x", vec![], vec![])]);
+            handle_daemon_event(
+                &mut app,
+                Event::StaleWorktrees {
+                    worktrees: vec![stale("/w/a", "dev/a", "PR #1 merged")],
+                    note: String::new(),
+                },
+            );
+            typed(&mut app, answer);
+            enter(&mut app);
+            assert!(rx.try_recv().is_err(), "answer {answer:?} must not remove");
+            assert!(app.prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn an_empty_stale_list_opens_no_prompt_and_passes_on_the_note() {
+        let (mut app, _rx) = app_with_rx(vec![wt("/w/x", vec![], vec![])]);
+        handle_daemon_event(
+            &mut app,
+            Event::StaleWorktrees {
+                worktrees: vec![],
+                note: "1 kept for its uncommitted changes".into(),
+            },
+        );
+        assert!(app.prompt.is_none());
+        assert!(app.footer.contains("no stale worktrees"), "{}", app.footer);
+        assert!(app.footer.contains("1 kept for its uncommitted changes"), "{}", app.footer);
+    }
+
+    #[test]
+    fn the_stale_list_is_drawn_while_its_prompt_is_open() {
+        let (mut app, _rx) = app_with_rx(vec![wt("/w/x", vec![], vec![])]);
+        handle_daemon_event(
+            &mut app,
+            Event::StaleWorktrees {
+                worktrees: vec![stale("/w/a", "dev/merged-thing", "PR #8292 merged")],
+                note: String::new(),
+            },
+        );
+        let screen = render(&app, 100, 20).join("\n");
+        assert!(screen.contains("dev/merged-thing"), "{screen}");
+        assert!(screen.contains("PR #8292 merged"), "{screen}");
+
+        typed(&mut app, "n");
+        enter(&mut app);
+        let screen = render(&app, 100, 20).join("\n");
+        assert!(!screen.contains("dev/merged-thing"), "list must close with its prompt");
+    }
+
+    #[test]
+    fn the_stale_list_names_each_worktree_by_its_full_path() {
+        // Codex keeps its worktrees at `~/.codex/worktrees/<id>/<repo name>`, so
+        // a detached one named by its last path component read as the root repo
+        // itself being up for deletion.
+        let (mut app, _rx) = app_with_rx(vec![wt("/w/x", vec![], vec![])]);
+        let home = dirs::home_dir().unwrap().display().to_string();
+        let codex = format!("{home}/.codex/worktrees/a9f0/keysavvy");
+        handle_daemon_event(
+            &mut app,
+            Event::StaleWorktrees {
+                worktrees: vec![stale(&codex, crate::git::DETACHED_BRANCH, "idle 20d")],
+                note: String::new(),
+            },
+        );
+        let screen = render(&app, 120, 20).join("\n");
+        assert!(screen.contains("~/.codex/worktrees/a9f0/keysavvy"), "{screen}");
     }
 
     #[test]

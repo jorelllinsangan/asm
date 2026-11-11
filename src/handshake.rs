@@ -260,6 +260,8 @@ mod tests {
             command: String::new(),
             status,
             agent: None,
+            unread: false,
+            idle_secs: 0,
         }
     }
 
@@ -274,6 +276,8 @@ mod tests {
                 subject: String::new(),
                 rebasing: None,
                 created_secs: None,
+                last_active_secs: None,
+                pr: None,
                 sessions: statuses
                     .iter()
                     .enumerate()

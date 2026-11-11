@@ -7,8 +7,10 @@ use crate::handshake;
 use crate::ipc::{Frame, read_frame, write_frame};
 use crate::paths;
 use crate::protocol::{
-    AgentInfo, AgentTool, Event, Request, SessionId, SessionInfo, Status, WorktreeInfo,
+    AgentInfo, AgentTool, Event, PrBadge, Request, SessionId, SessionInfo, StaleWorktree, Status,
+    WorktreeInfo,
 };
+use crate::stale;
 
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -28,6 +30,8 @@ const SCROLLBACK_LINES: usize = 1000;
 const RUNNING_WINDOW: Duration = Duration::from_millis(600);
 const TICK: Duration = Duration::from_millis(400);
 const AGENT_REFRESH: Duration = Duration::from_secs(2);
+/// How often the slow thread re-reads pull requests from `gh` (~1s a call).
+const PR_REFRESH: Duration = Duration::from_secs(120);
 /// Most-recent Claude sessions to surface per worktree.
 const AGENT_LIMIT: usize = 12;
 
@@ -97,6 +101,12 @@ impl vt100::Callbacks for SessionCallbacks {
 struct SessionShared {
     parser: vt100::Parser<SessionCallbacks>,
     last_output: Instant,
+    /// When a client last had this session on screen: set as a view starts and
+    /// as the last one ends (see [`Viewing`]). Output after it, while nobody
+    /// watches, is unread.
+    last_seen: Instant,
+    /// Streams currently forwarding this session to a client.
+    viewers: usize,
     exited: bool,
     /// Set by the bell callback; means the app rang for attention (finished /
     /// awaiting a response). Cleared when the session is attached.
@@ -130,6 +140,10 @@ struct TitleCacheEntry {
     /// Distinct non-`HEAD` git branches this transcript ran on (in order first
     /// seen). Used to scope a recycled worktree path to the branch it's on now.
     branches: Vec<String>,
+    /// Claude only: the session this transcript was continued in, if any.
+    continued_in: Option<String>,
+    /// Claude only: written by a headless run (`claude -p`, the Agent SDK).
+    headless: bool,
 }
 
 /// The kinds of hidden per-worktree helper session (see [`Daemon::open_helper`]).
@@ -156,6 +170,15 @@ struct Daemon {
     /// subject never changes, so entries are never invalidated; this keeps the
     /// 400ms tree tick from spawning `git log` once the labels are known.
     subjects: Mutex<HashMap<String, String>>,
+    /// Claude Code transcripts continued under a new session id (compaction
+    /// starts a new file and leaves a `continued-in` record in the old one):
+    /// old id -> new id. Refreshed with the agent scan.
+    continuations: Mutex<HashMap<String, String>>,
+    /// Commit time by full SHA (see [`Daemon::commit_times`]).
+    commit_times: Mutex<HashMap<String, u64>>,
+    /// Each worktree's pull request, refreshed by [`Daemon::refresh_prs`].
+    prs: Mutex<HashMap<PathBuf, PrBadge>>,
+    prs_read_at: Mutex<Option<Instant>>,
 }
 
 impl Daemon {
@@ -276,6 +299,8 @@ impl Daemon {
                 SessionCallbacks::new(bell.clone()),
             ),
             last_output: Instant::now(),
+            last_seen: Instant::now(),
+            viewers: 0,
             exited: false,
             bell,
         }));
@@ -350,14 +375,15 @@ impl Daemon {
     /// so no bytes are lost or duplicated across the handoff. The snapshot is
     /// the emulator's current screen plus the input modes the app enabled
     /// (which `contents_formatted` omits) — see [`input_mode_setup`].
-    fn attach(&self, id: SessionId) -> Option<(Vec<u8>, broadcast::Receiver<Vec<u8>>)> {
+    fn attach(&self, id: SessionId) -> Option<(Vec<u8>, broadcast::Receiver<Vec<u8>>, Viewing)> {
         let s = self.sessions.lock().unwrap().get(&id).cloned()?;
         let mut shared = s.shared.lock().unwrap();
         // Attending to the session clears its "needs attention" bell.
         shared.bell.store(false, Ordering::Relaxed);
         let rx = s.output_tx.subscribe();
         let snapshot = attach_snapshot(&mut shared.parser);
-        Some((snapshot, rx))
+        let viewing = Viewing::start(s.shared.clone(), &mut shared);
+        Some((snapshot, rx, viewing))
     }
 
     /// Returns the `.worktreeinclude` files that could not be copied in.
@@ -368,7 +394,10 @@ impl Daemon {
 
     fn remove_worktree(&self, path: &str, force: bool) -> Result<()> {
         let path = PathBuf::from(path);
-        // Kill sessions living in the worktree before removing it.
+        // Let git decide first: a plain remove refuses a worktree holding
+        // uncommitted work, and that refusal must leave its sessions running.
+        git::remove_worktree(&self.root, &path, force)?;
+        // Then end the sessions that were living in it.
         let ids: Vec<SessionId> = {
             let map = self.sessions.lock().unwrap();
             map.values()
@@ -385,8 +414,54 @@ impl Daemon {
             .lock()
             .unwrap()
             .retain(|(_, k), _| !paths_eq(k, &path));
-        git::remove_worktree(&self.root, &path, force)?;
         Ok(())
+    }
+
+    /// Commit times of the worktrees' HEADs, fetching (in one git call) only
+    /// the SHAs not already cached. A SHA's time never changes, so the 400ms
+    /// tick spawns git only when a worktree moves to a new commit.
+    fn commit_times(&self, worktrees: &[git::Worktree]) -> HashMap<String, u64> {
+        let mut cache = self.commit_times.lock().unwrap();
+        let missing: Vec<&str> = worktrees
+            .iter()
+            .map(|w| w.head.as_str())
+            .filter(|h| !h.is_empty() && !cache.contains_key(*h))
+            .collect();
+        if !missing.is_empty() {
+            let found = git::commit_times(&self.root, &missing);
+            // Cache misses as 0 (never "newest"), so they aren't re-queried.
+            for sha in missing {
+                cache.insert(sha.to_string(), found.get(sha).copied().unwrap_or(0));
+            }
+        }
+        cache.clone()
+    }
+
+    /// Re-read pull requests from `gh` when the last read is older than
+    /// [`PR_REFRESH`] (or `force`), and badge each worktree's branch. Blocking:
+    /// runs on the slow agent thread. A failed `gh` keeps the old badges.
+    fn refresh_prs(&self, force: bool) {
+        {
+            let mut last = self.prs_read_at.lock().unwrap();
+            if !force && last.is_some_and(|t| t.elapsed() < PR_REFRESH) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let Ok(prs) = stale::pull_requests(&self.root) else {
+            return;
+        };
+        let worktrees = git::list_worktrees_in(&self.root).unwrap_or_default();
+        let badges: HashMap<PathBuf, PrBadge> = worktrees
+            .iter()
+            .filter_map(|wt| {
+                let badge = stale::pr_badge_for(&wt.branch, &wt.head, &prs, |a, b| {
+                    git::is_ancestor(&wt.path, a, b)
+                })?;
+                Some((wt.path.clone(), badge))
+            })
+            .collect();
+        *self.prs.lock().unwrap() = badges;
     }
 
     /// Subjects of the commits detached worktrees sit on, fetching (in one git
@@ -423,24 +498,34 @@ impl Daemon {
     fn build_tree(&self) -> Event {
         let worktrees = git::list_worktrees_in(&self.root).unwrap_or_default();
         let subjects = self.detached_subjects(&worktrees);
+        let commit_times = self.commit_times(&worktrees);
+        let prs = self.prs.lock().unwrap().clone();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let map = self.sessions.lock().unwrap();
         let agents_cache = self.agents.lock().unwrap();
         // Resumed sessions carry their on-disk id — hide that exact copy.
-        let live_agent_ids: HashSet<String> =
-            map.values().filter_map(|s| s.agent_id.clone()).collect();
+        let live_agent_ids = with_continuations(
+            map.values().filter_map(|s| s.agent_id.clone()).collect(),
+            &self.continuations.lock().unwrap(),
+        );
         let mut wt_infos = Vec::new();
         for wt in &worktrees {
             let mut sessions: Vec<SessionInfo> = map
                 .values()
                 .filter(|s| !s.hidden && paths_eq(&s.worktree, &wt.path))
                 .map(|s| {
-                    let status = compute_status(&s.shared.lock().unwrap());
+                    let sh = s.shared.lock().unwrap();
                     SessionInfo {
                         id: s.id,
                         name: s.name.lock().unwrap().clone(),
                         command: s.command.clone(),
-                        status,
+                        status: compute_status(&sh),
                         agent: s.agent,
+                        unread: is_unread(&sh),
+                        idle_secs: sh.last_output.elapsed().as_secs(),
                     }
                 })
                 .collect();
@@ -460,11 +545,18 @@ impl Daemon {
                     *fresh_by_tool.entry(tool).or_default() += 1;
                 }
             }
-            let agents = visible_agents(
-                agents_cache.get(&wt.path).cloned().unwrap_or_default(),
-                &live_agent_ids,
-                fresh_by_tool,
-            );
+            let on_disk = agents_cache.get(&wt.path).cloned().unwrap_or_default();
+            let created_secs = dir_birthtime(&wt.path);
+            let last_active_secs = [
+                commit_times.get(&wt.head).copied(),
+                created_secs,
+                on_disk.iter().map(|a| now.saturating_sub(a.age_secs)).max(),
+                sessions.iter().map(|s| now.saturating_sub(s.idle_secs)).max(),
+            ]
+            .into_iter()
+            .flatten()
+            .max();
+            let agents = visible_agents(on_disk, &live_agent_ids, fresh_by_tool);
             let detached = wt.branch == git::DETACHED_BRANCH;
             wt_infos.push(WorktreeInfo {
                 path: wt.path.display().to_string(),
@@ -477,7 +569,9 @@ impl Daemon {
                     String::new()
                 },
                 rebasing: if detached { git::rebasing_branch(&wt.path) } else { None },
-                created_secs: dir_birthtime(&wt.path),
+                created_secs,
+                last_active_secs,
+                pr: prs.get(&wt.path).copied(),
                 sessions,
                 agents,
             });
@@ -487,6 +581,84 @@ impl Daemon {
             root: self.root.display().to_string(),
             worktrees: wt_infos,
         }
+    }
+
+    /// The worktrees `X` offers to remove (see [`crate::stale`]), plus a note on
+    /// what couldn't be checked or was held back. Blocking: shells out to git
+    /// and `gh`.
+    fn find_stale(&self, idle_days: u64) -> (Vec<StaleWorktree>, String) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.find_stale_at(idle_days, now)
+    }
+
+    /// [`Self::find_stale`] as of `now` (seconds since the epoch), so a test can
+    /// look at a fresh worktree from a month later.
+    fn find_stale_at(&self, idle_days: u64, now: u64) -> (Vec<StaleWorktree>, String) {
+        let worktrees = git::list_worktrees_in(&self.root).unwrap_or_default();
+        let mut notes = Vec::new();
+        let prs = stale::merged_prs(&self.root).unwrap_or_else(|e| {
+            notes.push(format!("merged PRs not checked: {e}"));
+            Vec::new()
+        });
+
+        let mut found = Vec::new();
+        let mut kept_dirty = 0;
+        for wt in &worktrees {
+            let live_sessions = {
+                let map = self.sessions.lock().unwrap();
+                map.values()
+                    .filter(|s| !s.hidden && paths_eq(&s.worktree, &wt.path))
+                    .filter(|s| !s.shared.lock().unwrap().exited)
+                    .count()
+            };
+            // Newest agent transcript for this worktree; `age_secs` is relative
+            // to the last 2s rescan, which is close enough at day granularity.
+            let newest_agent = self
+                .agents
+                .lock()
+                .unwrap()
+                .get(&wt.path)
+                .and_then(|a| a.iter().map(|a| a.age_secs).min())
+                .map(|age| now.saturating_sub(age));
+            let facts = stale::Facts {
+                is_root: wt.is_root,
+                rebasing: git::rebasing_branch(&wt.path).is_some(),
+                live_sessions,
+                merged_pr: stale::merged_pr_for(&wt.branch, &wt.head, &prs, |a, b| {
+                    git::is_ancestor(&wt.path, a, b)
+                }),
+                last_active_secs: [
+                    git::head_commit_secs(&wt.path),
+                    dir_birthtime(&wt.path),
+                    newest_agent,
+                ]
+                .into_iter()
+                .flatten()
+                .max(),
+            };
+            let Some(verdict) = stale::verdict(&facts, now, idle_days) else {
+                continue;
+            };
+            // Last, because it's the slow check: `d` would refuse it anyway.
+            if git::has_uncommitted_work(&wt.path) {
+                kept_dirty += 1;
+                continue;
+            }
+            found.push(StaleWorktree {
+                path: wt.path.display().to_string(),
+                branch: wt.branch.clone(),
+                reason: verdict.describe(),
+            });
+        }
+        match kept_dirty {
+            0 => {}
+            1 => notes.push("1 kept for its uncommitted changes".into()),
+            n => notes.push(format!("{n} kept for their uncommitted changes")),
+        }
+        (found, notes.join("; "))
     }
 
     fn broadcast_tree(&self) {
@@ -500,6 +672,7 @@ impl Daemon {
         let _ = git::prune_worktrees(&self.root);
         self.title_cache.lock().unwrap().clear();
         self.refresh_agents();
+        self.refresh_prs(true);
         self.broadcast_tree();
     }
 
@@ -516,6 +689,7 @@ impl Daemon {
         let oc_by_dir = opencode_sessions();
         let codex_by_dir = self.codex_sessions();
         let mut result: HashMap<PathBuf, Vec<AgentInfo>> = HashMap::new();
+        let mut continuations: HashMap<String, String> = HashMap::new();
 
         for wt in &worktrees {
             let mut agents = Vec::new();
@@ -523,44 +697,7 @@ impl Daemon {
             // --- Claude Code: one transcript file per session ---
             if let Some(base) = &claude_base {
                 let dir = base.join(encode_project(&wt.path));
-                let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
-                if let Ok(rd) = fs::read_dir(&dir) {
-                    for entry in rd.flatten() {
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                            continue;
-                        }
-                        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-                            files.push((path, mtime));
-                        }
-                    }
-                }
-                files.sort_by(|a, b| b.1.cmp(&a.1)); // most-recent first
-                files.truncate(AGENT_LIMIT);
-                for (path, mtime) in files {
-                    let (cwd, title, branches) = self.title_for(&path, mtime);
-                    // Guard against encoding collisions.
-                    if !paths_eq(Path::new(&cwd), &wt.path) {
-                        continue;
-                    }
-                    // Scope recycled paths to the current branch (a previous
-                    // tenant of this reused path lives on a different branch).
-                    if !transcript_matches_branch(&wt.branch, &branches) {
-                        continue;
-                    }
-                    let session_id = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let age_secs = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
-                    agents.push(AgentInfo {
-                        session_id,
-                        title,
-                        last_active: humanize_secs(age_secs),
-                        age_secs,
-                        tool: AgentTool::Claude,
-                    });
-                }
+                agents.extend(self.claude_agents(&dir, wt, now, &mut continuations));
             }
 
             // --- OpenCode: rows keyed by the session's directory ---
@@ -619,25 +756,94 @@ impl Daemon {
             result.insert(wt.path.clone(), agents);
         }
         *self.agents.lock().unwrap() = result;
+        *self.continuations.lock().unwrap() = continuations;
     }
 
-    fn title_for(&self, path: &Path, mtime: SystemTime) -> (String, String, Vec<String>) {
+    /// The past Claude sessions of `wt`, from its project directory `dir`
+    /// (`~/.claude/projects/<encoded path>`), most recent first. Records every
+    /// `continued-in` link it reads into `continuations`, and lists neither a
+    /// headless run nor the earlier part of a continued conversation.
+    fn claude_agents(
+        &self,
+        dir: &Path,
+        wt: &git::Worktree,
+        now: SystemTime,
+        continuations: &mut HashMap<String, String>,
+    ) -> Vec<AgentInfo> {
+        let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+        if let Ok(rd) = fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                    files.push((path, mtime));
+                }
+            }
+        }
+        files.sort_by(|a, b| b.1.cmp(&a.1)); // most-recent first
+        files.truncate(AGENT_LIMIT);
+        let mut agents = Vec::new();
+        for (path, mtime) in files {
+            let meta = self.title_for(&path, mtime);
+            // Guard against encoding collisions.
+            if !paths_eq(Path::new(&meta.cwd), &wt.path) {
+                continue;
+            }
+            let session_id = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Some(next) = &meta.continued_in {
+                continuations.insert(session_id.clone(), next.clone());
+            }
+            let continued_exists = |id: &str| dir.join(format!("{id}.jsonl")).exists();
+            if !claude_listable(&meta, continued_exists) {
+                continue;
+            }
+            // Scope recycled paths to the current branch (a previous
+            // tenant of this reused path lives on a different branch).
+            if !transcript_matches_branch(&wt.branch, &meta.branches) {
+                continue;
+            }
+            let age_secs = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
+            agents.push(AgentInfo {
+                session_id,
+                title: meta.title,
+                last_active: humanize_secs(age_secs),
+                age_secs,
+                tool: AgentTool::Claude,
+            });
+        }
+        agents
+    }
+
+    fn title_for(&self, path: &Path, mtime: SystemTime) -> TranscriptMeta {
         if let Some(e) = self.title_cache.lock().unwrap().get(path)
             && e.mtime == mtime
         {
-            return (e.cwd.clone(), e.title.clone(), e.branches.clone());
+            return TranscriptMeta {
+                cwd: e.cwd.clone(),
+                title: e.title.clone(),
+                branches: e.branches.clone(),
+                continued_in: e.continued_in.clone(),
+                headless: e.headless,
+            };
         }
-        let (cwd, title, branches) = parse_transcript(path);
+        let meta = parse_transcript(path);
         self.title_cache.lock().unwrap().insert(
             path.to_path_buf(),
             TitleCacheEntry {
                 mtime,
-                cwd: cwd.clone(),
-                title: title.clone(),
-                branches: branches.clone(),
+                cwd: meta.cwd.clone(),
+                title: meta.title.clone(),
+                branches: meta.branches.clone(),
+                continued_in: meta.continued_in.clone(),
+                headless: meta.headless,
             },
         );
-        (cwd, title, branches)
+        meta
     }
 
     /// Scan Codex rollout transcripts and group them by their recorded `cwd`.
@@ -690,6 +896,8 @@ impl Daemon {
                 cwd: cwd.clone(),
                 title: title.clone(),
                 branches: Vec::new(),
+                continued_in: None,
+                headless: false,
             },
         );
         (cwd, title)
@@ -910,6 +1118,15 @@ fn parse_codex_content(content: &str, path: &Path) -> (String, String) {
         let payload = v.get("payload");
         match v.get("type").and_then(|x| x.as_str()) {
             Some("session_meta") => {
+                // A sub-thread (a Guardian review, a sub-agent) names the thread
+                // that spawned it, and `codex resume` refuses it. Reporting no
+                // cwd keeps it out of every worktree's list.
+                if payload
+                    .and_then(|p| p.get("parent_thread_id"))
+                    .is_some_and(|x| !x.is_null())
+                {
+                    return (String::new(), String::new());
+                }
                 if let Some(c) = payload
                     .and_then(|p| p.get("cwd"))
                     .and_then(|x| x.as_str())
@@ -917,16 +1134,8 @@ fn parse_codex_content(content: &str, path: &Path) -> (String, String) {
                     cwd = c.to_string();
                 }
             }
-            Some("event_msg") => {
-                if title.is_none()
-                    && payload.and_then(|p| p.get("type")).and_then(|x| x.as_str())
-                        == Some("user_message")
-                    && let Some(t) = payload
-                        .and_then(|p| p.get("message"))
-                        .and_then(|x| x.as_str())
-                {
-                    title = Some(t.to_string());
-                }
+            Some("event_msg") if title.is_none() => {
+                title = payload.and_then(codex_user_prompt);
             }
             _ => {}
         }
@@ -935,8 +1144,42 @@ fn parse_codex_content(content: &str, path: &Path) -> (String, String) {
             break;
         }
     }
-    let title = title.unwrap_or_else(|| fallback_id(path));
+    let title = title.unwrap_or_else(|| {
+        let id = codex_session_id_from_path(path);
+        if id.is_empty() {
+            fallback_id(path)
+        } else {
+            id.chars().take(8).collect()
+        }
+    });
     (cwd, clean_title(&title))
+}
+
+/// The user's prompt text if this `event_msg` payload carries one. Older Codex
+/// writes a `user_message` event; 0.166+ writes none and records the prompt only
+/// as a completed `UserMessage` item, whose content may lead with an image part.
+fn codex_user_prompt(payload: &serde_json::Value) -> Option<String> {
+    match payload.get("type").and_then(|x| x.as_str()) {
+        Some("user_message") => payload
+            .get("message")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        Some("item_completed") => {
+            let item = payload.get("item")?;
+            if item.get("type").and_then(|x| x.as_str()) != Some("UserMessage") {
+                return None;
+            }
+            let text: Vec<&str> = item
+                .get("content")?
+                .as_array()?
+                .iter()
+                .filter(|part| part.get("type").and_then(|x| x.as_str()) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(|x| x.as_str()))
+                .collect();
+            (!text.is_empty()).then(|| text.join(" "))
+        }
+        _ => None,
+    }
 }
 
 /// Creation time of a directory, in seconds since the epoch. On macOS this is
@@ -968,20 +1211,67 @@ fn transcript_matches_branch(wt_branch: &str, branches: &[String]) -> bool {
     wt_branch.is_empty() || branches.is_empty() || branches.iter().any(|b| b == wt_branch)
 }
 
-/// Extract (cwd, title, branches) from a transcript. Title preference: the
-/// latest `ai-title`, else the first user message, else the first
-/// `last-prompt`. `branches` is the distinct set of non-`HEAD` `gitBranch`
-/// values seen, used to disambiguate a recycled worktree path.
-fn parse_transcript(path: &Path) -> (String, String, Vec<String>) {
+/// What the tree needs from one Claude Code transcript.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct TranscriptMeta {
+    cwd: String,
+    /// The latest `ai-title`, else the first user message, else the first
+    /// `last-prompt`.
+    title: String,
+    /// The distinct non-`HEAD` `gitBranch` values seen, used to disambiguate a
+    /// recycled worktree path.
+    branches: Vec<String>,
+    /// The session id named by a `continued-in` record: compaction carried the
+    /// conversation on in that transcript, so this one is its past.
+    continued_in: Option<String>,
+    /// Written by a headless run: its `entrypoint` is `sdk-cli` (`claude -p`,
+    /// or another tool driving Claude) or another `sdk-*`, not the `cli` of an
+    /// interactive session. Nobody resumes those.
+    headless: bool,
+}
+
+/// Parse a transcript file; see [`TranscriptMeta`].
+fn parse_transcript(path: &Path) -> TranscriptMeta {
     let Ok(content) = fs::read_to_string(path) else {
-        return (String::new(), fallback_id(path), Vec::new());
+        return TranscriptMeta { title: fallback_id(path), ..TranscriptMeta::default() };
     };
     parse_transcript_content(&content, path)
 }
 
+/// Whether a Claude transcript belongs in a worktree's list of past sessions:
+/// not a headless run, and not the earlier half of a conversation that was
+/// continued in a transcript that still exists (`continued_exists`), which is
+/// listed in its place.
+fn claude_listable(meta: &TranscriptMeta, continued_exists: impl Fn(&str) -> bool) -> bool {
+    !meta.headless && !meta.continued_in.as_deref().is_some_and(continued_exists)
+}
+
+/// `live` (the on-disk ids of resumed live sessions) plus every transcript they
+/// were continued in, transitively: each is the same conversation, still live.
+fn with_continuations(
+    mut live: HashSet<String>,
+    links: &HashMap<String, String>,
+) -> HashSet<String> {
+    let starts: Vec<String> = live.iter().cloned().collect();
+    for start in starts {
+        let mut id = start;
+        // Bounded, so a malformed cycle can't spin.
+        for _ in 0..links.len() {
+            let Some(next) = links.get(&id) else { break };
+            if !live.insert(next.clone()) {
+                break;
+            }
+            id = next.clone();
+        }
+    }
+    live
+}
+
 /// The pure core of [`parse_transcript`]: parses already-read JSONL `content`.
 /// `path` is used only for the title fallback when nothing else is found.
-fn parse_transcript_content(content: &str, path: &Path) -> (String, String, Vec<String>) {
+fn parse_transcript_content(content: &str, path: &Path) -> TranscriptMeta {
+    let mut continued_in: Option<String> = None;
+    let mut entrypoint: Option<String> = None;
     let mut cwd = String::new();
     let mut ai_title: Option<String> = None;
     let mut first_user: Option<String> = None;
@@ -1000,6 +1290,11 @@ fn parse_transcript_content(content: &str, path: &Path) -> (String, String, Vec<
             && let Some(c) = v.get("cwd").and_then(|x| x.as_str())
         {
             cwd = c.to_string();
+        }
+        if entrypoint.is_none()
+            && let Some(e) = v.get("entrypoint").and_then(|x| x.as_str())
+        {
+            entrypoint = Some(e.to_string());
         }
         // `gitBranch` appears on most entries; `HEAD` means detached (rebase,
         // etc.) and carries no branch identity, so skip it.
@@ -1028,6 +1323,11 @@ fn parse_transcript_content(content: &str, path: &Path) -> (String, String, Vec<
                     first_user = extract_user_text(&v);
                 }
             }
+            Some("continued-in") => {
+                if let Some(id) = v.get("continuedInSessionId").and_then(|x| x.as_str()) {
+                    continued_in = Some(id.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -1035,7 +1335,13 @@ fn parse_transcript_content(content: &str, path: &Path) -> (String, String, Vec<
         .or(first_user)
         .or(first_prompt)
         .unwrap_or_else(|| fallback_id(path));
-    (cwd, clean_title(&title), branches)
+    TranscriptMeta {
+        cwd,
+        title: clean_title(&title),
+        branches,
+        continued_in,
+        headless: entrypoint.is_some_and(|e| e.starts_with("sdk")),
+    }
 }
 
 fn extract_user_text(v: &serde_json::Value) -> Option<String> {
@@ -1202,6 +1508,43 @@ fn sane_dims(cols: u16, rows: u16) -> (u16, u16) {
     (cols.max(1), rows.max(1))
 }
 
+/// One client stream showing a session. While any exists the session's output
+/// is being watched; when the last ends (detach, switching sessions, the client
+/// going away: an aborted stream task drops it too) everything so far counts as
+/// seen. See [`is_unread`].
+struct Viewing(Arc<Mutex<SessionShared>>);
+
+impl Viewing {
+    /// `locked` is `shared`, already locked by the caller.
+    fn start(shared: Arc<Mutex<SessionShared>>, locked: &mut SessionShared) -> Self {
+        locked.viewers += 1;
+        locked.last_seen = Instant::now();
+        Viewing(shared)
+    }
+}
+
+impl Drop for Viewing {
+    fn drop(&mut self) {
+        // A poisoned lock means the session is already broken; nothing to mark.
+        if let Ok(mut sh) = self.0.lock() {
+            sh.viewers = sh.viewers.saturating_sub(1);
+            sh.last_seen = Instant::now();
+        }
+    }
+}
+
+/// Whether a session finished something nobody has seen: it produced output
+/// after it was last on screen, nobody is watching it now, and it has gone
+/// quiet (still-streaming output is work in progress, not a result). Unlike the
+/// bell this needs nothing from the program, so it works for every agent CLI
+/// and for plain shells alike.
+fn is_unread(sh: &SessionShared) -> bool {
+    !sh.exited
+        && sh.viewers == 0
+        && sh.last_output > sh.last_seen
+        && sh.last_output.elapsed() >= RUNNING_WINDOW
+}
+
 fn compute_status(sh: &SessionShared) -> Status {
     if sh.exited {
         Status::Exited
@@ -1258,6 +1601,10 @@ pub async fn run(root: PathBuf) -> Result<()> {
         title_cache: Mutex::new(HashMap::new()),
         helpers: Mutex::new(HashMap::new()),
         subjects: Mutex::new(HashMap::new()),
+        continuations: Mutex::new(HashMap::new()),
+        commit_times: Mutex::new(HashMap::new()),
+        prs: Mutex::new(HashMap::new()),
+        prs_read_at: Mutex::new(None),
     });
 
     // Periodic status refresh: recompute + push the tree to all clients.
@@ -1278,6 +1625,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
         std::thread::spawn(move || {
             loop {
                 daemon.refresh_agents();
+                daemon.refresh_prs(false);
                 daemon.broadcast_tree();
                 std::thread::sleep(AGENT_REFRESH);
             }
@@ -1441,10 +1789,11 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
                     t.abort();
                 }
                 daemon.resize(id, cols, rows);
-                if let Some((scrollback, rx)) = daemon.attach(id) {
+                if let Some((scrollback, rx, viewing)) = daemon.attach(id) {
                     let _ = out_tx.send(Event::Attached { id, scrollback });
                     let out_tx = out_tx.clone();
                     attach_task = Some(tokio::spawn(async move {
+                        let _viewing = viewing; // held for as long as the stream runs
                         forward_output(id, rx, out_tx).await;
                     }));
                 } else {
@@ -1476,10 +1825,11 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
                     t.abort();
                 }
                 daemon.resize(id, cols, rows);
-                if let Some((scrollback, rx)) = daemon.attach(id) {
+                if let Some((scrollback, rx, viewing)) = daemon.attach(id) {
                     let _ = out_tx.send(Event::Attached { id, scrollback });
                     let out_tx = out_tx.clone();
                     editor_task = Some(tokio::spawn(async move {
+                        let _viewing = viewing; // held for as long as the stream runs
                         forward_output(id, rx, out_tx).await;
                     }));
                 } else {
@@ -1509,10 +1859,11 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
                     t.abort();
                 }
                 daemon.resize(id, cols, rows);
-                if let Some((scrollback, rx)) = daemon.attach(id) {
+                if let Some((scrollback, rx, viewing)) = daemon.attach(id) {
                     let _ = out_tx.send(Event::Attached { id, scrollback });
                     let out_tx = out_tx.clone();
                     drawer_task = Some(tokio::spawn(async move {
+                        let _viewing = viewing; // held for as long as the stream runs
                         forward_output(id, rx, out_tx).await;
                     }));
                 } else {
@@ -1542,6 +1893,15 @@ async fn handle_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) -> Res
                         Err(e) => Event::Error { message: format!("{e:#}") },
                     };
                     let _ = out_tx.send(ev);
+                });
+            }
+            Request::FindStaleWorktrees { idle_days } => {
+                // git status per candidate and a `gh` call: keep it off the socket task.
+                let daemon = daemon.clone();
+                let out_tx = out_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let (worktrees, note) = daemon.find_stale(idle_days);
+                    let _ = out_tx.send(Event::StaleWorktrees { worktrees, note });
                 });
             }
             Request::Input { id, data } => daemon.write_input(id, &data),
@@ -1596,6 +1956,8 @@ mod tests {
         SessionShared {
             parser,
             last_output: old,
+            last_seen: old,
+            viewers: 0,
             exited: false,
             bell,
         }
@@ -1627,6 +1989,167 @@ mod tests {
         reader_loop(reader, shared, tx, writer); // returns at EOF
         let out = captured.0.lock().unwrap().clone();
         out
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A real repo with one linked worktree, and a daemon rooted at it.
+    fn daemon_with_worktree(tag: &str) -> (Daemon, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("asm-rm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        git_in(&root, &["init", "-q", "-b", "main"]);
+        git_in(&root, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = base.join("wt");
+        git_in(&root, &["worktree", "add", "-q", "-b", "feature", wt.to_str().unwrap()]);
+        let (tree_tx, _) = broadcast::channel(16);
+        let daemon = Daemon {
+            root: root.clone(),
+            sessions: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            tree_tx,
+            agents: Mutex::new(HashMap::new()),
+            title_cache: Mutex::new(HashMap::new()),
+            helpers: Mutex::new(HashMap::new()),
+            subjects: Mutex::new(HashMap::new()),
+            continuations: Mutex::new(HashMap::new()),
+            commit_times: Mutex::new(HashMap::new()),
+            prs: Mutex::new(HashMap::new()),
+            prs_read_at: Mutex::new(None),
+        };
+        (daemon, base, wt)
+    }
+
+    #[test]
+    fn a_refused_worktree_removal_leaves_its_sessions_running() {
+        // `d` is a plain `git worktree remove`, which git refuses on a worktree
+        // with uncommitted work. The sessions in it used to be killed first, so
+        // the refusal still ended them.
+        let (daemon, base, wt) = daemon_with_worktree("refused");
+        std::fs::write(wt.join("wip.txt"), "unsaved").unwrap();
+        let id = daemon
+            .create_session(wt.to_string_lossy().into(), "s".into(), "sleep 30".into(), None)
+            .unwrap();
+
+        assert!(daemon.remove_worktree(&wt.to_string_lossy(), false).is_err());
+        assert!(wt.exists(), "a dirty worktree must survive a plain remove");
+        assert!(
+            daemon.sessions.lock().unwrap().contains_key(&id),
+            "a refused removal must not kill the worktree's sessions"
+        );
+
+        // Once git does remove it, the sessions go with it.
+        daemon.remove_worktree(&wt.to_string_lossy(), true).unwrap();
+        assert!(!daemon.sessions.lock().unwrap().contains_key(&id));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn add_worktree(daemon: &Daemon, base: &Path, name: &str) -> PathBuf {
+        let wt = base.join(name);
+        git_in(&daemon.root, &["worktree", "add", "-q", "-b", name, wt.to_str().unwrap()]);
+        wt
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    #[test]
+    fn cleanup_offers_idle_worktrees_and_holds_back_busy_ones() {
+        let (daemon, base, idle) = daemon_with_worktree("stale");
+        let dirty = add_worktree(&daemon, &base, "dirty");
+        std::fs::write(dirty.join("wip.txt"), "unsaved").unwrap();
+        let busy = add_worktree(&daemon, &base, "busy");
+        daemon
+            .create_session(busy.to_string_lossy().into(), "s".into(), "sleep 30".into(), None)
+            .unwrap();
+
+        // A month from now, every worktree here has been quiet for 30 days.
+        let (found, note) = daemon.find_stale_at(14, now_secs() + 30 * stale::DAY_SECS);
+        let paths: Vec<PathBuf> =
+            found.iter().map(|w| std::fs::canonicalize(&w.path).unwrap()).collect();
+        assert_eq!(paths, [std::fs::canonicalize(&idle).unwrap()], "only the clean, unattended one");
+        assert_eq!(found[0].branch, "feature");
+        assert!(found[0].reason.starts_with("idle 30d"), "{}", found[0].reason);
+        assert!(note.contains("1 kept for its uncommitted changes"), "{note}");
+
+        // Today, nothing has been idle long enough.
+        let (found, _) = daemon.find_stale_at(14, now_secs());
+        assert!(found.is_empty(), "{found:?}");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn ago(ms: u64) -> Instant {
+        Instant::now().checked_sub(Duration::from_millis(ms)).unwrap_or_else(Instant::now)
+    }
+
+    #[test]
+    fn output_nobody_saw_is_unread_once_it_goes_quiet() {
+        let mut sh = shared_fed(b"done");
+        sh.last_seen = ago(5_000);
+        sh.last_output = ago(2_000);
+        assert!(is_unread(&sh), "output after it was last seen, now quiet");
+
+        sh.last_output = ago(100);
+        assert!(!is_unread(&sh), "still streaming is work in progress, not a result");
+
+        sh.last_output = ago(6_000);
+        assert!(!is_unread(&sh), "output from before it was last seen");
+    }
+
+    #[test]
+    fn a_watched_or_exited_session_is_never_unread() {
+        let mut sh = shared_fed(b"done");
+        sh.last_seen = ago(5_000);
+        sh.last_output = ago(2_000);
+        sh.viewers = 1;
+        assert!(!is_unread(&sh), "someone has it on screen");
+        sh.viewers = 0;
+        sh.exited = true;
+        assert!(!is_unread(&sh), "an exited session is shown as exited instead");
+    }
+
+    #[test]
+    fn a_view_counts_as_seen_while_it_lasts_and_when_it_ends() {
+        let shared = Arc::new(Mutex::new(shared_fed(b"")));
+        shared.lock().unwrap().last_seen = ago(10_000);
+        shared.lock().unwrap().last_output = ago(5_000);
+        assert!(is_unread(&shared.lock().unwrap()));
+
+        let viewing = {
+            let mut locked = shared.lock().unwrap();
+            Viewing::start(shared.clone(), &mut locked)
+        };
+        assert_eq!(shared.lock().unwrap().viewers, 1);
+        assert!(!is_unread(&shared.lock().unwrap()), "opening it reads it");
+
+        // Output while it is on screen, then the view closes.
+        shared.lock().unwrap().last_output = Instant::now();
+        drop(viewing);
+        let sh = shared.lock().unwrap();
+        assert_eq!(sh.viewers, 0);
+        assert!(sh.last_seen >= sh.last_output, "what was on screen when it closed was seen");
+    }
+
+    #[test]
+    fn commit_times_reads_each_head_once_in_one_call() {
+        let (daemon, base, _wt) = daemon_with_worktree("ctimes");
+        let wts = git::list_worktrees_in(&daemon.root).unwrap();
+        let times = daemon.commit_times(&wts);
+        let head = &wts[0].head;
+        assert!(times.get(head).is_some_and(|t| *t > 1_600_000_000), "{times:?}");
+        assert_eq!(daemon.commit_times.lock().unwrap().len(), 1, "both worktrees share one commit");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1828,7 +2351,7 @@ mod tests {
             r#"{"type":"user","gitBranch":"feat-b"}"#,
             "\n",
         );
-        let (cwd, _title, branches) = parse_transcript_content(jsonl, Path::new("x.jsonl"));
+        let TranscriptMeta { cwd, branches, .. } = parse_transcript_content(jsonl, Path::new("x.jsonl"));
         assert_eq!(cwd, "/repo");
         assert_eq!(branches, vec!["feat-a".to_string(), "feat-b".to_string()]);
     }
@@ -1839,7 +2362,7 @@ mod tests {
             r#"{"cwd":"/repo","type":"user","message":{"content":"hi"}}"#,
             "\n",
         );
-        let (_cwd, _title, branches) = parse_transcript_content(jsonl, Path::new("x.jsonl"));
+        let TranscriptMeta { branches, .. } = parse_transcript_content(jsonl, Path::new("x.jsonl"));
         assert!(branches.is_empty());
     }
 
@@ -1883,13 +2406,56 @@ mod tests {
     }
 
     #[test]
+    fn codex_rollout_takes_its_title_from_a_completed_user_message_item() {
+        // Newer Codex (0.166+) writes no `user_message` event; the clean prompt
+        // only appears as a completed `UserMessage` item, and an image prompt
+        // has a `local_image` part ahead of its text.
+        let jsonl = concat!(
+            r#"{"type":"session_meta","payload":{"id":"abc","cwd":"/repo/wt"}}"#,
+            "\n",
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md preamble junk"}]}}"##,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning"}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"local_image","path":"/x.png"},{"type":"text","text":"fix the payoff page"}]}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"a later prompt"}]}}}"#,
+            "\n",
+        );
+        let (cwd, title) = parse_codex_content(jsonl, Path::new("rollout-x.jsonl"));
+        assert_eq!(cwd, "/repo/wt");
+        assert_eq!(title, "fix the payoff page");
+    }
+
+    #[test]
+    fn a_codex_sub_thread_is_not_listed_as_a_session() {
+        // Guardian reviews (and other sub-agents) get their own rollout file,
+        // naming the thread that spawned them. `codex resume` refuses them, so
+        // listing them only fills a worktree with unresumable rows.
+        let child = concat!(
+            r#"{"type":"session_meta","payload":{"id":"kid","session_id":"top","parent_thread_id":"top","cwd":"/repo/wt","thread_source":"guardian_review","source":{"subagent":{"other":"guardian"}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"review this"}]}}}"#,
+            "\n",
+        );
+        let (cwd, _) = parse_codex_content(child, Path::new("rollout-x.jsonl"));
+        assert_eq!(cwd, "", "a sub-thread must report no cwd, so no worktree lists it");
+
+        // The thread that spawned it is still listed.
+        let top = r#"{"type":"session_meta","payload":{"id":"top","session_id":"top","cwd":"/repo/wt","thread_source":"user","source":"cli"}}"#;
+        assert_eq!(parse_codex_content(top, Path::new("rollout-x.jsonl")).0, "/repo/wt");
+    }
+
+    #[test]
     fn codex_rollout_falls_back_to_id_without_user_message() {
         let jsonl =
             r#"{"type":"session_meta","payload":{"session_id":"abc","cwd":"/repo"}}"#;
-        let (cwd, title) = parse_codex_content(jsonl, Path::new("rollout-deadbeef.jsonl"));
+        let path = Path::new("rollout-2026-11-06T08-15-11-01a1b1a4-8535-7af0-81f4-4573eb3467f0.jsonl");
+        let (cwd, title) = parse_codex_content(jsonl, path);
         assert_eq!(cwd, "/repo");
-        // No user_message → title falls back to the filename stem prefix.
-        assert_eq!(title, "rollout-");
+        // No prompt → the session id's prefix, not the filename's (every
+        // rollout file starts `rollout-`, so that told sessions apart not at all).
+        assert_eq!(title, "01a1b1a4");
     }
 
     fn on_disk(id: &str, tool: AgentTool, age_secs: u64) -> AgentInfo {
@@ -1945,6 +2511,117 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    #[test]
+    fn a_transcript_records_where_it_was_continued_and_whether_it_ran_headless() {
+        let continued = concat!(
+            r#"{"type":"user","cwd":"/w","entrypoint":"cli","message":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"continued-in","sessionId":"old","continuedInSessionId":"new"}"#,
+            "\n",
+        );
+        let meta = parse_transcript_content(continued, Path::new("old.jsonl"));
+        assert_eq!(meta.continued_in.as_deref(), Some("new"));
+        assert!(!meta.headless, "entrypoint cli is interactive");
+
+        let headless = r#"{"type":"user","cwd":"/w","entrypoint":"sdk-cli","message":{"content":"Reply with exactly: ok"}}"#;
+        let meta = parse_transcript_content(headless, Path::new("h.jsonl"));
+        assert!(meta.headless);
+        assert_eq!(meta.continued_in, None);
+
+        // Older transcripts carry no entrypoint at all: interactive.
+        let bare = r#"{"type":"user","cwd":"/w","message":{"content":"hi"}}"#;
+        assert!(!parse_transcript_content(bare, Path::new("b.jsonl")).headless);
+    }
+
+    #[test]
+    fn only_the_newest_part_of_a_continued_conversation_is_listed() {
+        let continued = TranscriptMeta { continued_in: Some("new".into()), ..TranscriptMeta::default() };
+        // Its continuation exists, and is listed in its place.
+        assert!(!claude_listable(&continued, |id| id == "new"));
+        // Its continuation was deleted: this is the only copy left, so keep it.
+        assert!(claude_listable(&continued, |_| false));
+        // A plain interactive transcript is listed; a headless one never is.
+        assert!(claude_listable(&TranscriptMeta::default(), |_| true));
+        let headless = TranscriptMeta { headless: true, ..TranscriptMeta::default() };
+        assert!(!claude_listable(&headless, |_| false));
+    }
+
+    #[test]
+    fn a_live_id_covers_every_later_continuation_of_its_conversation() {
+        let links: HashMap<String, String> =
+            [("a", "b"), ("b", "c"), ("x", "y")].into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+        let live = with_continuations(["a".to_string()].into(), &links);
+        let mut got: Vec<&str> = live.iter().map(String::as_str).collect();
+        got.sort();
+        assert_eq!(got, ["a", "b", "c"], "transitively, and nothing unrelated");
+        // A continuation doesn't reach back: the earlier part isn't live.
+        let live = with_continuations(["b".to_string()].into(), &links);
+        assert!(!live.contains("a"));
+        // A cycle in the links terminates.
+        let cyclic: HashMap<String, String> =
+            [("p", "q"), ("q", "p")].into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+        assert_eq!(with_continuations(["p".to_string()].into(), &cyclic).len(), 2);
+    }
+
+    #[test]
+    fn the_claude_scan_lists_a_continued_conversation_once_and_skips_headless_runs() {
+        let (daemon, base, wt_path) = daemon_with_worktree("claude-scan");
+        let wt = git::list_worktrees_in(&daemon.root).unwrap().into_iter().find(|w| !w.is_root).unwrap();
+        let dir = base.join("project");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = wt_path.to_string_lossy();
+        let line = |extra: &str| {
+            format!(r#"{{"type":"user","cwd":"{cwd}","entrypoint":"cli","message":{{"content":"Semantic search"}}}}{extra}"#)
+        };
+        let continued = format!(
+            "{}\n{}\n",
+            line(""),
+            r#"{"type":"continued-in","sessionId":"old","continuedInSessionId":"new"}"#
+        );
+        std::fs::write(dir.join("old.jsonl"), continued).unwrap();
+        std::fs::write(dir.join("new.jsonl"), line("\n")).unwrap();
+        let headless = format!(
+            r#"{{"type":"user","cwd":"{cwd}","entrypoint":"sdk-cli","message":{{"content":"Reply with exactly: ok"}}}}"#
+        );
+        std::fs::write(dir.join("bot.jsonl"), headless).unwrap();
+
+        let mut links = HashMap::new();
+        let agents = daemon.claude_agents(&dir, &wt, SystemTime::now(), &mut links);
+        let ids: Vec<&str> = agents.iter().map(|a| a.session_id.as_str()).collect();
+        assert_eq!(ids, ["new"]);
+        assert_eq!(links.get("old").map(String::as_str), Some("new"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_live_session_hides_the_transcript_it_continued_into() {
+        // Claude Code compacts a long conversation into a new session id and
+        // leaves `continued-in` in the old transcript. A live `claude --resume
+        // <old>` is that conversation, so the new transcript must not be listed
+        // beside it as a second, resumable session.
+        let (daemon, base, wt) = daemon_with_worktree("continued");
+        daemon
+            .spawn_session(wt.clone(), "s".into(), "sleep 30".into(), Some("orig".into()), Some(AgentTool::Claude), false)
+            .unwrap();
+        let listed = git::list_worktrees_in(&daemon.root)
+            .unwrap()
+            .into_iter()
+            .find(|w| !w.is_root)
+            .unwrap()
+            .path;
+        daemon.agents.lock().unwrap().insert(
+            listed,
+            vec![on_disk("cont", AgentTool::Claude, 5), on_disk("unrelated", AgentTool::Claude, 50)],
+        );
+        daemon.continuations.lock().unwrap().insert("orig".into(), "cont".into());
+
+        let Event::Tree { worktrees, .. } = daemon.build_tree() else { unreachable!() };
+        let info = worktrees.iter().find(|w| !w.is_root).unwrap();
+        let ids: Vec<&str> = info.agents.iter().map(|a| a.session_id.as_str()).collect();
+        assert_eq!(ids, ["unrelated"]);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     fn wt_named(path: &str, branch: &str, is_root: bool) -> WorktreeInfo {
         WorktreeInfo {
             path: path.into(),
@@ -1954,6 +2631,8 @@ mod tests {
             subject: String::new(),
             rebasing: None,
             created_secs: None,
+            last_active_secs: None,
+            pr: None,
             sessions: Vec::new(),
             agents: Vec::new(),
         }

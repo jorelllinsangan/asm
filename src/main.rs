@@ -15,6 +15,7 @@ mod ipc;
 mod keys;
 mod paths;
 mod protocol;
+mod stale;
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
