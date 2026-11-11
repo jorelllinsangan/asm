@@ -17,6 +17,7 @@ mod keys;
 mod paths;
 mod protocol;
 mod stale;
+mod working;
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;

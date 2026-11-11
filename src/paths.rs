@@ -25,6 +25,11 @@ pub fn socket_path(root: &Path) -> PathBuf {
     base_dir().join(format!("{}.sock", key(root)))
 }
 
+/// Where the client saves this repo's working set (see [`crate::working`]).
+pub fn working_path(root: &Path) -> PathBuf {
+    base_dir().join(format!("{}.working.json", key(root)))
+}
+
 pub fn log_path(root: &Path) -> PathBuf {
     base_dir().join(format!("{}.log", key(root)))
 }

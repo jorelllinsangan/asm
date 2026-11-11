@@ -9,8 +9,9 @@ use crate::keys::{self, KeyModes};
 use crate::git;
 use crate::handshake;
 use crate::paths;
+use crate::working::{Seen, WorkingSet};
 use crate::protocol::{
-    AgentInfo, AgentTool, Event, PrBadge, PrState, Request, SessionId, SessionInfo,
+    AgentInfo, AgentTool, Event, Checks, PrBadge, PrState, Review, Request, SessionId, SessionInfo,
     StaleWorktree, Status, WorktreeInfo,
 };
 
@@ -177,11 +178,10 @@ enum ClickPane {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Group {
     NeedsYou,
-    /// Worktrees with a live session.
-    Active,
-    /// Active within [`RECENT_SECS`] (and the root, always).
-    Recent,
-    Idle,
+    /// The working set (see [`crate::working`]), root first, then join order.
+    Working,
+    /// Everything you're not working on: `p` brings one back.
+    Parked,
     /// Its pull request was merged.
     Merged,
     /// Detached scratch checkouts made by Codex or OpenCode.
@@ -189,8 +189,7 @@ enum Group {
 }
 
 /// Worktree sections in display order (the inbox goes above them).
-const WORKTREE_GROUPS: [Group; 5] =
-    [Group::Active, Group::Recent, Group::Idle, Group::Merged, Group::Tools];
+const WORKTREE_GROUPS: [Group; 4] = [Group::Working, Group::Parked, Group::Merged, Group::Tools];
 
 /// A flattened, selectable tree row.
 #[derive(Clone, Copy, Debug)]
@@ -352,6 +351,10 @@ struct App {
     show_history: bool,
     /// The home directory, for spotting Codex/OpenCode checkouts by path.
     home: Option<String>,
+    /// The worktrees you're working on (see [`crate::working`]).
+    working: WorkingSet,
+    /// The `g` board, while it's open.
+    board: Option<Board>,
     /// The `/` finder, while open.
     finder: Option<Finder>,
     /// The `?` key sheet, while open.
@@ -438,17 +441,63 @@ impl App {
     /// Each non-empty worktree section with its members' indices into `tree`,
     /// in display order (members keep the tree's own order).
     fn sections(&self) -> Vec<(Group, Vec<usize>)> {
-        let now = now_secs();
         WORKTREE_GROUPS
             .iter()
             .map(|&g| {
                 let members = (0..self.tree.len())
-                    .filter(|&i| group_of(&self.tree[i], self.home.as_deref(), now) == g)
+                    .filter(|&i| self.group_of(&self.tree[i]) == g)
                     .collect::<Vec<_>>();
+                let mut members = members;
+                if g == Group::Working {
+                    members.sort_by_key(|&i| {
+                        let w = &self.tree[i];
+                        (!w.is_root, self.working.rank(&w.path))
+                    });
+                }
                 (g, members)
             })
             .filter(|(_, m)| !m.is_empty())
             .collect()
+    }
+
+    fn group_of(&self, w: &WorktreeInfo) -> Group {
+        group_of(w, &self.working, self.home.as_deref())
+    }
+
+    /// `p`: add the worktree at `tree[i]` to the working set.
+    fn work_on(&mut self, i: usize) {
+        let Some(w) = self.tree.get(i) else {
+            return;
+        };
+        let (path, name) = (w.path.clone(), worktree_display(w, &self.root).0);
+        self.footer = if w.is_root {
+            format!("{name} is the root; it always stays")
+        } else if self.working.join(&path) {
+            format!("working on {name}")
+        } else {
+            format!("already working on {name}")
+        };
+        let key = self.selected_key();
+        self.rebuild_rows();
+        self.reselect(key);
+    }
+
+    /// `P`: park the worktree at `tree[i]`.
+    fn park(&mut self, i: usize) {
+        let Some(w) = self.tree.get(i) else {
+            return;
+        };
+        let (path, name) = (w.path.clone(), worktree_display(w, &self.root).0);
+        self.footer = if w.is_root {
+            format!("{name} is the root; it always stays")
+        } else if self.working.park(&path) {
+            format!("parked {name} · / finds it, p brings it back")
+        } else {
+            format!("{name} isn't in the working set")
+        };
+        let key = self.selected_key();
+        self.rebuild_rows();
+        self.reselect(key);
     }
 
     fn history_shown(&self, w: &WorktreeInfo) -> bool {
@@ -811,7 +860,7 @@ impl App {
         };
         if let Some(wt) = wt {
             let w = &self.tree[wt];
-            let group = group_of(w, self.home.as_deref(), now_secs());
+            let group = self.group_of(w);
             let path = w.path.clone();
             self.folded_groups.remove(&group);
             if !matches!(key, RowKey::Worktree(_)) {
@@ -863,7 +912,7 @@ fn sort_by_age(tree: &mut [WorktreeInfo]) {
 }
 
 fn default_folded_groups() -> HashSet<Group> {
-    [Group::Idle, Group::Merged, Group::Tools].into_iter().collect()
+    [Group::Parked, Group::Merged, Group::Tools].into_iter().collect()
 }
 
 fn now_secs() -> u64 {
@@ -890,28 +939,28 @@ fn needs_you(s: &SessionInfo) -> bool {
     s.status == Status::Waiting || s.unread
 }
 
-/// Which section a worktree sits in. A live session puts it in Active whatever
-/// else is true; the root is never folded away; a merged PR or a tool's scratch
-/// checkout outranks age; past that, activity in the last [`RECENT_SECS`]
-/// decides, and a worktree with no known activity counts as recent rather than
-/// be hidden on a guess.
-fn group_of(w: &WorktreeInfo, home: Option<&str>, now: u64) -> Group {
-    if w.sessions.iter().any(|s| s.status != Status::Exited) {
-        return Group::Active;
-    }
+fn is_merged(w: &WorktreeInfo) -> bool {
+    w.pr.is_some_and(|p| p.state == PrState::Merged)
+}
+
+/// Which section a worktree sits in. The root is always Working; a merged PR
+/// outranks the working set (merging is what drops a worktree from it); then
+/// membership; a tool's scratch checkout outside the set is Tools; the rest is
+/// Parked.
+fn group_of(w: &WorktreeInfo, working: &WorkingSet, home: Option<&str>) -> Group {
     if w.is_root {
-        return Group::Recent;
+        return Group::Working;
     }
-    if w.pr.is_some_and(|p| p.state == PrState::Merged) {
+    if is_merged(w) {
         return Group::Merged;
+    }
+    if working.contains(&w.path) {
+        return Group::Working;
     }
     if is_tool_checkout(w, home) {
         return Group::Tools;
     }
-    match w.last_active_secs {
-        Some(t) if now.saturating_sub(t) > RECENT_SECS => Group::Idle,
-        _ => Group::Recent,
-    }
+    Group::Parked
 }
 
 /// A detached checkout Codex or OpenCode made for itself. One you put a branch
@@ -1018,6 +1067,8 @@ pub async fn run(root: PathBuf) -> Result<()> {
         history_open: HashSet::new(),
         show_history: false,
         home: dirs::home_dir().map(|h| h.display().to_string()),
+        working: WorkingSet::load(paths::working_path(&root)),
+        board: None,
         finder: None,
         help: false,
         nav_hidden: false,
@@ -1171,6 +1222,21 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             let key = app.selected_key();
             app.daemon_order = worktrees.iter().map(|w| w.path.clone()).collect();
             app.tree = worktrees;
+            let now = now_secs();
+            let home = app.home.clone();
+            let seen: Vec<Seen> = app
+                .tree
+                .iter()
+                .map(|w| Seen {
+                    path: &w.path,
+                    is_root: w.is_root,
+                    live: w.sessions.iter().filter(|s| s.status != Status::Exited).map(|s| s.id).collect(),
+                    recent: w.last_active_secs.is_none_or(|t| now.saturating_sub(t) <= RECENT_SECS),
+                    tool: is_tool_checkout(w, home.as_deref()),
+                    merged: is_merged(w),
+                })
+                .collect();
+            app.working.sync(&seen);
             app.reorder(key);
         }
         Event::Attached { id, scrollback } => {
@@ -1335,6 +1401,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
     if app.finder.is_some() {
         handle_finder_key(app, key);
+        return;
+    }
+    if app.board.is_some() {
+        handle_board_key(app, key);
+        if app.board.is_none() && app.footer == BOARD_HINT {
+            app.footer = nav_hint(app);
+        }
         return;
     }
     match app.focus {
@@ -2111,6 +2184,25 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => hide_nav(app),
         KeyCode::Char(' ') => app.toggle_collapse_selected(),
         KeyCode::Char('z') => app.toggle_collapse_all(),
+        KeyCode::Char('p') => {
+            if let Some(i) = app.selected_row().and_then(row_worktree) {
+                app.work_on(i);
+            }
+        }
+        KeyCode::Char('P') => {
+            if let Some(i) = app.selected_row().and_then(row_worktree) {
+                app.park(i);
+            }
+        }
+        KeyCode::Char('g') => {
+            open_board(app);
+            app.footer = BOARD_HINT.into();
+        }
+        KeyCode::Char('O') => {
+            if let Some(w) = app.selected_worktree() {
+                app.footer = open_pr(&app.root, w);
+            }
+        }
         KeyCode::Char('s') => {
             app.sort_by_age = !app.sort_by_age;
             let key = app.selected_key();
@@ -2233,6 +2325,15 @@ fn handle_nav_key(app: &mut App, key: KeyEvent) {
 /// Open the selected session (attach) or agent (resume). Returns false when the
 /// selection is a worktree header (nothing to open).
 fn open_selected(app: &mut App) -> bool {
+    // Opening anything in a worktree means you're working on it.
+    if let Some(path) = app.selected_worktree().map(|w| w.path.clone())
+        && (app.selected_session().is_some() || app.selected_agent().is_some())
+        && app.working.join(&path)
+    {
+        let key = app.selected_key();
+        app.rebuild_rows();
+        app.reselect(key);
+    }
     if let Some((_, id)) = app.selected_session() {
         let (cols, rows) = app.term_dims;
         app.send(Request::Attach { id, cols, rows });
@@ -3024,6 +3125,7 @@ fn draw(f: &mut Frame, app: &App) {
     draw_footer(f, app, footer_area);
     // Modal, so it goes last — over whatever the right pane drew.
     draw_comment_editor(f, app, right);
+    draw_board(f, app, main);
     draw_prune_list(f, app, main);
     draw_finder(f, app, main);
     draw_help(f, app, main);
@@ -3565,6 +3667,9 @@ const KEY_SHEET: &[(&str, &[(&str, &str)])] = &[
         ("b", "name the branch (detached only)"),
         ("d D", "remove · force-remove"),
         ("X", "clean up merged and idle"),
+        ("p P", "work on it · park it"),
+        ("g", "board: every worktree by pull request"),
+        ("O", "open its pull request in the browser"),
         ("r", "refresh"),
     ]),
     ("FIND AND VIEW", &[
@@ -3844,9 +3949,8 @@ fn dim() -> Style {
 fn group_title(g: Group) -> (&'static str, &'static str) {
     match g {
         Group::NeedsYou => ("NEEDS YOU", "finished since you last looked"),
-        Group::Active => ("ACTIVE", "sessions running"),
-        Group::Recent => ("RECENT", "this week"),
-        Group::Idle => ("IDLE", "quiet 7d+"),
+        Group::Working => ("WORKING", "P parks"),
+        Group::Parked => ("PARKED", "p brings one back"),
         Group::Merged => ("MERGED", "PR merged"),
         Group::Tools => ("TOOL CHECKOUTS", "codex · opencode"),
     }
@@ -3925,6 +4029,26 @@ fn pr_span(pr: PrBadge) -> Span<'static> {
     }
 }
 
+/// A PR's checks as a glyph: passing, running, failing.
+fn checks_glyph(c: Checks) -> (&'static str, Color) {
+    match c {
+        Checks::Passing => ("✓", Color::Green),
+        Checks::Pending => ("●", Color::Yellow),
+        Checks::Failing(_) => ("✕", Color::Red),
+    }
+}
+
+/// An open PR's review state as a word, if it has one.
+fn review_span(pr: PrBadge) -> Option<Span<'static>> {
+    let (word, style) = match (pr.state, pr.review?) {
+        (PrState::Merged, _) => return None,
+        (PrState::Open | PrState::Draft, Review::Required) => ("review", dim()),
+        (PrState::Open | PrState::Draft, Review::ChangesRequested) => ("changes", Style::default().fg(Color::Red)),
+        (PrState::Open | PrState::Draft, Review::Approved) => ("approved", Style::default().fg(Color::Green)),
+    };
+    Some(Span::styled(word, style))
+}
+
 /// Leading spaces for a row `depth` levels into the tree.
 fn indent(depth: usize) -> String {
     "  ".repeat(depth)
@@ -3959,7 +4083,20 @@ fn worktree_line(
         right.push(vec![Span::styled(format!("↺{}", w.agents.len()), dim())]);
     }
     if let Some(pr) = w.pr {
-        right.push(vec![pr_span(pr)]);
+        let mut spans = vec![pr_span(pr)];
+        if pr.state != PrState::Merged
+            && let Some(c) = pr.checks
+        {
+            let (glyph, color) = checks_glyph(c);
+            spans.push(Span::styled(glyph, Style::default().fg(color)));
+        }
+        if let Some(word) = review_span(pr) {
+            spans.push(Span::raw(" "));
+            spans.push(word);
+        }
+        right.push(spans);
+    } else if let Some(n) = w.ahead.filter(|n| *n > 0) {
+        right.push(vec![Span::styled(format!("{n} ahead"), dim())]);
     }
     let counts = session_counts(&w.sessions);
     if !counts.is_empty() {
@@ -4258,7 +4395,7 @@ fn nav_hint(app: &App) -> String {
         None => "w new worktree · q quit",
         Some(Row::Group(_)) => "Enter fold · j/k move",
         Some(Row::Worktree { .. }) => {
-            "Enter expand · c claude · C codex · n shell · w worktree · d remove · X clean up"
+            "Enter expand · c claude · C codex · n shell · p/P work on/park · g board · O PR"
         }
         Some(Row::Session { .. } | Row::Inbox { .. }) => {
             "Enter open · R rename · x kill · Ctrl+G diff · Ctrl+] editor"
@@ -4381,6 +4518,359 @@ fn spawn_daemon(root: &Path) -> Result<()> {
     Ok(())
 }
 
+
+/// The `g` board: every worktree as a card, in a lane per pull-request stage.
+/// A card's lane comes from GitHub alone, so nothing moves when a session
+/// needs you; the `◐` shows on the card instead.
+#[derive(Default)]
+struct Board {
+    /// Index into the lanes shown (see [`BoardLanes::lanes`]).
+    lane: usize,
+    /// Index into that lane's cards.
+    card: usize,
+    /// `i`: also show what's hidden by default, the Merged lane and quiet
+    /// worktrees with no PR.
+    all: bool,
+}
+
+/// What the board shows: the lanes on screen, each with its cards as indices
+/// into `tree`, and how many worktrees were left off.
+struct BoardLanes {
+    lanes: Vec<(Lane, Vec<usize>)>,
+    /// PR-less Parked worktrees idle past [`RECENT_SECS`].
+    quiet: usize,
+    /// Merged worktrees: `X` cleans those up, so the lane is hidden.
+    merged: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lane {
+    NoPr,
+    Draft,
+    /// Open and not a draft, whatever its review says: the card says that.
+    InReview,
+    Merged,
+}
+
+const LANES: [Lane; 4] = [Lane::NoPr, Lane::Draft, Lane::InReview, Lane::Merged];
+
+const BOARD_HINT: &str =
+    "BOARD · h/l lane · j/k card · Enter open newest session · p/P work on/park · O PR · i hidden · g back";
+
+fn lane_title(lane: Lane) -> &'static str {
+    match lane {
+        Lane::NoPr => "No PR",
+        Lane::Draft => "Draft",
+        Lane::InReview => "In review",
+        Lane::Merged => "Merged",
+    }
+}
+
+fn lane_of(w: &WorktreeInfo) -> Lane {
+    match w.pr {
+        None => Lane::NoPr,
+        Some(pr) => match pr.state {
+            PrState::Merged => Lane::Merged,
+            PrState::Draft => Lane::Draft,
+            PrState::Open => Lane::InReview,
+        },
+    }
+}
+
+/// The board's lanes and cards: working set first in each lane (root, then
+/// join order), the rest newest activity first. Tool checkouts outside the
+/// working set are left off. Unless `all`, so are the Merged lane and
+/// worktrees with no PR and nothing for [`RECENT_SECS`], and those are counted.
+fn board_lanes(app: &App, all: bool) -> BoardLanes {
+    let now = now_secs();
+    let (mut quiet, mut merged) = (0, 0);
+    let mut lanes: Vec<(Lane, Vec<usize>)> =
+        LANES.iter().filter(|l| all || **l != Lane::Merged).map(|l| (*l, Vec::new())).collect();
+    for (i, w) in app.tree.iter().enumerate() {
+        let group = app.group_of(w);
+        if group == Group::Tools {
+            continue;
+        }
+        let lane = lane_of(w);
+        let stale = w.last_active_secs.is_some_and(|t| now.saturating_sub(t) > RECENT_SECS);
+        if !all && lane == Lane::Merged {
+            merged += 1;
+            continue;
+        }
+        if !all && lane == Lane::NoPr && group == Group::Parked && stale {
+            quiet += 1;
+            continue;
+        }
+        if let Some((_, cards)) = lanes.iter_mut().find(|(l, _)| *l == lane) {
+            cards.push(i);
+        }
+    }
+    for (_, cards) in &mut lanes {
+        cards.sort_by_key(|&i| {
+            let w = &app.tree[i];
+            let rank = if w.is_root { Some(0) } else { app.working.rank(&w.path).map(|r| r + 1) };
+            (rank.is_none(), rank, Reverse(w.last_active_secs))
+        });
+    }
+    BoardLanes { lanes, quiet, merged }
+}
+
+fn open_board(app: &mut App) {
+    let mut board = Board::default();
+    // Start on the selected worktree's card, so `g` keeps your place.
+    if let Some(path) = app.selected_worktree().map(|w| w.path.clone()) {
+        let shown = board_lanes(app, false);
+        for (l, (_, cards)) in shown.lanes.iter().enumerate() {
+            if let Some(c) = cards.iter().position(|&i| app.tree[i].path == path) {
+                (board.lane, board.card) = (l, c);
+            }
+        }
+    }
+    app.board = Some(board);
+}
+
+/// The worktree under the board's cursor, as an index into `tree`.
+fn board_selected(app: &App) -> Option<usize> {
+    let b = app.board.as_ref()?;
+    let shown = board_lanes(app, b.all);
+    shown.lanes.get(b.lane)?.1.get(b.card).copied()
+}
+
+fn handle_board_key(app: &mut App, key: KeyEvent) {
+    let all = app.board.as_ref().is_some_and(|b| b.all);
+    let lane_count = board_lanes(app, all).lanes.len();
+    let selected = board_selected(app);
+    let Some(b) = app.board.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Char('g' | 'q') | KeyCode::Esc => app.board = None,
+        KeyCode::Char('h') | KeyCode::Left => b.lane = b.lane.saturating_sub(1),
+        KeyCode::Char('l') | KeyCode::Right => b.lane = (b.lane + 1).min(lane_count.saturating_sub(1)),
+        KeyCode::Char('j') | KeyCode::Down => b.card += 1,
+        KeyCode::Char('k') | KeyCode::Up => b.card = b.card.saturating_sub(1),
+        KeyCode::Char('i') => b.all = !b.all,
+        KeyCode::Char('p') => {
+            if let Some(i) = selected {
+                app.work_on(i);
+            }
+        }
+        KeyCode::Char('P') => {
+            if let Some(i) = selected {
+                app.park(i);
+            }
+        }
+        KeyCode::Char('O') => {
+            if let Some(i) = selected {
+                app.footer = open_pr(&app.root, &app.tree[i]);
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(i) = selected {
+                app.board = None;
+                open_newest(app, i);
+            }
+        }
+        _ => {}
+    }
+    // Keep the cursor on a lane and a card: lanes come and go with `i`, and a
+    // lane can be shorter or have just lost a card.
+    let all = app.board.as_ref().is_some_and(|b| b.all);
+    let shown = board_lanes(app, all);
+    if let Some(b) = app.board.as_mut() {
+        b.lane = b.lane.min(shown.lanes.len().saturating_sub(1));
+        let len = shown.lanes.get(b.lane).map_or(0, |(_, c)| c.len());
+        b.card = b.card.min(len.saturating_sub(1));
+    }
+}
+
+/// Open the worktree's newest session: its newest live one, else its newest
+/// past one (resumed), else just select the worktree. It joins the working set.
+fn open_newest(app: &mut App, wt: usize) {
+    let Some(w) = app.tree.get(wt) else {
+        return;
+    };
+    let path = w.path.clone();
+    let name = worktree_display(w, &app.root).0;
+    let live = w.sessions.iter().filter(|s| s.status != Status::Exited).map(|s| s.id).max();
+    let past = w.agents.first().map(|a| a.session_id.clone());
+    app.focus = Focus::Nav;
+    match (live, past) {
+        (Some(id), _) => app.reveal(RowKey::Session(id)),
+        (None, Some(id)) => app.reveal(RowKey::Agent(id)),
+        (None, None) => {
+            app.reveal(RowKey::Worktree(path));
+            app.footer = format!("no sessions in {name} · c starts one");
+            return;
+        }
+    }
+    open_selected(app);
+}
+
+/// `O`: the worktree's PR in the browser, via `gh` (which knows the repo).
+fn open_pr(root: &str, w: &WorktreeInfo) -> String {
+    let Some(pr) = w.pr else {
+        return format!("{} has no pull request", worktree_display(w, root).0);
+    };
+    let number = pr.number.to_string();
+    let child = std::process::Command::new("gh")
+        .args(["pr", "view", &number, "--web"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match child {
+        Ok(mut child) => {
+            // Reap it off the UI thread; gh returns once the browser has it.
+            std::thread::spawn(move || child.wait());
+            format!("opening #{number} in the browser…")
+        }
+        Err(e) => format!("couldn't run gh: {e}"),
+    }
+}
+
+/// Card height: three lines plus its border.
+const CARD_ROWS: u16 = 5;
+
+fn draw_board(f: &mut Frame, app: &App, area: Rect) {
+    let Some(b) = app.board.as_ref() else {
+        return;
+    };
+    let BoardLanes { lanes, quiet, merged } = board_lanes(app, b.all);
+    let total: usize = lanes.iter().map(|(_, c)| c.len()).sum();
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(format!(" {} ", short_path(&app.root)), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("by pull request · {total} worktrees · "), dim()),
+            Span::styled("▌", Style::default().fg(Color::Cyan)),
+            Span::styled(" working set ", dim()),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [body, note] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    let mut hidden = Vec::new();
+    if merged > 0 {
+        hidden.push(format!("{merged} merged (X cleans up)"));
+    }
+    if quiet > 0 {
+        hidden.push(format!("{quiet} quiet {}d+ without a PR", RECENT_SECS / 86_400));
+    }
+    let note_text = if b.all {
+        " showing merged and quiet worktrees · i hides them".to_string()
+    } else if hidden.is_empty() {
+        String::new()
+    } else {
+        format!(" hidden: {} · i shows them", hidden.join(", "))
+    };
+    f.render_widget(Paragraph::new(Span::styled(note_text, dim())), note);
+
+    let n = u32::try_from(lanes.len()).unwrap_or(1).max(1);
+    let cols = Layout::horizontal(lanes.iter().map(|_| Constraint::Ratio(1, n)))
+        .spacing(1)
+        .split(body);
+    let now = now_secs();
+    for (l, (lane, cards)) in lanes.iter().enumerate() {
+        let Some(&col) = cols.get(l) else {
+            continue;
+        };
+        let header = Line::from(vec![
+            Span::styled(lane_title(*lane), Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {}", cards.len()), dim()),
+        ]);
+        f.render_widget(Paragraph::new(header), Rect { height: 1, ..col });
+        let room = col.height.saturating_sub(1);
+        let fits = usize::from(room / CARD_ROWS);
+        // Scroll the lane under the cursor so its card stays in view.
+        let first = if l == b.lane { (b.card + 1).saturating_sub(fits) } else { 0 };
+        for (slot, &i) in cards.iter().skip(first).take(fits).enumerate() {
+            let y = col.y + 1 + u16::try_from(slot).unwrap_or(0) * CARD_ROWS;
+            let rect = Rect { y, height: CARD_ROWS, ..col };
+            let on = l == b.lane && first + slot == b.card;
+            draw_card(f, app, &app.tree[i], on, now, rect);
+        }
+        let more = cards.len().saturating_sub(first + fits);
+        let used = u16::try_from(cards.len().min(fits)).unwrap_or(0) * CARD_ROWS;
+        if more > 0 && room > used {
+            let y = col.y + 1 + used;
+            f.render_widget(Paragraph::new(Span::styled(format!("+ {more} more"), dim())), Rect { y, height: 1, ..col });
+        }
+    }
+}
+
+/// One card: the name (`▌` marks the working set); the PR and its checks, or
+/// how far ahead a PR-less branch is; then review, sessions and age.
+fn draw_card(f: &mut Frame, app: &App, w: &WorktreeInfo, on: bool, now: u64, area: Rect) {
+    let border = if on { Style::default().fg(Color::Cyan) } else { dim() };
+    let block = Block::default().borders(Borders::ALL).border_style(border);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let width = usize::from(inner.width);
+    let working = w.is_root || app.working.contains(&w.path);
+    let (name, _) = worktree_display(w, &app.root);
+    let merged = w.pr.is_some_and(|p| p.state == PrState::Merged);
+    let name_style = if merged { dim() } else { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) };
+    let mut first = vec![Span::styled(if working { "▌" } else { " " }, Style::default().fg(Color::Cyan))];
+    first.push(Span::styled(truncate(&name, width.saturating_sub(1)), name_style));
+
+    let second = match w.pr {
+        Some(pr) => {
+            let mut spans = vec![Span::styled(format!("#{}", pr.number), Style::default().fg(Color::Magenta))];
+            if !merged && let Some(c) = pr.checks {
+                let (glyph, color) = checks_glyph(c);
+                let what = match c {
+                    Checks::Failing(1) => " check failing".to_string(),
+                    Checks::Failing(_) => " checks failing".to_string(),
+                    _ => " checks".to_string(),
+                };
+                spans.push(Span::styled(format!(" {glyph}{what}"), Style::default().fg(color)));
+            }
+            spans
+        }
+        None => match w.ahead {
+            Some(0) => vec![Span::styled("nothing committed", dim())],
+            Some(n) => vec![Span::styled(format!("{n} ahead"), dim())],
+            None if w.is_root => vec![Span::styled("root", dim())],
+            None => vec![],
+        },
+    };
+
+    let mut third = Vec::new();
+    if let Some(pr) = w.pr
+        && let Some(word) = review_span(pr)
+    {
+        let word = match pr.review {
+            Some(Review::ChangesRequested) => Span::styled("changes requested", word.style),
+            Some(Review::Approved) => Span::styled("ready to merge", word.style),
+            Some(Review::Required) => Span::styled("in review", word.style),
+            None => word,
+        };
+        third.push(word);
+    }
+    let counts = session_counts(&w.sessions);
+    if !counts.is_empty() {
+        if !third.is_empty() {
+            third.push(Span::styled(" · ", dim()));
+        }
+        third.extend(counts);
+    }
+    if let Some(t) = w.last_active_secs {
+        if !third.is_empty() {
+            third.push(Span::styled(" · ", dim()));
+        }
+        third.push(Span::styled(ago(now.saturating_sub(t)), dim()));
+    }
+    let lines = vec![Line::from(first), Line::from(second), Line::from(third)];
+    let mut para = Paragraph::new(lines);
+    if on {
+        para = para.style(Style::default().bg(Color::Rgb(35, 42, 51)));
+    }
+    f.render_widget(para, inner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4451,6 +4941,8 @@ mod tests {
             history_open: HashSet::new(),
             show_history: false,
             home: Some("/home/me".into()),
+            working: WorkingSet::in_memory(),
+            board: None,
             finder: None,
             help: false,
             nav_hidden: false,
@@ -4480,6 +4972,17 @@ mod tests {
             should_quit: false,
             exit_message: None,
         };
+        // Tests start with every ordinary worktree in the working set, so they
+        // see the tree unfolded; the grouping tests park what they need.
+        let joinable: Vec<String> = app
+            .tree
+            .iter()
+            .filter(|w| !w.is_root && !is_merged(w) && !is_tool_checkout(w, app.home.as_deref()))
+            .map(|w| w.path.clone())
+            .collect();
+        for path in joinable {
+            app.working.join(&path);
+        }
         app.rebuild_rows();
         (app, rx)
     }
@@ -4885,50 +5388,80 @@ mod tests {
     }
 
     #[test]
-    fn worktrees_fall_into_sections_by_state() {
+    fn worktrees_fall_into_sections_by_working_set() {
         let home = Some("/home/me");
-        let now = now_secs();
-        let mut root = active_at(wt("/r/main", vec![], vec![]), 90 * DAY);
+        let mut working = WorkingSet::in_memory();
+        let mut root = wt("/r/main", vec![], vec![]);
         root.is_root = true;
-        assert_eq!(group_of(&root, home, now), Group::Recent, "the root is never folded away");
+        assert_eq!(group_of(&root, &working, home), Group::Working, "the root always stays");
 
-        let live = active_at(wt("/r/live", vec![sess(1, "s")], vec![]), 90 * DAY);
-        assert_eq!(group_of(&live, home, now), Group::Active, "a live session beats age");
-        let ghost = active_at(wt("/r/ghost", vec![sess_status(1, "s", Status::Exited)], vec![]), 90 * DAY);
-        assert_eq!(group_of(&ghost, home, now), Group::Idle, "an exited session isn't live");
+        let mine = wt("/r/mine", vec![], vec![]);
+        assert_eq!(group_of(&mine, &working, home), Group::Parked);
+        working.join("/r/mine");
+        assert_eq!(group_of(&mine, &working, home), Group::Working);
 
-        let mut merged = active_at(wt("/r/merged", vec![], vec![]), 0);
+        let mut merged = mine.clone();
         merged.pr = Some(PrBadge { number: 7, state: PrState::Merged, checks: None, review: None });
-        assert_eq!(group_of(&merged, home, now), Group::Merged);
-        let mut open = merged.clone();
-        open.pr = Some(PrBadge { number: 8, state: PrState::Open, checks: None, review: None });
-        assert_eq!(group_of(&open, home, now), Group::Recent);
+        assert_eq!(group_of(&merged, &working, home), Group::Merged, "merging outranks the set");
 
-        let mut codex = active_at(wt("/home/me/.codex/worktrees/a9f0/repo", vec![], vec![]), 0);
+        let mut codex = wt("/home/me/.codex/worktrees/a9f0/repo", vec![], vec![]);
         codex.branch = git::DETACHED_BRANCH.into();
-        assert_eq!(group_of(&codex, home, now), Group::Tools);
-        let mut named = codex.clone();
-        named.branch = "dev/mine".into();
-        assert_eq!(group_of(&named, home, now), Group::Recent, "a branch makes it yours");
-
-        assert_eq!(group_of(&active_at(wt("/r/w", vec![], vec![]), 6 * DAY), home, now), Group::Recent);
-        assert_eq!(group_of(&active_at(wt("/r/w", vec![], vec![]), 8 * DAY), home, now), Group::Idle);
-        assert_eq!(group_of(&wt("/r/w", vec![], vec![]), home, now), Group::Recent, "unknown age stays visible");
+        assert_eq!(group_of(&codex, &working, home), Group::Tools);
+        working.join(&codex.path);
+        assert_eq!(group_of(&codex, &working, home), Group::Working, "joining claims a tool checkout");
     }
 
     #[test]
-    fn idle_merged_and_tool_sections_start_folded_and_enter_unfolds_them() {
-        let mut app = app_with(vec![
-            active_at(wt("/r/new", vec![], vec![]), DAY),
-            active_at(wt("/r/old", vec![], vec![]), 30 * DAY),
-        ]);
-        assert_eq!(groups_shown(&app), [Group::Recent, Group::Idle]);
-        assert_eq!(worktrees_shown(&app), ["/r/new"], "Idle is folded to its header");
+    fn parked_merged_and_tool_sections_start_folded_and_enter_unfolds_them() {
+        let mut app = app_with(vec![wt("/r/new", vec![], vec![]), wt("/r/old", vec![], vec![])]);
+        app.park(1);
+        assert_eq!(groups_shown(&app), [Group::Working, Group::Parked]);
+        assert_eq!(worktrees_shown(&app), ["/r/new"], "Parked is folded to its header");
 
-        app.reselect(Some(RowKey::Group(Group::Idle)));
+        app.reselect(Some(RowKey::Group(Group::Parked)));
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(worktrees_shown(&app), ["/r/new", "/r/old"]);
-        assert_eq!(app.selected_key(), Some(RowKey::Group(Group::Idle)));
+        assert_eq!(app.selected_key(), Some(RowKey::Group(Group::Parked)));
+    }
+
+    #[test]
+    fn p_and_upper_p_move_a_worktree_between_working_and_parked() {
+        let mut app = app_with(vec![wt("/r/a", vec![], vec![])]);
+        app.reselect(Some(RowKey::Worktree("/r/a".into())));
+        press(&mut app, 'P');
+        assert!(!app.working.contains("/r/a"));
+        assert!(app.footer.starts_with("parked "));
+        app.folded_groups.clear();
+        app.rebuild_rows();
+        app.reselect(Some(RowKey::Worktree("/r/a".into())));
+        press(&mut app, 'p');
+        assert!(app.working.contains("/r/a"));
+    }
+
+    #[test]
+    fn the_board_lanes_worktrees_by_pull_request_stage() {
+        let mut draft = wt("/r/draft", vec![], vec![]);
+        draft.pr = Some(PrBadge { number: 1, state: PrState::Draft, checks: None, review: None });
+        let mut open = wt("/r/open", vec![], vec![]);
+        open.pr = Some(PrBadge { number: 2, state: PrState::Open, checks: None, review: Some(Review::Approved) });
+        let mut merged = wt("/r/merged", vec![], vec![]);
+        merged.pr = Some(PrBadge { number: 3, state: PrState::Merged, checks: None, review: None });
+        let app = app_with(vec![wt("/r/none", vec![], vec![]), draft, open, merged]);
+        let shown = board_lanes(&app, false);
+        let lanes: Vec<(Lane, Vec<&str>)> = shown
+            .lanes
+            .iter()
+            .map(|(l, cards)| (*l, cards.iter().map(|&i| app.tree[i].path.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            lanes,
+            [
+                (Lane::NoPr, vec!["/r/none"]),
+                (Lane::Draft, vec!["/r/draft"]),
+                (Lane::InReview, vec!["/r/open"]),
+            ]
+        );
+        assert_eq!(shown.merged, 1, "the merged lane is hidden and counted");
     }
 
     #[test]
