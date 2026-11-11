@@ -1269,10 +1269,20 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
                 app.footer = format!("no stale worktrees{note}");
             } else {
                 let n = worktrees.len();
+                let dirty = worktrees.iter().filter(|w| w.dirty).count();
                 let them = if n == 1 { "this worktree".to_string() } else { format!("these {n} worktrees") };
+                let label = match (n - dirty, dirty) {
+                    (_, 0) => format!("Remove {them}? Branches are kept{note}. (y/N)"),
+                    (0, _) => format!(
+                        "Type force to remove {them}: uncommitted files get them deleted{note}. Branches are kept."
+                    ),
+                    (clean, dirty) => format!(
+                        "y removes {clean} clean · force also removes {dirty} with uncommitted files (they get them deleted){note}. Branches are kept."
+                    ),
+                };
                 app.prompt = Some(Prompt {
                     kind: PromptKind::PruneWorktrees { worktrees },
-                    label: format!("Remove {them}? Branches are kept{note}. (y/N)"),
+                    label,
                     input: String::new(),
                 });
             }
@@ -2786,15 +2796,25 @@ fn submit_prompt(app: &mut App, prompt: Prompt) {
             }
         }
         PromptKind::PruneWorktrees { worktrees } => {
-            if is_yes(&input) {
-                app.footer = format!("removing {} worktree(s)…", worktrees.len());
-                // Plain removes: one that picked up changes since the scan is
-                // refused by git, and its error lands in the footer.
-                for w in worktrees {
-                    app.send(Request::RemoveWorktree { path: w.path, force: false });
-                }
+            // `y` takes the clean ones with plain removes (one that picked up
+            // changes since the scan is refused by git, and the error lands in
+            // the footer); only `force` takes the dirty ones too.
+            let force = input.trim().eq_ignore_ascii_case("force");
+            let chosen: Vec<StaleWorktree> = if force {
+                worktrees
+            } else if is_yes(&input) {
+                worktrees.into_iter().filter(|w| !w.dirty).collect()
             } else {
+                Vec::new()
+            };
+            if chosen.is_empty() {
                 app.footer = "nothing removed".into();
+            } else {
+                app.footer = format!("removing {} worktree(s)…", chosen.len());
+                for w in chosen {
+                    let force = force && w.dirty;
+                    app.send(Request::RemoveWorktree { path: w.path, force });
+                }
             }
         }
     }
@@ -3638,7 +3658,7 @@ fn draw_prune_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" stale worktrees — y removes, anything else keeps ")
+        .title(" stale worktrees — y removes the clean ones, force the rest, anything else keeps ")
         .border_style(border_style(true));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -3654,11 +3674,15 @@ fn draw_prune_list(f: &mut Frame, app: &App, area: Rect) {
                 Some(rest) if rest.starts_with('/') => format!("~{rest}"),
                 _ => w.path.clone(),
             };
-            Line::from(vec![
+            let mut spans = vec![
                 Span::raw(w.branch.clone()),
                 Span::styled(format!("  {}  ", w.reason), dim),
                 Span::styled(path, Style::default().fg(Color::Cyan)),
-            ])
+            ];
+            if w.dirty {
+                spans.push(Span::styled("  uncommitted (force)", Style::default().fg(Color::Yellow)));
+            }
+            Line::from(spans)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
@@ -4405,6 +4429,7 @@ mod tests {
             created_secs: None,
             last_active_secs: None,
             pr: None,
+            ahead: None,
             sessions,
             agents,
         }
@@ -4873,10 +4898,10 @@ mod tests {
         assert_eq!(group_of(&ghost, home, now), Group::Idle, "an exited session isn't live");
 
         let mut merged = active_at(wt("/r/merged", vec![], vec![]), 0);
-        merged.pr = Some(PrBadge { number: 7, state: PrState::Merged });
+        merged.pr = Some(PrBadge { number: 7, state: PrState::Merged, checks: None, review: None });
         assert_eq!(group_of(&merged, home, now), Group::Merged);
         let mut open = merged.clone();
-        open.pr = Some(PrBadge { number: 8, state: PrState::Open });
+        open.pr = Some(PrBadge { number: 8, state: PrState::Open, checks: None, review: None });
         assert_eq!(group_of(&open, home, now), Group::Recent);
 
         let mut codex = active_at(wt("/home/me/.codex/worktrees/a9f0/repo", vec![], vec![]), 0);
@@ -4969,7 +4994,7 @@ mod tests {
     fn a_row_puts_its_meta_flush_right_and_gives_way_from_the_name() {
         let mut w = active_at(wt("/r/x", vec![running(1, "a")], vec![agent("p")]), 3 * DAY);
         w.branch = "dev/payoff-quote-record-dialog".into();
-        w.pr = Some(PrBadge { number: 8301, state: PrState::Open });
+        w.pr = Some(PrBadge { number: 8301, state: PrState::Open, checks: None, review: None });
         let text = |width| {
             let line = worktree_line(&w, "/r", true, now_secs(), 0, Some(width));
             line.spans.iter().map(|s| s.content.to_string()).collect::<String>()
@@ -7158,6 +7183,7 @@ diff --git a/src/b.rs b/src/b.rs
             path: path.into(),
             branch: branch.into(),
             reason: reason.into(),
+            dirty: false,
         }
     }
 

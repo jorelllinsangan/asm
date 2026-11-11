@@ -153,6 +153,10 @@ pub struct WorktreeInfo {
     /// The pull request for this worktree's branch, if `gh` knows one.
     #[serde(default)]
     pub pr: Option<PrBadge>,
+    /// Commits on HEAD that the root branch doesn't have; `None` for the root
+    /// or when git couldn't say.
+    #[serde(default)]
+    pub ahead: Option<u32>,
     /// Live PTY sessions asm is running in this worktree.
     pub sessions: Vec<SessionInfo>,
     /// Existing (on-disk, not currently live) Claude Code sessions for this
@@ -183,6 +187,27 @@ pub struct SessionInfo {
 pub struct PrBadge {
     pub number: u64,
     pub state: PrState,
+    /// CI on an open PR; `None` when it has no checks or isn't open.
+    #[serde(default)]
+    pub checks: Option<Checks>,
+    /// GitHub's review decision on an open PR.
+    #[serde(default)]
+    pub review: Option<Review>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Checks {
+    Passing,
+    Pending,
+    /// How many checks failed.
+    Failing(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Review {
+    Required,
+    ChangesRequested,
+    Approved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +223,9 @@ pub struct StaleWorktree {
     pub path: String,
     pub branch: String,
     pub reason: String,
+    /// Has uncommitted changes: only a forced remove takes it.
+    #[serde(default)]
+    pub dirty: bool,
 }
 
 /// Which agent CLI a discovered session belongs to.

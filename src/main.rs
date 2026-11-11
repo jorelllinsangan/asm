@@ -10,6 +10,7 @@ mod client;
 mod daemon;
 mod diff;
 mod git;
+mod github;
 mod handshake;
 mod ipc;
 mod keys;

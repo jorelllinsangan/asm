@@ -6,9 +6,10 @@ use crate::git;
 use crate::handshake;
 use crate::ipc::{Frame, read_frame, write_frame};
 use crate::paths;
+use crate::github;
 use crate::protocol::{
-    AgentInfo, AgentTool, Event, PrBadge, Request, SessionId, SessionInfo, StaleWorktree, Status,
-    WorktreeInfo,
+    AgentInfo, AgentTool, Checks, Event, PrBadge, Request, SessionId, SessionInfo, StaleWorktree,
+    Status, WorktreeInfo,
 };
 use crate::stale;
 
@@ -32,6 +33,8 @@ const TICK: Duration = Duration::from_millis(400);
 const AGENT_REFRESH: Duration = Duration::from_secs(2);
 /// How often the slow thread re-reads pull requests from `gh` (~1s a call).
 const PR_REFRESH: Duration = Duration::from_secs(120);
+/// How often PRs are re-read while any badge has checks still running.
+const PR_REFRESH_PENDING: Duration = Duration::from_secs(20);
 /// Most-recent Claude sessions to surface per worktree.
 const AGENT_LIMIT: usize = 12;
 
@@ -179,6 +182,9 @@ struct Daemon {
     /// Each worktree's pull request, refreshed by [`Daemon::refresh_prs`].
     prs: Mutex<HashMap<PathBuf, PrBadge>>,
     prs_read_at: Mutex<Option<Instant>>,
+    /// Commits ahead of the root branch per worktree, with the `HEAD`s it was
+    /// counted at (see [`Daemon::refresh_ahead`]).
+    ahead: Mutex<HashMap<PathBuf, (String, u32)>>,
 }
 
 impl Daemon {
@@ -443,14 +449,23 @@ impl Daemon {
     fn refresh_prs(&self, force: bool) {
         {
             let mut last = self.prs_read_at.lock().unwrap();
-            if !force && last.is_some_and(|t| t.elapsed() < PR_REFRESH) {
+            let pending = self.prs.lock().unwrap().values().any(|b| b.checks == Some(Checks::Pending));
+            let every = if pending { PR_REFRESH_PENDING } else { PR_REFRESH };
+            if !force && last.is_some_and(|t| t.elapsed() < every) {
                 return;
             }
             *last = Some(Instant::now());
         }
-        let Ok(prs) = stale::pull_requests(&self.root) else {
+        let Ok(mut prs) = stale::pull_requests(&self.root) else {
             return;
         };
+        if let Ok(status) = github::open_pr_status(&self.root) {
+            for pr in &mut prs {
+                if let Some((checks, review)) = status.get(&pr.number) {
+                    (pr.checks, pr.review) = (*checks, *review);
+                }
+            }
+        }
         let worktrees = git::list_worktrees_in(&self.root).unwrap_or_default();
         let badges: HashMap<PathBuf, PrBadge> = worktrees
             .iter()
@@ -462,6 +477,24 @@ impl Daemon {
             })
             .collect();
         *self.prs.lock().unwrap() = badges;
+    }
+
+    /// Recount commits ahead for worktrees whose `HEAD` (or the root's) moved
+    /// since the last count. Blocking: runs on the slow agent thread.
+    fn refresh_ahead(&self) {
+        let worktrees = git::list_worktrees_in(&self.root).unwrap_or_default();
+        let root_head = worktrees.iter().find(|w| w.is_root).map(|w| w.head.clone()).unwrap_or_default();
+        let mut cache = self.ahead.lock().unwrap();
+        cache.retain(|p, _| worktrees.iter().any(|w| &w.path == p));
+        for wt in worktrees.iter().filter(|w| !w.is_root && !w.head.is_empty()) {
+            let key = format!("{}:{root_head}", wt.head);
+            if cache.get(&wt.path).is_some_and(|(k, _)| *k == key) {
+                continue;
+            }
+            if let Some(n) = git::ahead(&self.root, &wt.path) {
+                cache.insert(wt.path.clone(), (key, n));
+            }
+        }
     }
 
     /// Subjects of the commits detached worktrees sit on, fetching (in one git
@@ -500,6 +533,7 @@ impl Daemon {
         let subjects = self.detached_subjects(&worktrees);
         let commit_times = self.commit_times(&worktrees);
         let prs = self.prs.lock().unwrap().clone();
+        let ahead = self.ahead.lock().unwrap().clone();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -572,6 +606,7 @@ impl Daemon {
                 created_secs,
                 last_active_secs,
                 pr: prs.get(&wt.path).copied(),
+                ahead: ahead.get(&wt.path).map(|(_, n)| *n),
                 sessions,
                 agents,
             });
@@ -605,7 +640,6 @@ impl Daemon {
         });
 
         let mut found = Vec::new();
-        let mut kept_dirty = 0;
         for wt in &worktrees {
             let live_sessions = {
                 let map = self.sessions.lock().unwrap();
@@ -642,21 +676,14 @@ impl Daemon {
             let Some(verdict) = stale::verdict(&facts, now, idle_days) else {
                 continue;
             };
-            // Last, because it's the slow check: `d` would refuse it anyway.
-            if git::has_uncommitted_work(&wt.path) {
-                kept_dirty += 1;
-                continue;
-            }
+            // Last, because it's the slow check. A dirty one is offered too, but
+            // only a forced remove takes it.
             found.push(StaleWorktree {
                 path: wt.path.display().to_string(),
                 branch: wt.branch.clone(),
                 reason: verdict.describe(),
+                dirty: git::has_uncommitted_work(&wt.path),
             });
-        }
-        match kept_dirty {
-            0 => {}
-            1 => notes.push("1 kept for its uncommitted changes".into()),
-            n => notes.push(format!("{n} kept for their uncommitted changes")),
         }
         (found, notes.join("; "))
     }
@@ -1605,6 +1632,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
         commit_times: Mutex::new(HashMap::new()),
         prs: Mutex::new(HashMap::new()),
         prs_read_at: Mutex::new(None),
+        ahead: Mutex::new(HashMap::new()),
     });
 
     // Periodic status refresh: recompute + push the tree to all clients.
@@ -1626,6 +1654,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
             loop {
                 daemon.refresh_agents();
                 daemon.refresh_prs(false);
+                daemon.refresh_ahead();
                 daemon.broadcast_tree();
                 std::thread::sleep(AGENT_REFRESH);
             }
@@ -2026,6 +2055,7 @@ mod tests {
             commit_times: Mutex::new(HashMap::new()),
             prs: Mutex::new(HashMap::new()),
             prs_read_at: Mutex::new(None),
+            ahead: Mutex::new(HashMap::new()),
         };
         (daemon, base, wt)
     }
@@ -2633,6 +2663,7 @@ mod tests {
             created_secs: None,
             last_active_secs: None,
             pr: None,
+            ahead: None,
             sessions: Vec::new(),
             agents: Vec::new(),
         }

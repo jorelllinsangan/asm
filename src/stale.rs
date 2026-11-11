@@ -6,7 +6,7 @@
 //! transcripts it already scans, `gh`) and checks for uncommitted work last,
 //! because `git status` is the expensive part in a big repo.
 
-use crate::protocol::{PrBadge, PrState};
+use crate::protocol::{Checks, PrBadge, PrState, Review};
 use serde::Deserialize;
 use std::path::Path;
 use std::process::Command;
@@ -120,6 +120,11 @@ pub struct PullRequest {
     pub state: String,
     #[serde(rename = "isDraft", default)]
     pub is_draft: bool,
+    /// Filled from [`crate::github::open_pr_status`] for open PRs.
+    #[serde(skip)]
+    pub checks: Option<Checks>,
+    #[serde(skip)]
+    pub review: Option<Review>,
 }
 
 /// How many PRs of any state to read for badges.
@@ -152,7 +157,7 @@ pub fn pr_badge_for(
 ) -> Option<PrBadge> {
     if let Some(pr) = prs.iter().find(|pr| pr.branch == branch && pr.state == "OPEN") {
         let state = if pr.is_draft { PrState::Draft } else { PrState::Open };
-        return Some(PrBadge { number: pr.number, state });
+        return Some(PrBadge { number: pr.number, state, checks: pr.checks, review: pr.review });
     }
     if head.is_empty() {
         return None;
@@ -160,7 +165,7 @@ pub fn pr_badge_for(
     prs.iter()
         .filter(|pr| pr.branch == branch && pr.state == "MERGED")
         .find(|pr| pr.head == head || is_ancestor(head, &pr.head))
-        .map(|pr| PrBadge { number: pr.number, state: PrState::Merged })
+        .map(|pr| PrBadge { number: pr.number, state: PrState::Merged, checks: None, review: None })
 }
 
 #[cfg(test)]

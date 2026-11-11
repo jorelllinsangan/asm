@@ -229,6 +229,13 @@ pub fn commit_subjects(repo: &Path, shas: &[&str]) -> HashMap<String, String> {
     out
 }
 
+/// Commits on `worktree`'s HEAD that the root's branch doesn't have.
+pub fn ahead(root: &Path, worktree: &Path) -> Option<u32> {
+    let base = merge_base(root, worktree)?;
+    let n = run(&["rev-list", "--count", &format!("{base}..HEAD")], worktree).ok()?;
+    n.trim().parse().ok()
+}
+
 /// Commit time (seconds since the epoch) of each commit in `shas`, keyed by
 /// full SHA, in one `git` process. Unknown SHAs are simply absent.
 pub fn commit_times(repo: &Path, shas: &[&str]) -> HashMap<String, u64> {

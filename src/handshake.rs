@@ -278,6 +278,7 @@ mod tests {
                 created_secs: None,
                 last_active_secs: None,
                 pr: None,
+                ahead: None,
                 sessions: statuses
                     .iter()
                     .enumerate()
