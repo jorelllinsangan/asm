@@ -2919,6 +2919,7 @@ fn submit_prompt(app: &mut App, prompt: Prompt) {
             }
         }
         PromptKind::NewSession { worktree } => {
+            float_new_session(app);
             let name = if input.is_empty() {
                 "shell".to_string()
             } else {
@@ -2933,6 +2934,7 @@ fn submit_prompt(app: &mut App, prompt: Prompt) {
             });
         }
         PromptKind::NewAgent { worktree, tool } => {
+            float_new_session(app);
             let name = if input.is_empty() { cute_name() } else { input };
             app.send(Request::CreateSession {
                 worktree,
@@ -4655,7 +4657,7 @@ enum Lane {
 const LANES: [Lane; 3] = [Lane::NoPr, Lane::InReview, Lane::Merged];
 
 const BOARD_HINT: &str =
-    "BOARD · h/l lane · j/k card · Enter open newest session (floats over the board) · p/P work on/park · O PR · i hidden · g back";
+    "BOARD · h/l lane · j/k card · Enter open newest session (floats over the board) · c/C/o/n new session · p/P work on/park · O PR · i hidden · g back";
 
 fn lane_title(lane: Lane) -> &'static str {
     match lane {
@@ -4768,6 +4770,15 @@ fn handle_board_key(app: &mut App, key: KeyEvent) {
                 float_newest(app, i);
             }
         }
+        // Start a session in the card's worktree: the tree's own flow (name
+        // prompt), on the card's worktree. `submit_prompt` floats it.
+        KeyCode::Char('c' | 'C' | 'o' | 'n') => {
+            if let Some(i) = selected {
+                let path = app.tree[i].path.clone();
+                app.reveal(RowKey::Worktree(path));
+                handle_nav_key(app, key);
+            }
+        }
         _ => {}
     }
     // Keep the cursor on a lane and a card: lanes come and go with `i`, and a
@@ -4809,6 +4820,19 @@ fn float_newest(app: &mut App, wt: usize) {
     }
     app.focus_term();
     app.footer = if live { FLOAT_HINT.into() } else { "resuming session…".into() };
+}
+
+/// A session started from the board floats over it once created: float now,
+/// so `SessionCreated` attaches it at the float's size, and drop whatever was
+/// attached so it doesn't show (and take keys) in the float meanwhile.
+fn float_new_session(app: &mut App) {
+    let Some(b) = app.board.as_mut() else {
+        return;
+    };
+    b.float = true;
+    app.attached = None;
+    app.parser = None;
+    relayout(app);
 }
 
 /// Stop floating the session over the board. It stays attached, so closing the
@@ -5640,6 +5664,34 @@ mod tests {
         relayout(&mut app);
         open_board(&mut app);
         (app, rx)
+    }
+
+    #[test]
+    fn c_on_a_card_starts_an_agent_there_and_floats_it() {
+        let (mut app, mut rx) = app_on_board();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        assert!(
+            matches!(
+                app.prompt.as_ref().map(|p| &p.kind),
+                Some(PromptKind::NewAgent { worktree, tool: AgentTool::Claude }) if worktree == "/r/a"
+            ),
+            "c on a card opens the name prompt for its worktree"
+        );
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.board.is_some() && app.floating(), "the new session floats over the board");
+        let sent = drain(&mut rx);
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::CreateSession { worktree, .. } if worktree == "/r/a")),
+            "{sent:?}"
+        );
+        handle_daemon_event(&mut app, Event::SessionCreated { id: 9 });
+        let dims = { let r = app.float_area(); inner_dims(r.width, r.height) };
+        let sent = drain(&mut rx);
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::Attach { id: 9, cols, rows } if (*cols, *rows) == dims)),
+            "attached at the float's size: {sent:?}"
+        );
+        assert_eq!(app.focus, Focus::Term);
     }
 
     #[test]
