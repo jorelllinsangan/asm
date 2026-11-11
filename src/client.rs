@@ -51,6 +51,8 @@ const NAV_HINT: &str =
     "j/k move · Enter open · c claude · C codex · o opencode · n shell · w worktree · d/D rm worktree · X clean up worktrees · x kill · s sort · e widen · Ctrl+H hide tree · Ctrl+] editor · Ctrl+\\ terminal · Ctrl+G diff · q quit";
 const TERM_HINT: &str =
     "TERMINAL · Ctrl+H (or Ctrl+Q) explorer · Ctrl+] editor · Ctrl+\\ terminal · Ctrl+G diff";
+const FLOAT_HINT: &str =
+    "SESSION · Ctrl+Q (or Ctrl+H) hides it, back to the board (keeps running) · Ctrl+] editor · click outside to hide";
 const DRAWER_HINT: &str =
     "DRAWER · Ctrl+\\ hides it (keeps running) · Ctrl+H explorer · click above to leave it";
 const EDITOR_HINT: &str = "EDITOR · Ctrl+] hides it (keeps running) · Ctrl+H explorer";
@@ -596,6 +598,34 @@ impl App {
         !self.diff_showing() && self.editor.is_some() && self.attached.is_some()
     }
 
+    /// Whether a session is floating over the `g` board (see [`Board::float`]).
+    fn floating(&self) -> bool {
+        self.board.as_ref().is_some_and(|b| b.float)
+    }
+
+    /// The floating session's outer rect, rebuilt from the cached dims the way
+    /// [`right_pane_rect`] is, for the paths with no `Rect` from the last frame:
+    /// [`relayout`] (PTY size) and mouse hit-testing. `draw` gets the same rect
+    /// from [`float_rect`] over the real main area.
+    fn float_area(&self) -> Rect {
+        let width = if self.screen_cols > 0 {
+            self.screen_cols
+        } else {
+            self.right_outer.0.saturating_add(self.nav_width())
+        };
+        float_rect(Rect { x: 0, y: 0, width, height: self.right_outer.1 })
+    }
+
+    /// Inner origin of the terminal pane: right of the tree under its top border,
+    /// or inside the float's border while one is up.
+    fn term_origin(&self) -> (u16, u16) {
+        if self.floating() {
+            let r = self.float_area();
+            return (r.x + 1, r.y + 1);
+        }
+        (self.nav_width() + 1, 1)
+    }
+
     /// Whether the drawer has the keyboard. Only while focus is `Term` — moving
     /// to the tree or the diff leaves `drawer_focused` as it was, but it means
     /// nothing until focus comes back.
@@ -680,16 +710,16 @@ impl App {
             let oy = main_h + 1;
             return self.drawer_parser.as_ref().map(|p| (p, self.nav_width() + 1, oy, c, r));
         }
+        let (ox, oy) = self.term_origin();
         if self.split_active() {
             let (ai_w, ed_w) = split_widths(right_w);
             if self.editor_focused {
                 let (c, r) = inner_dims(ed_w, main_h);
-                // Editor inner origin: tree width + ai block width + editor's border.
-                let ox = self.nav_width() + ai_w + 1;
-                return self.editor_parser.as_ref().map(|p| (p, ox, 1, c, r));
+                // Editor inner origin: past the ai block, inside its own border.
+                return self.editor_parser.as_ref().map(|p| (p, ox + ai_w, oy, c, r));
             }
             let (c, r) = inner_dims(ai_w, main_h);
-            return self.parser.as_ref().map(|p| (p, self.nav_width() + 1, 1, c, r));
+            return self.parser.as_ref().map(|p| (p, ox, oy, c, r));
         }
         let (c, r) = self.term_dims;
         let p = if self.editor.is_some() {
@@ -697,7 +727,7 @@ impl App {
         } else {
             self.parser.as_ref()
         };
-        p.map(|p| (p, self.nav_width() + 1, 1, c, r))
+        p.map(|p| (p, ox, oy, c, r))
     }
 
     /// Which pane the column `col` falls in (for click-to-focus). Mirrors the
@@ -1273,7 +1303,7 @@ fn handle_daemon_event(app: &mut App, ev: Event) {
             let (cols, rows) = app.term_dims;
             app.send(Request::Attach { id, cols, rows });
             app.focus_term();
-            app.footer = TERM_HINT.into();
+            app.footer = if app.floating() { FLOAT_HINT } else { TERM_HINT }.into();
         }
         Event::EditorOpened { id } => {
             // The daemon opened/reused the editor; stream it on the secondary slot.
@@ -1373,6 +1403,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    // The diff and the drawer live in the layout under the board, not in the
+    // float, so they'd open out of sight.
+    if app.floating() && !modal && (is_diff_toggle(&key) || is_drawer_toggle(&key)) {
+        app.footer = "Ctrl+Q hides the session, then close the board (g) for the diff or terminal".into();
+        return;
+    }
     if is_diff_toggle(&key) {
         if !modal {
             toggle_diff(app);
@@ -1401,6 +1437,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
     if app.finder.is_some() {
         handle_finder_key(app, key);
+        return;
+    }
+    if app.floating() {
+        handle_float_key(app, key);
         return;
     }
     if app.board.is_some() {
@@ -2581,11 +2621,26 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
     if app.finder.is_some() || app.help {
         return;
     }
-    // Click-to-focus: a left press in a pane other than the active one switches
-    // focus to it and is consumed (not forwarded), so the first click just moves
-    // focus. Clicks within the already-focused pane fall through to normal
-    // handling (forward to the app / scroll / etc.).
-    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+    // The board covers the panes, so they get no mouse while it's up. A
+    // floating session does; a click outside it hides it.
+    if app.board.is_some() {
+        if !app.floating() {
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind
+            && !app.float_area().contains(Position::new(ev.column, ev.row))
+        {
+            hide_float(app);
+            return;
+        }
+        if app.focus != Focus::Term {
+            return;
+        }
+    } else if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        // Click-to-focus: a left press in a pane other than the active one
+        // switches focus to it and is consumed (not forwarded), so the first
+        // click just moves focus. Clicks within the already-focused pane fall
+        // through to normal handling (forward to the app / scroll / etc.).
         let target = app.pane_at_point(ev.column, ev.row);
         if target != app.active_pane() {
             focus_pane(app, target);
@@ -3035,15 +3090,25 @@ fn drawer_split(main_h: u16) -> (u16, u16) {
 /// split, or the diff) and, while open, the drawer under it. Sets `term_dims`
 /// and `drawer_dims` and resizes every visible session's PTY to match.
 fn relayout(app: &mut App) {
-    let (right_w, main_h) = app.right_outer;
-    let (top_h, drawer_h) = if app.drawer.is_some() {
+    // A session floating over the board takes the float's size instead. The
+    // drawer isn't in the float, so it keeps the size it had.
+    let floating = app.floating();
+    let (right_w, main_h) = if floating {
+        let r = app.float_area();
+        (r.width, r.height)
+    } else {
+        app.right_outer
+    };
+    let (top_h, drawer_h) = if app.drawer.is_some() && !floating {
         drawer_split(main_h)
     } else {
         (main_h, 0)
     };
     let full = inner_dims(right_w, top_h);
     app.term_dims = full;
-    app.drawer_dims = inner_dims(right_w, drawer_h);
+    if !floating {
+        app.drawer_dims = inner_dims(right_w, drawer_h);
+    }
 
     let (ai_target, ed_target) = if app.split_active() {
         let (ai_w, ed_w) = split_widths(right_w);
@@ -3053,8 +3118,10 @@ fn relayout(app: &mut App) {
     };
     resize_view(app, ViewKind::Primary, ai_target);
     resize_view(app, ViewKind::Editor, ed_target);
-    let drawer_target = app.drawer_dims;
-    resize_view(app, ViewKind::Drawer, drawer_target);
+    if !floating {
+        let drawer_target = app.drawer_dims;
+        resize_view(app, ViewKind::Drawer, drawer_target);
+    }
 
     sync_diff_viewport(app);
 }
@@ -3146,6 +3213,11 @@ fn draw(f: &mut Frame, app: &App) {
     // Modal, so it goes last — over whatever the right pane drew.
     draw_comment_editor(f, app, right);
     draw_board(f, app, main);
+    if app.floating() {
+        let r = float_rect(main);
+        f.render_widget(Clear, r);
+        draw_terminal(f, app, r);
+    }
     draw_prune_list(f, app, main);
     draw_finder(f, app, main);
     draw_help(f, app, main);
@@ -4556,6 +4628,10 @@ struct Board {
     /// `i`: also show what's hidden by default, the Merged lane and quiet
     /// worktrees with no PR.
     all: bool,
+    /// The attached session is floating over the board (`Enter` on a card) and
+    /// has the keyboard. Hiding it (`Ctrl+Q`) only stops drawing it; the session
+    /// stays attached, so closing the board leaves it in the right-hand pane.
+    float: bool,
 }
 
 /// What the board shows: the lanes on screen, each with its cards as indices
@@ -4579,7 +4655,7 @@ enum Lane {
 const LANES: [Lane; 3] = [Lane::NoPr, Lane::InReview, Lane::Merged];
 
 const BOARD_HINT: &str =
-    "BOARD · h/l lane · j/k card · Enter open newest session · p/P work on/park · O PR · i hidden · g back";
+    "BOARD · h/l lane · j/k card · Enter open newest session (floats over the board) · p/P work on/park · O PR · i hidden · g back";
 
 fn lane_title(lane: Lane) -> &'static str {
     match lane {
@@ -4689,8 +4765,7 @@ fn handle_board_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             if let Some(i) = selected {
-                app.board = None;
-                open_newest(app, i);
+                float_newest(app, i);
             }
         }
         _ => {}
@@ -4706,11 +4781,82 @@ fn handle_board_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Open the worktree's newest session: its newest live one, else its newest
-/// past one (resumed), else just select the worktree. It joins the working set.
-fn open_newest(app: &mut App, wt: usize) {
+/// `Enter` on a card: open the worktree's newest session floating over the
+/// board, so `Ctrl+Q` puts you straight back on the board.
+fn float_newest(app: &mut App, wt: usize) {
     let Some(w) = app.tree.get(wt) else {
         return;
+    };
+    let live = w.sessions.iter().any(|s| s.status != Status::Exited);
+    // Float first, so the session is attached at the float's size.
+    if let Some(b) = app.board.as_mut() {
+        b.float = true;
+    }
+    relayout(app);
+    let previous = app.attached;
+    if !open_newest(app, wt) {
+        if let Some(b) = app.board.as_mut() {
+            b.float = false;
+        }
+        relayout(app);
+        return;
+    }
+    if !live && previous.is_some() {
+        // A resume: the old session would show (and take keys) until the new
+        // one is created. Drop it; `SessionCreated` attaches the new one.
+        app.attached = None;
+        app.parser = None;
+    }
+    app.focus_term();
+    app.footer = if live { FLOAT_HINT.into() } else { "resuming session…".into() };
+}
+
+/// Stop floating the session over the board. It stays attached, so closing the
+/// board shows it in the right-hand pane.
+fn hide_float(app: &mut App) {
+    if let Some(b) = app.board.as_mut() {
+        b.float = false;
+    }
+    app.focus = Focus::Nav;
+    app.footer = BOARD_HINT.into();
+    relayout(app);
+}
+
+/// Keys while a session floats over the board: all of them go to it, except
+/// `Ctrl+Q`/`Ctrl+H`, which hide it (the same chords that leave a session for
+/// the tree everywhere else).
+fn handle_float_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl && matches!(key.code, KeyCode::Char('h' | 'q')) {
+        hide_float(app);
+        return;
+    }
+    if app.focus == Focus::Term {
+        handle_term_key(app, key);
+    } else if key.code == KeyCode::Esc {
+        hide_float(app);
+    }
+}
+
+/// Where a session floats over the board: centred, leaving a margin of the
+/// board showing so it reads as a layer you can put away.
+fn float_rect(area: Rect) -> Rect {
+    let margin_x = (area.width / 20).max(2).min(area.width.saturating_sub(20) / 2);
+    let margin_y = (area.height / 20).max(1).min(area.height.saturating_sub(6) / 2);
+    Rect {
+        x: area.x + margin_x,
+        y: area.y + margin_y,
+        width: area.width.saturating_sub(margin_x * 2),
+        height: area.height.saturating_sub(margin_y * 2),
+    }
+}
+
+/// Open the worktree's newest session: its newest live one, else its newest
+/// past one (resumed), else just select the worktree. It joins the working set.
+/// Returns whether there was one to open.
+fn open_newest(app: &mut App, wt: usize) -> bool {
+    let Some(w) = app.tree.get(wt) else {
+        return false;
     };
     let path = w.path.clone();
     let name = worktree_display(w, &app.root).0;
@@ -4723,10 +4869,10 @@ fn open_newest(app: &mut App, wt: usize) {
         (None, None) => {
             app.reveal(RowKey::Worktree(path));
             app.footer = format!("no sessions in {name} · c starts one");
-            return;
+            return false;
         }
     }
-    open_selected(app);
+    open_selected(app)
 }
 
 /// `O`: the worktree's PR in the browser, via `gh` (which knows the repo).
@@ -5483,6 +5629,82 @@ mod tests {
             ]
         );
         assert_eq!(shown.merged, 1, "the merged lane is hidden and counted");
+    }
+
+    /// The board open over one worktree with a live session (7), focus on the
+    /// tree as `g` leaves it.
+    fn app_on_board() -> (App, mpsc::UnboundedReceiver<Request>) {
+        let (mut app, rx) = app_with_rx(vec![wt("/r/a", vec![running(7, "agent")], vec![])]);
+        app.screen_cols = 120;
+        app.right_outer = (120 - LEFT_WIDTH, 40);
+        relayout(&mut app);
+        open_board(&mut app);
+        (app, rx)
+    }
+
+    #[test]
+    fn enter_on_a_card_floats_its_session_over_the_board() {
+        let (mut app, mut rx) = app_on_board();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.board.is_some(), "the board stays up under the session");
+        assert!(app.floating());
+        assert_eq!(app.focus, Focus::Term);
+        let float = app.float_area();
+        let dims = inner_dims(float.width, float.height);
+        assert_eq!(app.term_dims, dims, "the PTY is sized to the float, not the pane");
+        let sent = drain(&mut rx);
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::Attach { id: 7, cols, rows } if (*cols, *rows) == dims)),
+            "attached at the float's size: {sent:?}"
+        );
+        // Keys go to the session, not the board's bindings.
+        handle_daemon_event(&mut app, Event::Attached { id: 7, scrollback: Vec::new() });
+        press(&mut app, 'j');
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [Request::Input { id: 7, data }] if data == b"j"), "{sent:?}");
+        assert!(app.floating());
+    }
+
+    #[test]
+    fn ctrl_q_hides_the_float_and_leaves_the_board_and_session() {
+        let (mut app, _rx) = app_on_board();
+        let pane_dims = app.term_dims;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        handle_daemon_event(&mut app, Event::Attached { id: 7, scrollback: Vec::new() });
+        handle_key(&mut app, ctrl('q'));
+        assert!(app.board.is_some(), "back on the board, not the tree");
+        assert!(!app.floating());
+        assert_eq!(app.focus, Focus::Nav);
+        assert_eq!(app.attached, Some(7), "hiding keeps the session attached");
+        assert_eq!(app.term_dims, pane_dims, "the session gets the pane's size back");
+        // Enter floats it again.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.floating());
+    }
+
+    #[test]
+    fn a_click_outside_the_float_hides_it() {
+        let (mut app, _rx) = app_on_board();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        handle_daemon_event(&mut app, Event::Attached { id: 7, scrollback: Vec::new() });
+        let inside = app.float_area();
+        handle_mouse(&mut app, click(inside.x + 3, inside.y + 3));
+        assert!(app.floating(), "a click inside stays with the session");
+        handle_mouse(&mut app, click(0, 0));
+        assert!(!app.floating());
+        assert!(app.board.is_some());
+    }
+
+    #[test]
+    fn the_float_draws_the_session_over_the_board() {
+        let (mut app, _rx) = app_on_board();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        handle_daemon_event(&mut app, Event::Attached { id: 7, scrollback: b"hello from the agent".to_vec() });
+        let screen = render(&app, 120, 41);
+        assert!(screen.iter().any(|l| l.contains("hello from the agent")), "{}", screen.join("\n"));
+        handle_key(&mut app, ctrl('q'));
+        let screen = render(&app, 120, 41);
+        assert!(!screen.iter().any(|l| l.contains("hello from the agent")), "hidden under the board");
     }
 
     #[test]
